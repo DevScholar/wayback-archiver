@@ -1,4 +1,4 @@
-# Web Archiver
+# Wayback Archiver
 
 ## Download Files
 From the "Network" tab in the browser console, copy all URLs that need to be archived.
