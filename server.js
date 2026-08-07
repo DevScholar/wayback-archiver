@@ -31,7 +31,7 @@ const INFRASTRUCTURE_DOMAINS = [
 
 const MIME_TYPES = {
     '.html': 'text/html', '.htm': 'text/html', '.asp': 'text/html', '.aspx': 'text/html',
-    '.php': 'text/html', '.cfm': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
+    '.php': 'text/html', '.cfm': 'text/html', '.shtml': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
     '.ico': 'image/x-icon', '.txt': 'text/plain', '.bmp': 'image/bmp',
     '.woff': 'font/woff', '.woff2': 'font/woff2', '.svg': 'image/svg+xml'
@@ -375,7 +375,7 @@ function serveFile(res, filePath, rewriteTs = null, host = null) {
     const ext = path.extname(filePath).toLowerCase();
     const mime = MIME_TYPES[ext] || 'application/octet-stream';
 
-    const isTextWeb = ['.html', '.htm', '.asp', '.php', '.aspx', '.cfm'].includes(ext);
+    const isTextWeb = ['.html', '.htm', '.asp', '.php', '.aspx', '.cfm', '.shtml'].includes(ext);
     const isCss = (ext === '.css');
     const isJs = (ext === '.js');
 

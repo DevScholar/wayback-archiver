@@ -16,7 +16,7 @@ const CONFIG = {
     outputFile: path.join(config.currentSaveLocation, 'index.html'),
     
     // Extensions considered as web pages
-    pageExtensions: ['.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp'],
+    pageExtensions: ['.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml'],
     
     // Ignore list
     ignoreList: [
@@ -54,7 +54,7 @@ function scanDir(directory) {
 }
 
 // Extensions that may not be served as HTML, but whose content might be.
-const NON_NATIVE_EXT = new Set(['.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp']);
+const NON_NATIVE_EXT = new Set(['.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml']);
 
 function isWebPage(filename, fullPath) {
     if (fullPath.includes('screenshot')) return false;

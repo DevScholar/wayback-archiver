@@ -42,19 +42,19 @@ function parseArgs() {
 
 /** Extensions we treat as text (will have links rewritten). */
 const TEXT_EXTENSIONS = new Set([
-    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp',
+    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml',
     '.css', '.js', '.txt', '.xml', '.svg'
 ]);
 
 /** HTML-like extensions (for Wayback injection cleanup). */
 const HTML_EXTENSIONS = new Set([
-    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp'
+    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml'
 ]);
 
 // Extensions that browsers may not render as HTML under file://.
 // We sniff the first bytes of the file to decide — a .asp can be CSS, JS, or image.
 const NON_NATIVE_EXT = new Set([
-    '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp'
+    '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml'
 ]);
 
 /**
@@ -435,7 +435,7 @@ function urlKeyVariants(hostname, port, pathname, protocols) {
 // Default document names to try for directory URLs (like /path/ → /path/default.asp)
 const DEFAULT_DOCS = [
     'index.html', 'index.htm', 'default.asp', 'default.aspx',
-    'default.htm', 'default.html', 'home.asp', 'home.html', 'main.html'
+    'default.htm', 'default.html', 'default.shtml', 'index.shtml', 'home.asp', 'home.html', 'main.html'
 ];
 
 function resolveUrl(urlStr, index, targetDate) {
@@ -1026,7 +1026,7 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
 // ==========================================================================
 
 const PAGE_EXT = new Set([
-    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp'
+    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml'
 ]);
 
 function isWebPage(filename) {
