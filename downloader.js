@@ -71,7 +71,10 @@ function getLocalPath(inputUrl) {
 
         if (wbMatch) {
             isWayback = true;
-            ts = wbMatch[1];
+            // Preserve the Wayback flags suffix (im_, cs_, js_, fw_, if_, …)
+            // that follows the timestamp. Dropping it flattens distinct content
+            // types that share one timestamp into a single directory.
+            ts = wbMatch[1] + (wbMatch[2] || '');
             rawUrl = wbMatch[3]; // Extract the actual original URL
         }
 

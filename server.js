@@ -342,13 +342,22 @@ function findWaybackArchive(targetTs, rawUrlPath) {
     const waybackBase = path.join(ARCHIVE_DIR, 'https', 'web.archive.org', 'web');
     if (!fs.existsSync(waybackBase)) return null;
 
-    let normalizedTs = targetTs.padEnd(14, '0').substring(0, 14);
+    // targetTs may carry the Wayback flags suffix (e.g. "20011215022550cs_").
+    // Compare on the numeric timestamp, but prefer the exact ts+flags dir.
+    let normalizedTs = (targetTs.match(/^\d+/) || [''])[0].padEnd(14, '0').substring(0, 14);
     const targetTime = parseInt(normalizedTs);
 
     let tsDirs;
     try {
         tsDirs = fs.readdirSync(waybackBase).filter(t => /^\d{4,14}([a-z]{2}_)?$/.test(t));
     } catch (e) { return null; }
+
+    // Fast path: exact timestamp+flags directory. Also resolves ties when the
+    // same timestamp has several flag variants (id_, im_, cs_, js_, …).
+    if (fs.existsSync(path.join(waybackBase, targetTs))) {
+        const exactFile = findFileSmart(path.join(waybackBase, targetTs), restPath);
+        if (exactFile) return { ts: targetTs, fullPath: exactFile };
+    }
 
     let bestMatch = null;
     let minDiff = Infinity;
@@ -499,7 +508,9 @@ const server = http.createServer((req, res) => {
     const waybackMatch = reqUrl.match(wbRegex);
 
     if (waybackMatch) {
-        const requestTs = waybackMatch[1];
+        // Keep the flags suffix (cs_, im_, js_, …) so we serve the exact
+        // variant the URL asks for, not just any dir at the same timestamp.
+        const requestTs = waybackMatch[1] + (waybackMatch[2] || '');
         let targetUrl = waybackMatch[3];
         // Strip query string and fragment — they are not part of the file path on disk.
         targetUrl = targetUrl.replace(/[?#].*$/, '');
