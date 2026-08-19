@@ -162,6 +162,40 @@ function getLocalPath(inputUrl) {
 }
 
 /**
+ * True if the downloaded body is a Wayback directory listing — the calendar /
+ * redirect interstitial chrome Wayback serves when the URL has no direct
+ * capture — rather than real archived content. A real capture keeps the
+ * original page's <title>; the listing page's own <title> is "Wayback Machine".
+ */
+function isWaybackDirectoryListing(buf) {
+    const head = buf.subarray(0, 16384).toString('latin1');
+    return /<title>\s*Wayback Machine\s*<\/title>/i.test(head) &&
+        /(?:id="wm-ipp-base"|id="playback"|wm-nav-captures)/i.test(head);
+}
+
+/**
+ * Write a buffered body to finalDest (mkdir -p, then write), rejecting on
+ * zero-byte content.
+ */
+function writeBody(finalDest, body) {
+    return new Promise((resolve, reject) => {
+        if (!body || body.length === 0) return reject("Zero Byte File Detected");
+        try {
+            fs.mkdirSync(path.dirname(finalDest), { recursive: true });
+        } catch (err) {
+            return reject(`Mkdir Failed: ${err.message}`);
+        }
+        fs.writeFile(finalDest, body, (err) => {
+            if (err) {
+                fs.unlink(finalDest, () => {});
+                return reject(`Write Failed: ${err.message}`);
+            }
+            resolve();
+        });
+    });
+}
+
+/**
  * General download function
  */
 function downloadFile(url, suggestedPath, redirectCount = 0) {
@@ -206,14 +240,32 @@ function downloadFile(url, suggestedPath, redirectCount = 0) {
                 return;
             }
 
-            // Intelligent extension completion (if path has no extension, complete based on header)
             let finalDest = suggestedPath;
             const currentExt = path.extname(finalDest);
-            
+            const ct = res.headers['content-type'] || '';
+
+            // Wayback directory listings (the calendar/interstitial chrome, not
+            // real archived content) must not masquerade as the page itself.
+            // HTML is buffered so we can sniff it before choosing the filename.
+            if (ct.includes('text/html')) {
+                const chunks = [];
+                res.on('data', (c) => chunks.push(c));
+                res.on('end', () => {
+                    const body = Buffer.concat(chunks);
+                    if (!currentExt) finalDest = path.join(finalDest, 'index.html');
+                    if (isWaybackDirectoryListing(body) && path.basename(finalDest) === 'index.html') {
+                        finalDest = path.join(path.dirname(finalDest), '__wayback__directory_index.html');
+                    }
+                    writeBody(finalDest, body).then(resolve).catch(reject);
+                });
+                res.on('error', (err) => reject(`Network: ${err.message}`));
+                return;
+            }
+
+            // Intelligent extension completion for non-HTML responses (images,
+            // CSS, JS) whose suggested path has no extension.
             if (!currentExt) {
-                const ct = res.headers['content-type'] || '';
-                if (ct.includes('text/html')) finalDest = path.join(finalDest, 'index.html');
-                else if (ct.includes('image/jpeg')) finalDest += '.jpg';
+                if (ct.includes('image/jpeg')) finalDest += '.jpg';
                 else if (ct.includes('image/png')) finalDest += '.png';
                 else if (ct.includes('image/gif')) finalDest += '.gif';
                 else if (ct.includes('javascript')) finalDest += '.js';

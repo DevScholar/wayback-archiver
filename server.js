@@ -16,6 +16,11 @@ const { sanitizeSegment, escapeHtml, isPathInside, loadConfig } = require('./com
 
 const PORT = 8080;
 
+// By default bind to localhost only so the archive is not served to the LAN.
+// Pass --expose to listen on all interfaces (0.0.0.0) instead.
+const EXPOSE = process.argv.includes('--expose');
+const LISTEN_HOST = EXPOSE ? '0.0.0.0' : '127.0.0.1';
+
 // Read save location from config.json
 const serverConfig = loadConfig();
 
@@ -556,11 +561,15 @@ const server = http.createServer((req, res) => {
     }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, LISTEN_HOST, () => {
     const ip = getLocalExternalIP();
     console.log(`\n=== Wayback Server (XP Compatible) ===`);
     console.log(`- Local Access: http://localhost:${PORT}`);
-    console.log(`- LAN/VM Access: http://${ip}:${PORT}`);
+    if (EXPOSE) {
+        console.log(`- LAN/VM Access: http://${ip}:${PORT}`);
+    } else {
+        console.log(`- LAN/VM Access: disabled (use --expose to enable)`);
+    }
     console.log(`- Archive Dir:  ${ARCHIVE_DIR}`);
     console.log('- Index:    ' + path.join(ARCHIVE_DIR, 'index.html'));
     console.log(`\nReady for legacy browsers...`);
