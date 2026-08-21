@@ -20,7 +20,15 @@ node flatten.js --output-dir=<PATH> [--archive-dir=<PATH>] [--date=<YYYY[-MM][-D
 | Argument | Required | Description |
 |---|---|---|
 | `--output-dir=<PATH>` | Yes | Output directory for the flattened archive |
-| `--archive-dir=<PATH>` | No | Archive directory. Defaults to `config.json`'s `currentSaveLocation` |
+| `--archive-dir=<PATH>` | No | Archive directory. Defaults to `user-private/config.json`'s `currentSaveLocation` |
 | `--date=<YYYY[-MM][-DD]>` | No | Preferred date for selecting snapshots. Defaults to today |
+
+config.json example:
+
+```json
+{
+  "currentSaveLocation": "__USER_DOCUMENTS__/wayback-archiver/websites/untitled/"
+}
+```
 
 This software is licensed under the MIT License.
