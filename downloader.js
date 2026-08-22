@@ -23,14 +23,17 @@ const CONFIG = {
     urlFile: path.join(__dirname, 'user-private', 'urls.txt'),
     baseDir: SAVE_ROOT, // Download root directory (from config.json)
     concurrency: 8, // Number of concurrent downloads
-    stateFile: path.join(__dirname, 'download_state.json'),
     mappingFile: path.join(__dirname, 'filename_mapping.json'), // Used to record long filename mappings
     timeout: 120000,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.0.0 Safari/537.36'
 };
 
 // === State initialization ===
-let downloaded = new Set();
+// The archive directory on disk is the single source of truth for "already
+// downloaded": a URL is (re)downloaded unless its file already exists on disk.
+// There is no download_state.json — that keyed-by-URL record went stale whenever
+// the save location changed or files were deleted, and silently skipped every
+// URL while the archive directory was empty.
 let urlMapping = {};
 
 // Query-string CSV entries accumulated this run, flushed on saveState().
@@ -38,12 +41,6 @@ let urlMapping = {};
 // on read-modify-write of one CSV file.
 const csvBuffer = new Map();   // dir -> Map(shortened -> originalUrl)
 const usedShortened = new Set(); // every shortened name generated this run
-
-try {
-    if (fs.existsSync(CONFIG.stateFile)) {
-        downloaded = new Set(JSON.parse(fs.readFileSync(CONFIG.stateFile)));
-    }
-} catch (e) {}
 
 try {
     if (fs.existsSync(CONFIG.mappingFile)) {
@@ -103,7 +100,6 @@ function flushCsv() {
 
 function saveState() {
     try {
-        fs.writeFileSync(CONFIG.stateFile, JSON.stringify([...downloaded], null, 2));
         fs.writeFileSync(CONFIG.mappingFile, JSON.stringify(urlMapping, null, 2));
         flushCsv();
     } catch (e) {}
@@ -433,8 +429,6 @@ async function start() {
     const worker = async (id) => {
         while (currentIndex < urls.length) {
             const url = urls[currentIndex++];
-            
-            if (downloaded.has(url)) continue;
 
             // Get storage path
             const result = getLocalPath(url);
@@ -446,7 +440,12 @@ async function start() {
             }
             const dest = result.destPath;
 
-            // Local file existence check
+            // Local file existence check.
+            //
+            // This is the ONLY skip signal.  Disk is the single source of truth:
+            // a URL is downloaded unless its file already exists on disk, so
+            // re-running after a save-location change or file deletion correctly
+            // re-downloads instead of silently skipping.
             let skip = false;
             // Check if file itself exists
             if (fs.existsSync(dest) && fs.statSync(dest).isFile() && fs.statSync(dest).size > 0) skip = true;
@@ -454,7 +453,6 @@ async function start() {
             else if (fs.existsSync(path.join(dest, 'index.html')) && fs.statSync(path.join(dest, 'index.html')).size > 0) skip = true;
 
             if (skip) {
-                downloaded.add(url);
                 continue;
             }
 
@@ -466,7 +464,6 @@ async function start() {
                     csvBuffer.get(result.csv.dir).set(result.csv.shortened, result.csv.originalUrl);
                 }
                 console.log(`[Thread ${id}] OK: ${url}`);
-                downloaded.add(url);
             } catch (err) {
                 console.log(`[Thread ${id}] FAIL: ${err} | ${url}`);
             }
