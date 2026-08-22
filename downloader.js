@@ -277,6 +277,15 @@ function getLocalPath(inputUrl) {
     }
 }
 
+// 429 (Too Many Requests) handling: retry with a fixed delay between attempts.
+const MAX_429_RETRIES = 3;   // extra attempts beyond the first
+const RETRY_DELAY_MS = 500;  // 0.5s between each retried link
+
+/** Sleep for `ms` milliseconds. */
+function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
 /**
  * General download function
  *
@@ -286,16 +295,16 @@ function getLocalPath(inputUrl) {
  * rename/move the file away from the name recorded in original_url.csv and
  * break the server's reverse lookup.
  */
-function downloadFile(url, suggestedPath, redirectCount = 0, hasQuery = false) {
+function downloadFile(url, suggestedPath, redirectCount = 0, hasQuery = false, retryCount = 0) {
     if (redirectCount > 5) return Promise.reject("Too many redirects");
 
     return new Promise((resolve, reject) => {
         // Automatically select protocol module
         const isHttps = url.startsWith('https:');
         const proto = isHttps ? https : http;
-        
-        const options = { 
-            headers: { 
+
+        const options = {
+            headers: {
                 'User-Agent': CONFIG.userAgent,
                 // Simulate browser Accept
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8'
@@ -316,9 +325,23 @@ function downloadFile(url, suggestedPath, redirectCount = 0, hasQuery = false) {
                     const basePath = path.posix.dirname(u.pathname);
                     newUrl = `${u.protocol}//${u.host}${basePath}/${newUrl}`;
                 }
-                
+
                 res.resume();
-                downloadFile(newUrl, suggestedPath, redirectCount + 1, hasQuery).then(resolve).catch(reject);
+                downloadFile(newUrl, suggestedPath, redirectCount + 1, hasQuery, retryCount).then(resolve).catch(reject);
+                return;
+            }
+
+            // 429 Too Many Requests → back off 0.5s and retry (up to MAX_429_RETRIES).
+            if (res.statusCode === 429) {
+                res.resume();
+                if (retryCount < MAX_429_RETRIES) {
+                    sleep(RETRY_DELAY_MS).then(() =>
+                        downloadFile(url, suggestedPath, redirectCount, hasQuery, retryCount + 1)
+                            .then(resolve).catch(reject)
+                    );
+                } else {
+                    reject(`HTTP 429 (gave up after ${MAX_429_RETRIES} retries)`);
+                }
                 return;
             }
 
