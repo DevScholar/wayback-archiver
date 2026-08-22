@@ -17,7 +17,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { loadConfig } = require('./common');
+const { loadConfig, PORT_SEP, readQueryMap, extractExplicitPort } = require('./common');
 
 // ==========================================================================
 // Argument Parsing
@@ -246,10 +246,13 @@ function parseUrl(urlStr) {
 
     try {
         const u = new URL(normalized);
+        // Preserve explicit default ports (http:80 / https:443) that `new URL()`
+        // otherwise normalizes away — matches the downloader's on-disk encoding.
+        const explicitPort = extractExplicitPort(normalized);
         return {
             protocol: u.protocol.replace(':', ''),
             hostname:  u.hostname,
-            port:      u.port,
+            port:      explicitPort !== '' ? explicitPort : u.port,
             pathname:  u.pathname,
             search:    u.search,
             hash:      u.hash,
@@ -260,19 +263,31 @@ function parseUrl(urlStr) {
 }
 
 /** Build a consistent lookup key from URL components. */
-function makeKey(protocol, hostname, port, pathname) {
+function makeKey(protocol, hostname, port, pathname, query) {
     let k = protocol + '://' + hostname;
     if (port) k += ':' + port;
     // Normalise: strip leading slash, so "http://x.com/" and "http://x.com" collide.
     let p = pathname;
     if (p.startsWith('/')) p = p.slice(1);
     k += '/' + p;
+    if (query) k += query;
     return k;
 }
 
 // ==========================================================================
 // Index Building
 // ==========================================================================
+
+// Memoize readQueryMap results per directory — classify() runs once per file,
+// and large archives would otherwise re-read the same original_url.csv many times.
+var queryMapCache = new Map();
+
+function getQueryMap(dir) {
+    if (queryMapCache.has(dir)) return queryMapCache.get(dir);
+    var m = readQueryMap(dir);
+    queryMapCache.set(dir, m);
+    return m;
+}
 
 /**
  * Walk the archive directory and build:
@@ -290,6 +305,7 @@ function buildIndex(archiveDir) {
 
         for (const entry of entries) {
             if (entry.name.startsWith('.')) continue;
+            if (entry.name === 'original_url.csv') continue; // query-mapping metadata, not archived content
             const fullPath = path.join(dir, entry.name);
             const cur = [...relParts, entry.name];
 
@@ -297,7 +313,7 @@ function buildIndex(archiveDir) {
                 if (entry.name === 'node_modules') continue;
                 walk(fullPath, cur);
             } else if (entry.isFile()) {
-                const info = classify(cur);
+                const info = classify(cur, dir);
                 if (!info) continue;
 
                 allFiles.push({
@@ -343,12 +359,40 @@ function buildIndex(archiveDir) {
  *   Wayback:  https/web.archive.org/web/<ts>[flags]/<host>[/<port>]/<path>
  *   Direct:   <http|https|ftp>/<host>[/<port>]/<path>
  *   Static:   https/web-static.archive.org/_static/<path>   (treated as Direct)
+ *
+ * `dir` is the absolute directory that contains the file — needed to read
+ * original_url.csv so query-shortened files (abc_AA2aEIMj.htm) are keyed by
+ * their real URL (abc.htm?a=1&b=2).
  */
-function classify(parts) {
+function classify(parts, dir) {
     if (parts.length < 2) return null;
 
     const p0 = parts[0].toLowerCase();
     const p1 = parts[1].toLowerCase();
+
+    // Split a host segment that may embed __port__ ("microsoft.com__port__80").
+    function splitHostSeg(seg) {
+        const idx = seg.indexOf(PORT_SEP);
+        if (idx >= 0) {
+            return { hostname: seg.slice(0, idx), port: seg.slice(idx + PORT_SEP.length) };
+        }
+        return { hostname: seg, port: '' };
+    }
+
+    // Build urlKeys for a pathname whose final segment may be a query-shortened
+    // filename recorded in the directory's original_url.csv.
+    function makeKeys(hostname, port, pathname, protocols) {
+        const segs = pathname.split('/').filter(s => s);
+        if (segs.length > 0) {
+            const last = segs[segs.length - 1];
+            const entry = getQueryMap(dir).get(last);
+            if (entry) {
+                const basePath = segs.slice(0, -1).concat(entry.base).join('/');
+                return urlKeyVariants(hostname, port, '/' + basePath, protocols, entry.query);
+            }
+        }
+        return urlKeyVariants(hostname, port, pathname, protocols);
+    }
 
     // ── Wayback file ──────────────────────────────────────────────
     if ((p0 === 'http' || p0 === 'https') &&
@@ -364,42 +408,40 @@ function classify(parts) {
         const hostIdx = 4;
         if (parts.length <= hostIdx) return null;
 
-        const hostname = parts[hostIdx];
-
+        const hs = splitHostSeg(parts[hostIdx]);
+        let port = hs.port;
         let portIdx = hostIdx + 1;
-        let port = '';
-        if (portIdx < parts.length && /^\d+$/.test(parts[portIdx])) {
+        if (!port && portIdx < parts.length && /^\d+$/.test(parts[portIdx])) {
             port = parts[portIdx];
             portIdx++;
         }
 
-        const pathname = parts.slice(portIdx).join('/');
+        const pathname = '/' + parts.slice(portIdx).join('/');
 
         return {
             isWayback: true,
             timestamp,
-            urlKeys: urlKeyVariants(hostname, port, '/' + pathname),
+            urlKeys: makeKeys(hs.hostname, port, pathname, undefined),
         };
     }
 
     // ── Direct file ───────────────────────────────────────────────
     if ((p0 === 'http' || p0 === 'https' || p0 === 'ftp') && parts.length >= 2) {
         const protocol = p0;
-        const hostname = p1;
-
+        const hs = splitHostSeg(p1);
+        let port = hs.port;
         let portIdx = 2;
-        let port = '';
-        if (portIdx < parts.length && /^\d+$/.test(parts[portIdx])) {
+        if (!port && portIdx < parts.length && /^\d+$/.test(parts[portIdx])) {
             port = parts[portIdx];
             portIdx++;
         }
 
-        const pathname = parts.slice(portIdx).join('/');
+        const pathname = '/' + parts.slice(portIdx).join('/');
 
         return {
             isWayback: false,
             timestamp: null,
-            urlKeys: urlKeyVariants(hostname, port, '/' + pathname, [protocol]),
+            urlKeys: makeKeys(hs.hostname, port, pathname, [protocol]),
         };
     }
 
@@ -411,15 +453,15 @@ function classify(parts) {
  * If `protocols` is omitted we try both http and https (Wayback case —
  * the original protocol is not stored on disk).
  */
-function urlKeyVariants(hostname, port, pathname, protocols) {
+function urlKeyVariants(hostname, port, pathname, protocols, query) {
     if (!protocols) protocols = ['http', 'https'];
     const wwwAlt = hostname.startsWith('www.')
         ? hostname.slice(4)
         : 'www.' + hostname;
     const keys = [];
     for (const proto of protocols) {
-        keys.push(makeKey(proto, hostname, port, pathname));
-        keys.push(makeKey(proto, wwwAlt,   port, pathname));
+        keys.push(makeKey(proto, hostname, port, pathname, query));
+        keys.push(makeKey(proto, wwwAlt,   port, pathname, query));
     }
     return keys;
 }
@@ -442,7 +484,8 @@ function resolveUrl(urlStr, index, targetDate) {
     const parsed = parseUrl(urlStr);
     if (!parsed) return null;
 
-    const { protocol, hostname, port, pathname } = parsed;
+    const { protocol, hostname, port, pathname, search } = parsed;
+    const query = search || '';
     const targetTs = dateToTimestamp(targetDate);
 
     // Collect all candidates across protocol/www variants
@@ -450,27 +493,27 @@ function resolveUrl(urlStr, index, targetDate) {
     const seen = new Set();
 
     const tryAdd = (proto, host, pn) => {
-        // 1. Exact path
-        addFromIndex(proto, host, port, pn);
+        // 1. Exact path (query, if any, only applies to this exact match)
+        addFromIndex(proto, host, port, pn, query);
         // 2. Always try appending /index.html — some archived pages like
         //    /isapi/gomscom.asp are stored as gomscom.asp/index.html on disk.
         var cleanPn = pn.replace(/\/$/, '');
-        addFromIndex(proto, host, port, cleanPn + '/index.html');
+        addFromIndex(proto, host, port, cleanPn + '/index.html', '');
         // 3. If it's a directory URL, try all common default documents
         if (pn.endsWith('/') || pn === '' || pn === '/') {
             for (var d = 0; d < DEFAULT_DOCS.length; d++) {
-                addFromIndex(proto, host, port, cleanPn + '/' + DEFAULT_DOCS[d]);
+                addFromIndex(proto, host, port, cleanPn + '/' + DEFAULT_DOCS[d], '');
             }
         }
         // 4. If the URL has no extension, try .html and .htm
         if (!pn.match(/\.[a-zA-Z0-9]{1,10}$/) && pn !== '' && pn !== '/') {
-            addFromIndex(proto, host, port, pn + '.html');
-            addFromIndex(proto, host, port, pn + '.htm');
+            addFromIndex(proto, host, port, pn + '.html', '');
+            addFromIndex(proto, host, port, pn + '.htm', '');
         }
     };
 
-    const addFromIndex = (proto, host, pnPort, pn) => {
-        const key = makeKey(proto, host, pnPort, pn);
+    const addFromIndex = (proto, host, pnPort, pn, q) => {
+        const key = makeKey(proto, host, pnPort, pn, q);
         if (seen.has(key)) return;
         seen.add(key);
         const entries = index[key];
@@ -660,8 +703,10 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
     }
 
     function relativize(absUrl) {
-        // Strip query string for lookup (it's not part of the file path)
-        var lookupUrl = absUrl.replace(/[?#].*$/, '');
+        // Strip only the fragment — the query string must survive so a
+        // query-shortened file (abc_AA2aEIMj.htm) can be matched by its
+        // real URL (abc.htm?a=1&b=2) via the index.
+        var lookupUrl = absUrl.replace(/#.*$/, '');
         // Capture hash to re-append
         var hash = '';
         var hashIdx = absUrl.indexOf('#');
@@ -677,7 +722,7 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
             return rel + hash;
         }
 
-        // ── 2. Fallback: compute hypothetical archive path ──
+        // ── 2. Fallback: compute hypothetical archive path (query-less) ──
         var fallbackPath = computeFallbackPath(absUrl.replace(/[?#].*$/, ''));
         if (fallbackPath) {
             var rel = path.posix.relative(currentDir, fallbackPath);
@@ -735,7 +780,7 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
         // Actually, the simplest approach: resolve the URL, and if there
         // are multiple candidates, prefer the one whose timestamp dir
         // matches our ts+flags.
-        var urlToResolve = lookup.replace(/[?#].*$/, '');
+        var urlToResolve = lookup.replace(/#.*$/, '');
         var hash = '';
         var hashIdx = waybackPath.indexOf('#');
         if (hashIdx >= 0) hash = waybackPath.slice(hashIdx);
@@ -748,8 +793,8 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
         if (resolved) {
             targetPath = resolved.archiveRelPath;
         } else {
-            // Fallback: compute hypothetical archive path
-            targetPath = computeFallbackPath(waybackPath);
+            // Fallback: compute hypothetical archive path (query-less)
+            targetPath = computeFallbackPath(waybackPath.replace(/[?#].*$/, ''));
         }
 
         if (!targetPath) return null;
@@ -783,15 +828,16 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
         // e.g. rootPath = "/library/toolbar/images/curve.gif"
         // context.host = "www.microsoft.com"
         // → archive path: https/web.archive.org/web/<ts>/<host>/library/toolbar/images/curve.gif
-        var clean = rootPath.replace(/[?#].*$/, '');
+        var clean = rootPath.replace(/[?#].*$/, '');   // query-less (for fallback)
+        var forLookup = rootPath.replace(/#.*$/, '');  // keep query (for index match)
         var hash = '';
         var hIdx = rootPath.indexOf('#');
         if (hIdx >= 0) hash = rootPath.slice(hIdx);
 
         // Try with the same protocol as the page context
         // (we default to both http and https for Wayback)
-        var lookupHttp = 'http://' + context.host + clean;
-        var lookupHttps = 'https://' + context.host + clean;
+        var lookupHttp = 'http://' + context.host + forLookup;
+        var lookupHttps = 'https://' + context.host + forLookup;
 
         // Try index-based resolution first
         var resolved = resolveUrlWithTsPreference(lookupHttp, context.ts, context.flags, index, targetDate) ||
@@ -803,7 +849,7 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
         if (resolved) {
             targetPath = resolved.archiveRelPath;
         } else {
-            // Fallback: compute archive path directly
+            // Fallback: compute archive path directly (query-less)
             targetPath = 'https/web.archive.org/web/' + context.ts + context.flags +
                 '/' + context.host + clean;
         }
@@ -830,14 +876,15 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
         var hostname = parsed.hostname;
         var port = parsed.port;
         var pathname = parsed.pathname;
+        var query = parsed.search || '';
         var targetTs = dateToTimestamp(targetDate);
 
         // Collect candidates
         var candidates = [];
         var seen = new Set();
 
-        function addFromIndex(proto, host, pnPort, pn) {
-            var key = makeKey(proto, host, pnPort, pn);
+        function addFromIndex(proto, host, pnPort, pn, q) {
+            var key = makeKey(proto, host, pnPort, pn, q);
             if (seen.has(key)) return;
             seen.add(key);
             var entries = index[key];
@@ -853,14 +900,14 @@ function rewriteLinks(content, currentRelPath, index, targetDate) {
         }
 
         function tryAdd(proto, host, pn) {
-            addFromIndex(proto, host, port, pn);
+            addFromIndex(proto, host, port, pn, query);
             // Always try appending /index.html
             var cleanPn = pn.replace(/\/$/, '');
-            addFromIndex(proto, host, port, cleanPn + '/index.html');
+            addFromIndex(proto, host, port, cleanPn + '/index.html', '');
             // If it's a directory URL, try all common default documents
             if (pn.endsWith('/') || pn === '' || pn === '/') {
                 for (var d = 0; d < DEFAULT_DOCS.length; d++) {
-                    addFromIndex(proto, host, port, cleanPn + '/' + DEFAULT_DOCS[d]);
+                    addFromIndex(proto, host, port, cleanPn + '/' + DEFAULT_DOCS[d], '');
                 }
             }
         }

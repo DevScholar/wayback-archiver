@@ -12,7 +12,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { sanitizeSegment, escapeHtml, isPathInside, loadConfig } = require('./common');
+const { sanitizeSegment, escapeHtml, isPathInside, loadConfig, PORT_SEP, resolveQueryFile } = require('./common');
 
 const PORT = 8080;
 
@@ -144,13 +144,20 @@ function serveDirectoryListing(res, dirPath, requestUrl) {
 function findFileSmart(baseDir, relativeUrlPath) {
     if (!fs.existsSync(baseDir)) return null;
 
-    let processedPath = relativeUrlPath
-        .replace(/^https?:\/\//, (match) => match.startsWith('https') ? 'https/' : 'http/')
-        .replace(/:\d+/, (port) => `/${port.replace(':', '')}`);
+    // Split the query string off first — it belongs to the final filename
+    // (e.g. "microsoft.com/abc.htm?a=1" → file "abc.htm" + query "?a=1").
+    // The query stays raw (percent-encoded) so it matches original_url.csv,
+    // which the downloader wrote using the URL's original search string.
+    let query = '';
+    let pathStr = relativeUrlPath;
+    const qIdx = pathStr.indexOf('?');
+    if (qIdx >= 0) {
+        query = pathStr.slice(qIdx);
+        pathStr = pathStr.slice(0, qIdx);
+    }
 
-    let parts = processedPath.split('/').filter(p => p && p !== '.');
-    if (parts.length === 0) {
-        // First check if there is a default homepage
+    // Default homepage when there's no path at all.
+    if (pathStr === '' || pathStr === '/') {
         const idx = path.join(baseDir, 'index.html');
         if (fs.existsSync(idx)) return idx;
         const defHtm = path.join(baseDir, 'default.htm');
@@ -158,48 +165,87 @@ function findFileSmart(baseDir, relativeUrlPath) {
         return null;
     }
 
-    function searchRecursive(currentDir, currentParts) {
-        if (currentParts.length === 0) {
-            if (fs.existsSync(currentDir) && fs.statSync(currentDir).isFile()) return currentDir;
-            const idx = path.join(currentDir, 'index.html');
-            if (fs.existsSync(idx)) return idx;
-            return null;
-        }
+    let normPath = pathStr.replace(/^https?:\/\//, (match) => match.startsWith('https') ? 'https/' : 'http/');
 
-        const rawPart = currentParts[0];
-        const targetPartLower = sanitize(rawPart).toLowerCase(); 
-        const remain = currentParts.slice(1);
+    // A `:port` may live in one of two on-disk forms:
+    //   • new:  <host>__port__<port>  (single segment)
+    //   • old:  <host>/<port>         (port as a separate numeric segment)
+    // Try the new encoding first, then the legacy one.
+    const variants = [];
+    if (/:\d+(?=\/|$)/.test(normPath)) {
+        variants.push(normPath.replace(/:\d+(?=\/|$)/, (port) => PORT_SEP + port.slice(1)));
+        variants.push(normPath.replace(/:\d+(?=\/|$)/, (port) => '/' + port.slice(1)));
+    } else {
+        variants.push(normPath);
+    }
 
+    // Walk down all but the final segment to find the containing directory.
+    function matchChild(currentDir, targetPartLower, isProtocolDir) {
         if (!fs.existsSync(currentDir) || !fs.statSync(currentDir).isDirectory()) return null;
-
         const items = fs.readdirSync(currentDir);
-        const currentDirName = path.basename(currentDir);
-        const isProtocolDir = (currentDirName === 'http' || currentDirName === 'https');
-
         for (const item of items) {
             const itemLower = item.toLowerCase();
             let isMatch = false;
-
             if (itemLower === targetPartLower) isMatch = true;
             else if (isProtocolDir) {
                 if (itemLower === 'www.' + targetPartLower) isMatch = true;
                 if ('www.' + itemLower === targetPartLower) isMatch = true;
             }
-
-            if (isMatch) {
-                const res = searchRecursive(path.join(currentDir, item), remain);
-                if (res) return res;
-            }
+            if (isMatch) return item;
         }
-        return null; 
+        return null;
     }
 
-    let found = searchRecursive(baseDir, parts);
-    if (found) return found;
+    function resolveDir(startDir, dirParts) {
+        let currentDir = startDir;
+        for (let i = 0; i < dirParts.length; i++) {
+            const targetPartLower = sanitize(dirParts[i]).toLowerCase();
+            const isProtocolDir = (path.basename(currentDir) === 'http' || path.basename(currentDir) === 'https');
+            const matched = matchChild(currentDir, targetPartLower, isProtocolDir);
+            if (!matched) return null;
+            currentDir = path.join(currentDir, matched);
+        }
+        return currentDir;
+    }
 
-    if (parts.length > 0 && !parts[0].startsWith('http')) {
-        let tryHttp = searchRecursive(baseDir, ['http', ...parts]);
-        if (tryHttp) return tryHttp;
+    function resolveFile(dir, baseName) {
+        const targetPartLower = sanitize(baseName).toLowerCase();
+        const isProtocolDir = (path.basename(dir) === 'http' || path.basename(dir) === 'https');
+        const matched = matchChild(dir, targetPartLower, isProtocolDir);
+        if (!matched) return null;
+        const full = path.join(dir, matched);
+        if (fs.statSync(full).isFile()) return full;
+        // A directory match: fall back to its index.html.
+        const idx = path.join(full, 'index.html');
+        if (fs.existsSync(idx)) return idx;
+        return null;
+    }
+
+    function findIn(parts, protoPrefix) {
+        const dirParts = parts.slice(0, -1);
+        const baseName = parts[parts.length - 1];
+        const resolvedDir = resolveDir(protoPrefix ? path.join(baseDir, protoPrefix) : baseDir, dirParts);
+        if (!resolvedDir) return null;
+
+        // Query-carrying request → resolve the shortened file via original_url.csv.
+        if (query.length > 1) {
+            const qf = resolveQueryFile(resolvedDir, baseName, query);
+            if (qf) return qf;
+        }
+        return resolveFile(resolvedDir, baseName);
+    }
+
+    for (const variant of variants) {
+        const parts = variant.split('/').filter(p => p && p !== '.');
+        if (parts.length === 0) continue;
+
+        const found = findIn(parts, null);
+        if (found) return found;
+
+        if (!parts[0].startsWith('http')) {
+            const tryHttp = findIn(parts, 'http');
+            if (tryHttp) return tryHttp;
+        }
     }
     return null;
 }
@@ -517,8 +563,9 @@ const server = http.createServer((req, res) => {
         // variant the URL asks for, not just any dir at the same timestamp.
         const requestTs = waybackMatch[1] + (waybackMatch[2] || '');
         let targetUrl = waybackMatch[3];
-        // Strip query string and fragment — they are not part of the file path on disk.
-        targetUrl = targetUrl.replace(/[?#].*$/, '');
+        // Strip the fragment only — the query string must survive so it can be
+        // resolved to a shortened filename via original_url.csv.
+        targetUrl = targetUrl.replace(/#.*$/, '');
 
         const match = findWaybackArchive(requestTs, targetUrl);
         if (match) {
@@ -533,19 +580,30 @@ const server = http.createServer((req, res) => {
     }
 
     // === 3. Process regular file/directory browsing (limited to ARCHIVE_DIR) ===
-    let searchPath = reqUrl.replace(/\?.*$/, '');
+    // Split query/fragment off BEFORE decoding, so the query string stays
+    // percent-encoded (matching what the downloader wrote to original_url.csv).
+    let searchPath = reqUrl;
+    let searchQuery = '';
+    const sqIdx = searchPath.indexOf('?');
+    if (sqIdx >= 0) {
+        searchQuery = searchPath.slice(sqIdx);
+        searchPath = searchPath.slice(0, sqIdx);
+    }
+    const shIdx = searchPath.indexOf('#');
+    if (shIdx >= 0) searchPath = searchPath.slice(0, shIdx);
+
     if (searchPath.startsWith('/')) searchPath = searchPath.substring(1);
     searchPath = decodeURIComponent(searchPath);
 
     // Prioritize searching for files in ARCHIVE_DIR (websites folder)
-    const foundPath = findFileSmart(ARCHIVE_DIR, searchPath);
-    
+    const foundPath = findFileSmart(ARCHIVE_DIR, searchPath + searchQuery);
+
     if (foundPath) {
-        serveFile(res, foundPath, null); 
+        serveFile(res, foundPath, null);
     } else {
         // If file not found, check if it's a physical directory, then display list
         let physicalPath = path.join(ARCHIVE_DIR, searchPath);
-        
+
         if (!fs.existsSync(physicalPath) && searchPath.includes(':/')) {
              let fixedSearch = searchPath.replace(':/', '/');
              physicalPath = path.join(ARCHIVE_DIR, fixedSearch);

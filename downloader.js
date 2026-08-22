@@ -10,7 +10,10 @@ const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { sanitizeSegment, loadConfig } = require('./common');
+const {
+    sanitizeSegment, loadConfig, randomBase62,
+    applyQuerySuffix, hostSegment, extractExplicitPort, csvEscape, parseOriginalUrlCsv
+} = require('./common');
 
 // === Configuration Area ===
 const config = loadConfig();
@@ -22,13 +25,19 @@ const CONFIG = {
     concurrency: 8, // Number of concurrent downloads
     stateFile: path.join(__dirname, 'download_state.json'),
     mappingFile: path.join(__dirname, 'filename_mapping.json'), // Used to record long filename mappings
-    timeout: 30000,
+    timeout: 120000,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.0.0 Safari/537.36'
 };
 
 // === State initialization ===
 let downloaded = new Set();
 let urlMapping = {};
+
+// Query-string CSV entries accumulated this run, flushed on saveState().
+// Keyed by directory so several downloads into the same directory don't race
+// on read-modify-write of one CSV file.
+const csvBuffer = new Map();   // dir -> Map(shortened -> originalUrl)
+const usedShortened = new Set(); // every shortened name generated this run
 
 try {
     if (fs.existsSync(CONFIG.stateFile)) {
@@ -42,16 +51,72 @@ try {
     }
 } catch (e) {}
 
+/**
+ * Read the existing original_url.csv in `dir`, if any, and return both a
+ * URL→shortened reverse map and the set of shortened names already taken.
+ */
+function readExistingCsv(dir) {
+    const byUrl = {};
+    const shortenedNames = new Set();
+    try {
+        const csvPath = path.join(dir, 'original_url.csv');
+        if (fs.existsSync(csvPath)) {
+            for (const r of parseOriginalUrlCsv(fs.readFileSync(csvPath, 'utf-8'))) {
+                byUrl[r.url] = r.shortened;
+                shortenedNames.add(r.shortened);
+            }
+        }
+    } catch (e) {}
+    return { byUrl, shortenedNames };
+}
+
+/** Write every accumulated CSV entry to disk, merging with existing rows. */
+function flushCsv() {
+    for (const [dir, entries] of csvBuffer) {
+        if (entries.size === 0) continue;
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+            const csvPath = path.join(dir, 'original_url.csv');
+
+            // Merge: existing rows on disk, then this run's entries.
+            const merged = new Map();
+            if (fs.existsSync(csvPath)) {
+                for (const r of parseOriginalUrlCsv(fs.readFileSync(csvPath, 'utf-8'))) {
+                    merged.set(r.shortened, r.url);
+                }
+            }
+            for (const [shortened, url] of entries) {
+                merged.set(shortened, url);
+            }
+
+            const lines = ['Shortened,URL'];
+            for (const [shortened, url] of merged) {
+                lines.push(csvEscape(shortened) + ',' + csvEscape(url));
+            }
+            fs.writeFileSync(csvPath, lines.join('\n') + '\n');
+        } catch (e) {
+            console.error(`Failed to write original_url.csv in ${dir}: ${e.message}`);
+        }
+    }
+    csvBuffer.clear();
+}
+
 function saveState() {
     try {
         fs.writeFileSync(CONFIG.stateFile, JSON.stringify([...downloaded], null, 2));
         fs.writeFileSync(CONFIG.mappingFile, JSON.stringify(urlMapping, null, 2));
+        flushCsv();
     } catch (e) {}
 }
 
 /**
  * [Core] Calculate local storage path
- * Compatible with Wayback links and direct links
+ * Compatible with Wayback links and direct links.
+ *
+ * Returns { destPath, csv } where `csv` is null unless the URL carried a query
+ * string.  In that case the file is renamed with an anti-collision base62
+ * suffix and `csv` = { dir, shortened, originalUrl } describes the
+ * original_url.csv row to write.
  */
 function getLocalPath(inputUrl) {
     try {
@@ -62,12 +127,14 @@ function getLocalPath(inputUrl) {
         // 1. Determine if it's a Wayback link.
         //    Matching format: /web/20011024204821/http://...
         //
-        //    Strip query string and fragment BEFORE the regex so query params
-        //    that happen to contain "/web/<ts>/…" (e.g.
-        //    donate.php?referer=…/web/…/…) don't cause false-positive wayback
-        //    matches that throw when new URL() tries to parse garbled input.
-        const baseUrl = inputUrl.replace(/[?#].*$/, '');
-        const wbMatch = baseUrl.match(/\/web\/(\d{4,14})([a-z0-9_]+)?\/(.*)/);
+        //    Parse the full URL first and match the wayback signature against
+        //    the *pathname* only.  The query string belongs to the inner
+        //    original URL (e.g. …/web/ts/http://host/a.asp?x=1) so it must NOT
+        //    be stripped here — matching on pathname also keeps a query param
+        //    that happens to contain "/web/<ts>/…" from causing a
+        //    false-positive wayback match.
+        const fullObj = new URL(inputUrl);
+        const wbMatch = fullObj.pathname.match(/\/web\/(\d{4,14})([a-z0-9_]+)?\/(.*)/);
 
         if (wbMatch) {
             isWayback = true;
@@ -75,7 +142,8 @@ function getLocalPath(inputUrl) {
             // that follows the timestamp. Dropping it flattens distinct content
             // types that share one timestamp into a single directory.
             ts = wbMatch[1] + (wbMatch[2] || '');
-            rawUrl = wbMatch[3]; // Extract the actual original URL
+            // Reconstruct the inner original URL (path + query).  Fragment is dropped.
+            rawUrl = wbMatch[3] + fullObj.search;
         }
 
         // 2. Complete protocol (to prevent input of links without protocol headers like google.com)
@@ -91,24 +159,29 @@ function getLocalPath(inputUrl) {
         const urlObj = new URL(rawUrl);
 
         // 4. Build path segments
-        
+
         // Protocol directory: 'http' or 'https'
         // Note: If it's a Wayback link, this is usually already included in rawUrl
-        const protocolDir = urlObj.protocol.replace(':', ''); 
-        
+        const protocolDir = urlObj.protocol.replace(':', '');
+
         // Hostname: the URL parser already lowercases this (DNS is
         // case-insensitive), which also keeps the filesystem tidy.
         const hostname = urlObj.hostname;
-        
-        // Port
-        const port = urlObj.port ? urlObj.port : '';
+
+        // Port.  Use the explicit port from the raw URL when present — `new URL()`
+        // normalizes default ports (http:80 / https:443) to empty, but we still
+        // want to record those so an archive that mixes :80 and :443 requests
+        // doesn't collapse them into one directory.  Colon → __port__ in the
+        // host segment below.
+        const explicitPort = extractExplicitPort(rawUrl);
+        const port = explicitPort !== '' ? explicitPort : (urlObj.port || '');
+        const query = urlObj.search || ''; // "?a=1&b=2" or ""
 
         // Path: [Important] decode and strictly preserve case sensitivity
         // urlObj.pathname by default preserves the case sensitivity of rawUrl
         const rawPathName = urlObj.pathname.substring(1); // remove leading /
-        
-        let pathParts = [protocolDir, hostname];
-        if (port) pathParts.push(port);
+
+        let pathParts = [protocolDir, hostSegment(hostname, port)];
 
         if (rawPathName) {
             const splitted = rawPathName.split('/').filter(p => p);
@@ -141,22 +214,60 @@ function getLocalPath(inputUrl) {
         // calendar / index page instead of real archived content), so name it
         // distinctly to avoid clobbering a real captured index.html. A bare
         // domain with no path still gets plain index.html.
-        if (rawUrl.endsWith('/')) {
+        if (rawUrl.replace(/[?#].*$/, '').endsWith('/')) {
              safeParts.push('__wayback__directory_index.html');
         } else if (safeParts.length <= 2) {
              safeParts.push('index.html');
         }
 
-        // 7. Assemble final path
+        // 7. Query-string handling: rename the file with an anti-collision
+        //    base62 suffix so `?`/`&` never land in a filename (and we never
+        //    blow the path-length limit).  Reuse an existing mapping so re-runs
+        //    are idempotent.
+        let csvEntry = null;
+        if (query.length > 1) {
+            const originalName = safeParts[safeParts.length - 1]; // e.g. "abc.htm"
+            const dir = isWayback
+                ? path.join(CONFIG.baseDir, 'https', 'web.archive.org', 'web', ts, ...safeParts.slice(1, -1))
+                : path.join(CONFIG.baseDir, ...safeParts.slice(0, -1));
+
+            const originalUrl = originalName + query;
+            const existing = readExistingCsv(dir);
+
+            let shortened = existing.byUrl[originalUrl];
+            if (!shortened) {
+                let suffix;
+                do {
+                    suffix = randomBase62(8);
+                    shortened = applyQuerySuffix(originalName, suffix);
+                } while (
+                    existing.shortenedNames.has(shortened) ||
+                    usedShortened.has(shortened) ||
+                    fs.existsSync(path.join(dir, shortened))
+                );
+                usedShortened.add(shortened);
+            }
+
+            safeParts[safeParts.length - 1] = shortened;
+            csvEntry = { dir, shortened, originalUrl };
+        }
+
+        // 8. Assemble final path
         if (isWayback) {
             // Wayback mode: websites/https/web.archive.org/web/TIMESTAMP/domain/path
             // web.archive.org is an HTTPS domain, so it lives under https/.
             // safeParts = [protocolDir, hostname, ...pathParts]
             // Insert 'web.archive.org/web/ts' between protocolDir and hostname
-            return path.join(CONFIG.baseDir, 'https', 'web.archive.org', 'web', ts, ...safeParts.slice(1));
+            return {
+                destPath: path.join(CONFIG.baseDir, 'https', 'web.archive.org', 'web', ts, ...safeParts.slice(1)),
+                csv: csvEntry
+            };
         } else {
             // Direct link mode: websites/http/domain/path
-            return path.join(CONFIG.baseDir, ...safeParts);
+            return {
+                destPath: path.join(CONFIG.baseDir, ...safeParts),
+                csv: csvEntry
+            };
         }
 
     } catch (e) {
@@ -168,8 +279,14 @@ function getLocalPath(inputUrl) {
 
 /**
  * General download function
+ *
+ * `hasQuery` is true when the destination was named for a query-carrying URL
+ * (i.e. it is already a shortened filename like `cdx_AA2aEIMj`).  In that
+ * case we must NOT do content-type extension completion, because it would
+ * rename/move the file away from the name recorded in original_url.csv and
+ * break the server's reverse lookup.
  */
-function downloadFile(url, suggestedPath, redirectCount = 0) {
+function downloadFile(url, suggestedPath, redirectCount = 0, hasQuery = false) {
     if (redirectCount > 5) return Promise.reject("Too many redirects");
 
     return new Promise((resolve, reject) => {
@@ -201,7 +318,7 @@ function downloadFile(url, suggestedPath, redirectCount = 0) {
                 }
                 
                 res.resume();
-                downloadFile(newUrl, suggestedPath, redirectCount + 1).then(resolve).catch(reject);
+                downloadFile(newUrl, suggestedPath, redirectCount + 1, hasQuery).then(resolve).catch(reject);
                 return;
             }
 
@@ -216,8 +333,8 @@ function downloadFile(url, suggestedPath, redirectCount = 0) {
             const ct = res.headers['content-type'] || '';
 
             // Intelligent extension completion (if path has no extension,
-            // complete based on header)
-            if (!currentExt) {
+            // complete based on header) — skipped for query-shortened names.
+            if (!currentExt && !hasQuery) {
                 if (ct.includes('text/html')) finalDest = path.join(finalDest, 'index.html');
                 else if (ct.includes('image/jpeg')) finalDest += '.jpg';
                 else if (ct.includes('image/png')) finalDest += '.png';
@@ -297,13 +414,14 @@ async function start() {
             if (downloaded.has(url)) continue;
 
             // Get storage path
-            const dest = getLocalPath(url);
-            
-            if (!dest) {
+            const result = getLocalPath(url);
+
+            if (!result) {
                 // If parsing fails, don't error, just skip
                 // console.log(`[Thread ${id}] Skipped invalid URL`);
-                continue; 
+                continue;
             }
+            const dest = result.destPath;
 
             // Local file existence check
             let skip = false;
@@ -311,20 +429,23 @@ async function start() {
             if (fs.existsSync(dest) && fs.statSync(dest).isFile() && fs.statSync(dest).size > 0) skip = true;
             // Check if it already exists as index.html
             else if (fs.existsSync(path.join(dest, 'index.html')) && fs.statSync(path.join(dest, 'index.html')).size > 0) skip = true;
-            
+
             if (skip) {
                 downloaded.add(url);
                 continue;
             }
 
             try {
-                await downloadFile(url, dest);
-                // Print slightly shorter logs
-                const displayUrl = url.length > 60 ? url.substring(0, 57) + '...' : url;
-                console.log(`[Thread ${id}] OK: ${displayUrl}`);
+                await downloadFile(url, dest, 0, !!result.csv);
+                // Record the query mapping once the file is safely on disk.
+                if (result.csv) {
+                    if (!csvBuffer.has(result.csv.dir)) csvBuffer.set(result.csv.dir, new Map());
+                    csvBuffer.get(result.csv.dir).set(result.csv.shortened, result.csv.originalUrl);
+                }
+                console.log(`[Thread ${id}] OK: ${url}`);
                 downloaded.add(url);
             } catch (err) {
-                console.log(`[Thread ${id}] FAIL: ${err} | ${url.substring(0, 50)}...`);
+                console.log(`[Thread ${id}] FAIL: ${err} | ${url}`);
             }
 
             if (currentIndex % 10 === 0) saveState();
