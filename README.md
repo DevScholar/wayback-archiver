@@ -1,4 +1,4 @@
-# WACZ Archiver
+# Wayback Archiver
 
 Read [WACZ](https://webrecorder.net/wacz) web archives: capture URLs into a new
 WACZ, export them to a standalone flat HTML folder, or serve them for replay in
