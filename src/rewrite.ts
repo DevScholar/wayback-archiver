@@ -137,6 +137,11 @@ function rewriteHtml(content: string, baseUrl: string, rewrite: UrlRewriter): st
     // whose target lives in the `content` attribute, not in href/src. It fires
     // as soon as the head is parsed — before any runtime shim can touch it — so
     // it must be rewritten here or the page jumps straight to the live web.
+    //
+    // Non-standard `<meta>` fields (Open Graph, Twitter Card, schema.org) are
+    // deliberately left untouched: they only matter to social-media crawlers
+    // and online search engines, so rewriting their URLs buys nothing for a
+    // local archive and would mangle markup we don't own.
     const META_RE = /<meta\b[^>]*>/gi;
     content = content.replace(META_RE, (tag) => {
         if (!/http-equiv\s*=\s*["']?refresh["']?/i.test(tag)) return tag;
