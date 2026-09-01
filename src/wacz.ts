@@ -141,39 +141,49 @@ export class Wacz {
     }
 
     /**
-     * Resolve a URL against the index, preferring the capture nearest to (but
-     * not after) a target timestamp prefix. `ts` may be a full 17-digit
-     * timestamp or any shorter prefix; matches are compared on that prefix.
-     * Falls back to the earliest capture when no capture is at-or-before.
+     * Resolve a URL against the index, preferring the capture closest to a
+     * target timestamp prefix by absolute distance — the same rule the Wayback
+     * Machine uses for replay (a miss may resolve either forward to a later
+     * capture or backward to an earlier one, whichever is nearer). Ties are
+     * broken toward the earlier capture. `ts` may be a full 17-digit timestamp
+     * or any shorter prefix. Falls back to the earliest capture when the URL is
+     * not indexed at all.
      */
     resolveAt(url: string, ts: string): CdxjEntry | null {
-        // A truncated timestamp means "the end of the smallest specified
-        // unit", so pad with 9s (not 0s) to make it an inclusive upper bound.
-        // E.g. "20260831074847" (second precision) -> "...74847999" so a
-        // capture at 48:47.976 is at-or-before it, while a capture in the next
-        // second (48:48.000) is not.
+        // A truncated timestamp names the end of the smallest specified unit,
+        // so pad with 9s (not 0s) to make the target point the inclusive upper
+        // bound of that unit (e.g. "20260831074847" -> "...74847999").
         const target = ts.padEnd(17, '9');
-        let best: CdxjEntry | null = null;
+
+        const best = { before: null as CdxjEntry | null, after: null as CdxjEntry | null };
+
+        const consider = (e: CdxjEntry): void => {
+            if (e.timestamp <= target) {
+                if (!best.before || e.timestamp > best.before.timestamp) best.before = e;
+            } else {
+                if (!best.after || e.timestamp < best.after.timestamp) best.after = e;
+            }
+        };
+
         for (const cand of candidateUrls(url)) {
             const list = this._indexByKey.get(lookupKey(cand));
-            if (!list) continue;
-            for (const e of list) {
-                // Skip captures after the target time.
-                if (e.timestamp > target) continue;
-                // Keep the latest capture at-or-before the target.
-                if (!best || e.timestamp > best.timestamp) best = e;
-            }
+            if (list) for (const e of list) consider(e);
         }
-        if (best) return best;
-        // Query-variant fallback, still honoring the timestamp bound.
-        const plist = this._indexByPath.get(lookupPathKey(url));
-        if (plist) {
-            for (const e of plist) {
-                if (e.timestamp > target) continue;
-                if (!best || e.timestamp > best.timestamp) best = e;
-            }
+
+        // Query-variant fallback: same scheme/host/port/path, any query.
+        if (!best.before && !best.after) {
+            const plist = this._indexByPath.get(lookupPathKey(url));
+            if (plist) for (const e of plist) consider(e);
         }
-        return best ?? this.resolve(url);
+
+        const before = best.before;
+        const after = best.after;
+        if (!before) return after ?? this.resolve(url);
+        if (!after) return before;
+        // Pick the closer side; on an exact tie, prefer the earlier capture.
+        const gapBefore = BigInt(target) - BigInt(before.timestamp);
+        const gapAfter = BigInt(after.timestamp) - BigInt(target);
+        return gapBefore <= gapAfter ? before : after;
     }
 
     /**

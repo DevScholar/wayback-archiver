@@ -25,6 +25,19 @@ export type ContentKind = 'html' | 'css' | 'js';
 
 const SKIP_SCHEME = /^(javascript|data|mailto|blob|about):/i;
 
+/** Decode the HTML entities that realistically show up inside a URL in an
+ * attribute value (`&amp;` being the common one); everything else is left
+ * untouched. */
+function decodeHtmlEntities(s: string): string {
+    return s
+        .replace(/&amp;/gi, '&')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&#x27;/gi, "'");
+}
+
 /** Resolve any URL reference (absolute, root-relative, or relative) to an
  * absolute URL, using the resource's own URL as the base. Returns null when
  * the reference cannot or should not be rewritten. */
@@ -118,6 +131,28 @@ function rewriteHtml(content: string, baseUrl: string, rewrite: UrlRewriter): st
         const out = rewrite(abs);
         if (out === null) return match;
         return `@import "${out}";`;
+    });
+
+    // <meta http-equiv="refresh" content="…; URL=…">: a client-side redirect
+    // whose target lives in the `content` attribute, not in href/src. It fires
+    // as soon as the head is parsed — before any runtime shim can touch it — so
+    // it must be rewritten here or the page jumps straight to the live web.
+    const META_RE = /<meta\b[^>]*>/gi;
+    content = content.replace(META_RE, (tag) => {
+        if (!/http-equiv\s*=\s*["']?refresh["']?/i.test(tag)) return tag;
+        return tag.replace(/(content\s*=\s*)(["'])([\s\S]*?)\2/i, (whole, name: string, quote: string, value: string) => {
+            // `url=` is the last field of the content value, so the URL is
+            // everything after it to the end. Do NOT split on `;`: an HTML
+            // entity like `&amp;` ends in `;` and would truncate the URL there.
+            const m = /^(.*?\burl\s*=\s*)([\s\S]*)$/is.exec(value);
+            if (!m) return whole;
+            const abs = toAbsolute(decodeHtmlEntities(m[2].trim()), baseUrl);
+            if (abs === null) return whole;
+            const out = rewrite(abs);
+            if (out === null) return whole;
+            // Re-encode `&` so a rewritten query stays a valid attribute value.
+            return `${name}${quote}${m[1]}${out.replace(/&/g, '&amp;')}${quote}`;
+        });
     });
 
     return content;

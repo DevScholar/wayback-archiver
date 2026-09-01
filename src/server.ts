@@ -18,6 +18,8 @@ import { WarcRecord } from './warc';
 import { renderIndexPage, IndexRow } from './index-page';
 import { rfc3339ToTs14 } from './time';
 import { createDefaultPipeline, ReplayContext } from './plugins';
+import { URL_FIXER_SCRIPT_ROUTE } from './url-fixer';
+import { URL_FIXER_SHIM } from './url-fixer-shim';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -186,6 +188,19 @@ function main(): void {
 
     const server = http.createServer((req, res) => {
         const reqUrl = req.url || '/';
+
+        // The url-fixer runtime shim, served as an external script. Injected
+        // into every HTML page by the url-fixer plugin via a <script src> that
+        // points here; serving it from a stable, cacheable route (rather than
+        // inlining it per page) mirrors how Wayback serves wombat.js.
+        if (reqUrl === URL_FIXER_SCRIPT_ROUTE) {
+            res.writeHead(200, {
+                'Content-Type': 'application/javascript; charset=utf-8',
+                'Cache-Control': 'no-cache',
+            });
+            res.end(URL_FIXER_SHIM);
+            return;
+        }
 
         // Index page — generated on demand from the archive.
         if (reqUrl === '/' || reqUrl === '/index.html') {
