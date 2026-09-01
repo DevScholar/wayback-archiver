@@ -1,22 +1,26 @@
 {
-  "name": "archive-web-server",
-  "version": "1.0.0",
-  "description": "Historical archive web page viewing server",
-  "main": "server.js",
+  "name": "wacz-archiver",
+  "version": "2.0.0",
+  "description": "Read WACZ web archives: export to standalone HTML and serve for replay",
   "private": true,
   "scripts": {
-    "dev": "node server.js",
-    "start": "node server.js"
+    "download": "tsx src/downloader.ts",
+    "export": "tsx src/export-to-html.ts",
+    "server": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
   },
   "keywords": [
-    "archive",
-    "wayback",
-    "history",
-    "web-server"
+    "wacz",
+    "web-archive",
+    "replay",
+    "warc"
   ],
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "playwright": "^1.61.1"
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
   }
 }

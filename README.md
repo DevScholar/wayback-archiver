@@ -1,34 +1,64 @@
-# Wayback Archiver
+# WACZ Archiver
 
-## Download Files
-From the "Network" tab in the browser console, copy all URLs that need to be archived.
-Copy the URLs to the `user-private/urls.txt` file, with each URL on a separate line. Then run the `node downloader.js` file.
+Read [WACZ](https://webrecorder.net/wacz) web archives: capture URLs into a new
+WACZ, export them to a standalone flat HTML folder, or serve them for replay in
+a browser.
 
-## Create Index Page
-Run the `node indexer.js` file.    
+The project was rewritten around the WACZ container format. All
+Archive.org-specific handling was removed, the TypeScript codebase is split into
+small single-purpose modules, and there are no runtime dependencies (only
+TypeScript and `tsx` are needed as dev dependencies — no GPL/AGPL libraries).
 
-## Run Server
-Run the `node server.js` file.
+## Requirements
 
-## Flatten Archive
-Run `node flatten.js` to convert the archive into a standalone folder that can be browsed without a server (file:// protocol).
+- Node.js >= 20
+- `npm install` (installs TypeScript, `tsx`, and `@types/node` only)
+
+## Capture URLs into a WACZ
 
 ```
-node flatten.js --output-dir=<PATH> [--archive-dir=<PATH>] [--date=<YYYY[-MM][-DD]>]
+npx tsx src/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]
 ```
 
-| Argument | Required | Description |
-|---|---|---|
-| `--output-dir=<PATH>` | Yes | Output directory for the flattened archive |
-| `--archive-dir=<PATH>` | No | Archive directory. Defaults to `user-private/config.json`'s `currentSaveLocation` |
-| `--date=<YYYY[-MM][-DD]>` | No | Preferred date for selecting snapshots. Defaults to today |
+`my-urls.txt` holds one URL per line (blank lines and `#` comments are
+ignored). Each URL is fetched once and archived as a WARC 1.1 `response` record
+inside `archive/data.warc.gz`; the title defaults to the output file's basename.
 
-config.json example:
+The download is **incremental**: if `--output-file` already exists, it is
+appended to rather than replaced. URLs already in the archive are skipped (not
+re-fetched), existing records are kept byte-for-byte, and only new URLs are
+added. Omitting `--title` keeps the existing title; providing it renames the
+archive. Options: `--concurrency` (default 8).
 
-```json
-{
-  "currentSaveLocation": "__USER_DOCUMENTS__/wayback-archiver/websites/untitled/"
-}
+## Export to standalone HTML
+
+```
+npx tsx src/export-to-html.ts <archive.wacz> [--out <dir>]
 ```
 
-This software is licensed under the MIT License.
+Extracts every archived resource into a flat folder. Files are named
+`<prefix>~<n><ext>` where `<prefix>` is the first five characters of the
+original file name and `<n>` disambiguates files that share a prefix
+(`about~1.html`, `infor~2.asp`, `cdx~1`). Two metadata files are written to the
+output root:
+
+- `urls.csv` — `File Name,Timestamp,Original URLs` mapping, timestamps in
+  WACZ-compatible RFC3339 form.
+- `index.html` — a pre-generated index page.
+
+If `--out` is omitted, output defaults to `<archive>-html/` next to the archive.
+
+## Serve for replay
+
+```
+npx tsx src/server.ts <archive.wacz> [--port 8080] [--expose]
+```
+
+Serves the archive at `http://localhost:8080/`. The index page is generated on
+demand from the archive's index, and archived content is served through
+`/web/<timestamp>/<url>` routes with links rewritten to stay local. Pass
+`--expose` to bind `0.0.0.0` and allow LAN access.
+
+## License
+
+MIT

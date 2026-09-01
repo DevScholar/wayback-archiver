@@ -1,4 +1,5 @@
 node_modules
 user-private/
-download_state.json
-filename_mapping.json
+dist/
+*.wacz
+*-html/
