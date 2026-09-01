@@ -80,3 +80,24 @@ ${body}
 </html>
 `;
 }
+
+/**
+ * Build the index-page rows from the archive's pages. The replay server and the
+ * flat export share everything about this step except how a page's URL becomes
+ * the link target: the server points at a `/web/<ts>/<url>` replay route, the
+ * export at a flat file name. That difference is passed in as `hrefFor`; it
+ * returns null for a page that should be omitted (e.g. one the export wrote no
+ * file for).
+ */
+export function buildPageRows(
+    pages: { url: string; ts: string; title?: string }[],
+    hrefFor: (url: string, ts: string) => string | null,
+): IndexRow[] {
+    const rows: IndexRow[] = [];
+    for (const p of pages) {
+        const href = hrefFor(p.url, p.ts);
+        if (href === null) continue;
+        rows.push({ href, name: p.title || p.url, timestamp: p.ts, url: p.url });
+    }
+    return rows;
+}

@@ -15,7 +15,7 @@
  */
 
 import { rewriteContent, detectContentKind, UrlRewriter } from './rewrite';
-import { lookupKey, lookupPathKey } from './url';
+import { lookupKey, lookupPathKey, lookupKeyCi } from './url';
 import { createUrlFixerPlugin } from './url-fixer';
 
 export interface ReplayContext {
@@ -33,6 +33,8 @@ export interface ReplayContext {
     flatMap?: Map<string, string>;
     /** Flat mode only: lookupPathKey(url) -> exported file name (query ignored). */
     flatPathMap?: Map<string, string>;
+    /** Flat mode only: lookupKeyCi(url) -> exported file name (case-insensitive). */
+    flatCiMap?: Map<string, string>;
 }
 
 export interface ResponsePlugin {
@@ -86,6 +88,11 @@ export function createStaticRewritePlugin(): ResponsePlugin {
                     // references another.
                     const byPath = ctx.flatPathMap ? ctx.flatPathMap.get(lookupPathKey(abs)) : undefined;
                     if (byPath) return byPath;
+                    // Case-insensitive fallback (last resort): the page
+                    // references a path in a different case than the crawler
+                    // stored (legacy case-insensitive servers, e.g. old IIS).
+                    const byCi = ctx.flatCiMap ? ctx.flatCiMap.get(lookupKeyCi(abs)) : undefined;
+                    if (byCi) return byCi;
                     // Not saved: point at the local 404 page, carrying the
                     // original URL so it can be shown. Captive — nothing leaks
                     // to the live web.

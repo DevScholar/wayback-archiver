@@ -84,6 +84,25 @@ export function lookupPathKey(raw: string): string {
 }
 
 /**
+ * Case-insensitive lookup key: lowercase scheme, host, AND path, keeping the
+ * query string as-is (query values may themselves be case-sensitive). This is
+ * NOT the primary key — it is tried only as a last resort when an exact match
+ * misses, to mirror the Wayback Machine's case-insensitive path matching
+ * against legacy case-insensitive servers (old IIS/Win32 paths). Lowercasing
+ * the path on the primary key would wrongly collapse `Foo.jpg` and `foo.jpg`
+ * (distinct resources on a case-sensitive server), so it stays a separate,
+ * fallback-only key.
+ */
+export function lookupKeyCi(raw: string): string {
+    const p = parseUrl(raw);
+    if (!p) return raw.toLowerCase();
+    return (
+        p.protocol.toLowerCase() + '://' + p.hostname.toLowerCase() +
+        (p.port ? ':' + p.port : '') + (p.pathname || '/').toLowerCase() + p.search
+    );
+}
+
+/**
  * Yield candidate URLs for a requested URL, ordered by how likely each is to
  * hit the index. `www.`/scheme alternates come last because they are less
  * precise than an exact match.

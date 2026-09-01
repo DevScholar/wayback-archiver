@@ -15,7 +15,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { Wacz } from './wacz';
 import { WarcRecord } from './warc';
-import { renderIndexPage, IndexRow } from './index-page';
+import { renderIndexPage, buildPageRows } from './index-page';
 import { rfc3339ToTs14 } from './time';
 import { createDefaultPipeline, ReplayContext } from './plugins';
 import { URL_FIXER_SCRIPT_ROUTE } from './url-fixer';
@@ -177,12 +177,7 @@ function main(): void {
     // The index page lists the archive's *pages* (from pages.jsonl), not every
     // captured resource. Each entry points at a /web/<ts>/<url> replay route.
     const buildIndexPage = (): string => {
-        const rows: IndexRow[] = wacz.pages.map((p) => ({
-            href: `/web/${rfc3339ToTs14(p.ts)}/${p.url}`,
-            name: p.title || p.url,
-            timestamp: p.ts,
-            url: p.url,
-        }));
+        const rows = buildPageRows(wacz.pages, (url, ts) => `/web/${rfc3339ToTs14(ts)}/${url}`);
         return renderIndexPage(wacz.title, rows, ['Page', 'Timestamp', 'Original URL']);
     };
 

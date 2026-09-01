@@ -10,7 +10,7 @@ import * as zlib from 'zlib';
 import { ZipReader } from './zip';
 import { parseWarcRecord, WarcRecord } from './warc';
 import { parseCdxj, CdxjEntry } from './cdxj';
-import { candidateUrls, lookupKey, lookupPathKey } from './url';
+import { candidateUrls, lookupKey, lookupPathKey, lookupKeyCi } from './url';
 
 export interface WaczPage {
     url: string;
@@ -35,6 +35,8 @@ export class Wacz {
     private _indexByKey = new Map<string, CdxjEntry[]>();
     /** lookupPathKey(url) -> all captures sharing that scheme/host/port/path, any query. */
     private _indexByPath = new Map<string, CdxjEntry[]>();
+    /** lookupKeyCi(url) -> all captures whose scheme/host/path differ only by case. */
+    private _indexByKeyCi = new Map<string, CdxjEntry[]>();
     /** Maps a WARC file basename (from CDXJ `filename`) to its ZIP entry path. */
     private _warcEntries = new Map<string, string>();
     private _title = '';
@@ -88,6 +90,11 @@ export class Wacz {
                 const plist = this._indexByPath.get(pkey);
                 if (plist) plist.push(e);
                 else this._indexByPath.set(pkey, [e]);
+
+                const cikey = lookupKeyCi(e.url);
+                const cilist = this._indexByKeyCi.get(cikey);
+                if (cilist) cilist.push(e);
+                else this._indexByKeyCi.set(cikey, [e]);
             }
             // Sort each list by ascending timestamp so timestamp-aware lookups
             // can pick "the latest capture at or before T" and "the nearest".
@@ -95,6 +102,9 @@ export class Wacz {
                 list.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
             }
             for (const list of this._indexByPath.values()) {
+                list.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+            }
+            for (const list of this._indexByKeyCi.values()) {
                 list.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
             }
         }
@@ -137,6 +147,13 @@ export class Wacz {
         // at `?w=400` archived only at `?w=1200&dpr=on,2`).
         const plist = this._indexByPath.get(lookupPathKey(url));
         if (plist && plist.length) return plist[0];
+
+        // Case-insensitive fallback (last resort): the page references a path
+        // in a different case than the crawler stored (legacy case-insensitive
+        // servers, e.g. old IIS). Exact match already won above, so this only
+        // fires on a genuine miss.
+        const cilist = this._indexByKeyCi.get(lookupKeyCi(url));
+        if (cilist && cilist.length) return cilist[0];
         return null;
     }
 
@@ -174,6 +191,13 @@ export class Wacz {
         if (!best.before && !best.after) {
             const plist = this._indexByPath.get(lookupPathKey(url));
             if (plist) for (const e of plist) consider(e);
+        }
+
+        // Case-insensitive fallback (last resort): exact + query-variant both
+        // missed; try the same resource under a differently-cased path.
+        if (!best.before && !best.after) {
+            const cilist = this._indexByKeyCi.get(lookupKeyCi(url));
+            if (cilist) for (const e of cilist) consider(e);
         }
 
         const before = best.before;
