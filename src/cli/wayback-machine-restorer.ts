@@ -185,7 +185,24 @@ function stripWaybackChrome(html: string): string {
     const he = out.search(/<\/html>/i);
     if (he >= 0) out = out.slice(0, he + 7);
 
+    // 4. Some resources (ASP endpoints that emit CSS/JS) get the footer appended
+    //    as a CSS/JS block comment instead of after </html>. Truncate at the
+    //    comment opener in either form.
+    out = stripWaybackFooter(out);
+
     return out;
+}
+
+/**
+ * Strip the Wayback "FILE ARCHIVED ON ..." + "playback timings" footer that is
+ * appended to every replayed response. It appears as an HTML comment after
+ * `</html>`, or as a CSS/JS block comment when the resource is a stylesheet or
+ * script (including ASP endpoints mislabeled text/html). Truncate at the comment
+ * opener in either form; nothing of historical value follows it.
+ */
+function stripWaybackFooter(text: string): string {
+    const foot = text.search(/(?:<!--|\/\*)\s*FILE ARCHIVED ON/i);
+    return foot >= 0 ? text.slice(0, foot) : text;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,41 +242,71 @@ const WAYBACK_DROP_HEADERS = new Set([
 const ORIG_HEADER_PREFIX = 'x-archive-orig-';
 
 /**
- * Rebuild the HTTP headers of a restored record:
- *   - fold `X-Archive-Orig-<Name>` back to `<Name>` (the historical header);
- *   - drop Wayback's replay headers;
- *   - drop `content-length`/`content-encoding` (framing is recomputed);
- *   - keep the record's own `content-type` (Wayback serves binary with the
- *     right type), falling back to `mime`.
+ * Rebuild the HTTP headers of a restored record so they read as if the era's
+ * server had answered directly, not Wayback's 2026 replay frontend.
+ *
+ * Wayback folds the *historical* response headers under `X-Archive-Orig-<Name>`
+ * (`x-archive-orig-server: Microsoft-IIS/4.0`, `x-archive-orig-date: Thu, 18
+ * Feb 1999 12:51:17 GMT`, ...) while serving its own modern headers on the same
+ * response (`server: nginx`, `cache-control: max-age=1800`, `date: Mon, 31 Aug
+ * 2026 ...`, CSP, permissions-policy, ...). When those historical headers are
+ * present they ARE the real response headers -- reconstruct from them alone and
+ * discard every replay header, so a modern replay artifact can never leak into
+ * the restored record.
+ *
+ * When a record carries no `X-Archive-Orig-*` (a directly-captured resource),
+ * its own headers are already historical -- keep them, dropping only the
+ * framing that the writer recomputes.
  */
-function restoreHeaders(record: WarcRecord, fallbackMime: string): [string, string][] {
+function restoreHeaders(record: WarcRecord, fallbackMime: string, body: Buffer): [string, string][] {
     const result: [string, string][] = [];
     const seen = new Set<string>();
-
-    // Historical headers first -- highest fidelity, so they win.
-    for (const [name, value] of record.httpHeaders) {
+    const push = (name: string, value: string) => {
         const lower = name.toLowerCase();
-        if (!lower.startsWith(ORIG_HEADER_PREFIX)) continue;
-        const real = lower.slice(ORIG_HEADER_PREFIX.length);
-        if (real === 'content-length' || real === 'content-encoding') continue;
-        if (seen.has(real)) continue;
-        result.push([real, value]);
-        seen.add(real);
-    }
-
-    // Then the replay headers that aren't chrome and aren't already set.
-    for (const [name, value] of record.httpHeaders) {
-        const lower = name.toLowerCase();
-        if (lower.startsWith(ORIG_HEADER_PREFIX)) continue;
-        if (WAYBACK_DROP_HEADERS.has(lower)) continue;
-        if (seen.has(lower)) continue;
-        result.push([name, value]);
+        if (seen.has(lower)) return;
         seen.add(lower);
+        result.push([name, value]);
+    };
+
+    // Framing headers describe the wire bytes: `content-encoding`/`transfer-
+    // encoding` are stale (the body is stored decoded), and `content-length`
+    // is only trustworthy when the body still matches it (untransformed).
+    const isStaleFraming = (name: string) =>
+        name === 'content-encoding' || name === 'transfer-encoding';
+
+    const hasOrig = [...record.httpHeaders.keys()].some((n) =>
+        n.startsWith(ORIG_HEADER_PREFIX),
+    );
+
+    if (hasOrig) {
+        // Reconstruct from the historical headers alone.
+        for (const [name, value] of record.httpHeaders) {
+            const lower = name.toLowerCase();
+            if (!lower.startsWith(ORIG_HEADER_PREFIX)) continue;
+            const real = lower.slice(ORIG_HEADER_PREFIX.length);
+            if (isStaleFraming(real)) continue;
+            if (real === 'content-length') {
+                if (Number(value) === body.length) push(real, value);
+                continue;
+            }
+            push(real, value);
+        }
+    } else {
+        // Direct capture: keep the record's own headers, minus any Wayback
+        // chrome that still tags along and minus recomputed framing.
+        for (const [name, value] of record.httpHeaders) {
+            const lower = name.toLowerCase();
+            if (lower.startsWith(ORIG_HEADER_PREFIX)) continue;
+            if (WAYBACK_DROP_HEADERS.has(lower)) continue;
+            if (isStaleFraming(lower) || lower === 'content-length') continue;
+            push(name, value);
+        }
     }
 
-    if (!seen.has('content-type')) {
-        result.push(['content-type', fallbackMime || 'application/octet-stream']);
-    }
+    // content-type: an explicit historical value already won above; otherwise
+    // the resolved mime (charset already stripped) is the faithful fallback.
+    if (!seen.has('content-type')) push('content-type', fallbackMime || 'application/octet-stream');
+
     return result;
 }
 
@@ -288,17 +335,42 @@ function extensionOf(url: string): string {
     }
 }
 
-function classifyKind(modifier: string, mime: string, innerUrl: string): ContentKind {
-    if (modifier === 'im_' || modifier === 'id_') return 'binary';
-    if (modifier === 'cs_') return 'css';
-    if (modifier === 'js_') return 'js';
-    if (modifier === '') return 'html';
+/** URL extensions that name a navigable document (a "page"), as opposed to a
+ * subresource. Used to decide what belongs on the index; a resource whose
+ * extension is a page type is a page, everything else (images, css, js, ...) is
+ * not -- even when the server answered it with an HTML error page. */
+const PAGE_EXTENSIONS = new Set([
+    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml',
+]);
 
+/**
+ * True when a URL names a page rather than a subresource. Deliberately based on
+ * the *extension*, not the response mime: a `.gif` that Microsoft answered with
+ * a "Sorry, there is no ..." HTML error page is still an image *location*, not a
+ * page to list on the index. Extensionless URLs (`/`, `/mscorp/`) count as pages.
+ */
+function isPageUrl(url: string): boolean {
+    const ext = extensionOf(url);
+    return ext === '' || PAGE_EXTENSIONS.has(ext);
+}
+
+function classifyKind(modifier: string, mime: string, innerUrl: string): ContentKind {
+    // The response's own content-type is authoritative -- the modifier only
+    // records *how the page referenced* the resource (via an <img>, <link>,
+    // <script>). An error page (404, 500, ...) is served as HTML even when it
+    // was referenced as an image, so `im_` must not force `binary` there:
+    // that would leave Wayback's chrome on the error page and write it out as
+    // a binary blob. Check mime first, fall back to modifier + extension.
     const m = (mime || '').toLowerCase();
     if (/html/.test(m)) return 'html';
     if (/css/.test(m)) return 'css';
     if (/javascript|ecmascript/.test(m)) return 'js';
-    if (/image|audio|video|font|octet-stream/.test(m)) return 'binary';
+    if (/image|audio|video|font/.test(m)) return 'binary';
+
+    if (modifier === 'im_' || modifier === 'id_') return 'binary';
+    if (modifier === 'cs_') return 'css';
+    if (modifier === 'js_') return 'js';
+    if (modifier === '') return 'html';
 
     const ext = extensionOf(innerUrl);
     if (['.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml', '.svg'].includes(ext)) return 'html';
@@ -654,10 +726,10 @@ function main(): void {
             const text = stripWaybackChrome(reverseRewriteText(body.toString('latin1')));
             body = Buffer.from(text, 'latin1');
         } else if (kind === 'css' || kind === 'js') {
-            body = Buffer.from(reverseRewriteText(body.toString('latin1')), 'latin1');
+            body = Buffer.from(stripWaybackFooter(reverseRewriteText(body.toString('latin1'))), 'latin1');
         }
 
-        const headers = restoreHeaders(resolved.record, mime);
+        const headers = restoreHeaders(resolved.record, mime, body);
 
         kept.push({
             innerUrl,
@@ -670,7 +742,7 @@ function main(): void {
             body,
         });
 
-        if (kind === 'html') {
+        if (isPageUrl(innerUrl)) {
             keptPages.push({
                 url: innerUrl,
                 ts: cdxjTsToRfc3339(ts17),
