@@ -345,25 +345,6 @@ function extensionOf(url: string): string {
     }
 }
 
-/** URL extensions that name a navigable document (a "page"), as opposed to a
- * subresource. Used to decide what belongs on the index; a resource whose
- * extension is a page type is a page, everything else (images, css, js, ...) is
- * not -- even when the server answered it with an HTML error page. */
-const PAGE_EXTENSIONS = new Set([
-    '.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml',
-]);
-
-/**
- * True when a URL names a page rather than a subresource. Deliberately based on
- * the *extension*, not the response mime: a `.gif` that Microsoft answered with
- * a "Sorry, there is no ..." HTML error page is still an image *location*, not a
- * page to list on the index. Extensionless URLs (`/`, `/mscorp/`) count as pages.
- */
-function isPageUrl(url: string): boolean {
-    const ext = extensionOf(url);
-    return ext === '' || PAGE_EXTENSIONS.has(ext);
-}
-
 function classifyKind(modifier: string, mime: string, innerUrl: string): ContentKind {
     // The response's own content-type is authoritative -- the modifier only
     // records *how the page referenced* the resource (via an <img>, <link>,
@@ -776,11 +757,18 @@ function main(): void {
             body,
         });
 
-        if (isPageUrl(innerUrl)) {
+        // List a resource on the index only when the crawl recorded a title for
+        // it. A title is the one crawl-time signal that cleanly separates a real
+        // page from a subresource (an image, stylesheet, or script) that the
+        // server happened to answer with an HTML error page. A URL extension
+        // can't tell those apart -- a `.asp` endpoint may serve pure CSS -- but
+        // a titled record is always a page.
+        const title = titleByWaybackUrl.get(e.url);
+        if (title) {
             keptPages.push({
                 url: innerUrl,
                 ts: cdxjTsToRfc3339(ts17),
-                title: titleByWaybackUrl.get(e.url) || innerUrl,
+                title,
             });
         }
     }
