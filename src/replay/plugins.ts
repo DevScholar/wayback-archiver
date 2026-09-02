@@ -5,8 +5,8 @@
  * about to leave the server (or be written by the export tool), optionally
  * transforms it, and releases it. Plugins are composed in order:
  *
- *   1. static-rewrite — byte-level URL rewriting of HTML/CSS/JS text.
- *   2. url-fixer      — injects the client-side runtime shim into HTML pages.
+ *   1. static-rewrite -- byte-level URL rewriting of HTML/CSS/JS text.
+ *   2. url-fixer      -- injects the client-side runtime shim into HTML pages.
  *
  * This is the seam the user described: "intercept the page the tool wants to
  * write, inject the script, then release it". Both the replay server and the
@@ -15,11 +15,11 @@
  */
 
 import { rewriteContent, detectContentKind, UrlRewriter } from './rewrite';
-import { lookupKey, lookupPathKey, lookupKeyCi } from './url';
+import { lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url';
 import { createUrlFixerPlugin } from './url-fixer';
 
 export interface ReplayContext {
-    /** Original URL of this resource — the base for resolving relative refs. */
+    /** Original URL of this resource -- the base for resolving relative refs. */
     url: string;
     /** 14-digit timestamp (YYYYMMDDHHMMSS) used to build /web/<ts>/ routes. */
     ts: string;
@@ -94,7 +94,7 @@ export function createStaticRewritePlugin(): ResponsePlugin {
                     const byCi = ctx.flatCiMap ? ctx.flatCiMap.get(lookupKeyCi(abs)) : undefined;
                     if (byCi) return byCi;
                     // Not saved: point at the local 404 page, carrying the
-                    // original URL so it can be shown. Captive — nothing leaks
+                    // original URL so it can be shown. Captive -- nothing leaks
                     // to the live web.
                     return flatNotFoundLink(abs);
                 }

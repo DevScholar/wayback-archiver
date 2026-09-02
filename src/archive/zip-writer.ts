@@ -1,7 +1,7 @@
 /**
  * zip-writer.ts
  *
- * A minimal ZIP writer — the counterpart to zip.ts. It emits STORE and DEFLATE
+ * A minimal ZIP writer -- the counterpart to zip.ts. It emits STORE and DEFLATE
  * entries into a standard ZIP container so the downloader can produce a WACZ
  * file. `archive/*` and `indexes/*.cdx` are written STORE (so they can be read
  * by random byte range, per the WACZ spec), and the small JSON metadata files

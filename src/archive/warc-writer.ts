@@ -5,7 +5,7 @@
  * byte-compatible with what warcio.js / archiveweb.page write:
  *
  *   WARC/1.1\r\n
- *   WARC-Record-ID: <urn:uuid:…>\r\n
+ *   WARC-Record-ID: <urn:uuid:...>\r\n
  *   WARC-Target-URI: <url>\r\n
  *   WARC-Date: <RFC3339>\r\n
  *   WARC-Type: response\r\n

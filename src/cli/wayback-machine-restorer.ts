@@ -4,11 +4,11 @@
  * Converts a WACZ that captured the *Wayback Machine replaying* old pages back
  * into a WACZ that looks like the pages were captured directly, in the past.
  *
- * When ArchiveWeb.page crawls `https://web.archive.org/web/<ts>/http://host/…`
+ * When ArchiveWeb.page crawls `https://web.archive.org/web/<ts>/http://host/...`
  * it archives two very different things side by side:
  *
  *   1. the replayed page, wrapped in Wayback's own chrome (top toolbar, donation
- *      banner, analytics, `wombat.js`, `bundle-playback.js`, …), with every URL
+ *      banner, analytics, `wombat.js`, `bundle-playback.js`, ...), with every URL
  *      rewritten to a `/web/<ts>[mod_]/<original-url>` route; and
  *   2. the same page's resources, each served through an `im_`/`cs_`/`js_`
  *      modifier route and, when the Wayback Machine has no capture at the
@@ -21,31 +21,31 @@
  *   - it unwraps `/web/<ts>[mod_]/<url>` (and the absolute
  *     `https://web.archive.org/web/<ts>[mod_]/<url>` form) back to `<url>`;
  *   - it strips the injected `<head>` scripts, the toolbar, and the trailing
- *     "FILE ARCHIVED ON …" footer from HTML;
+ *     "FILE ARCHIVED ON ..." footer from HTML;
  *   - it follows 302 redirect chains and WARC `revisit` references to the final
  *     record, then stamps that record with the *actual* capture time (the final
  *     URL's timestamp / `x-archive-orig-date`), not the requested replay time;
  *   - it restores the historical HTTP headers from `X-Archive-Orig-*`.
  *
- * Every record that Wayback actually served is kept verbatim — including empty
+ * Every record that Wayback actually served is kept verbatim -- including empty
  * bodies, error pages, and tiny stubs. If the era's server really sent it, it is
  * historical material and belongs in the archive.
  *
  * Usage:
- *   npx tsx src/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>]
+ *   npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>]
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
-import { ZipReader } from './zip';
-import { writeZipFile } from './zip-writer';
-import { buildWarcRecord, payloadDigest } from './warc-writer';
-import { parseWarcRecord, WarcRecord } from './warc';
-import { parseCdxj, CdxjEntry } from './cdxj';
-import { surtKey } from './url';
-import { cdxjTsToRfc3339 } from './time';
+import { ZipReader } from '../archive/zip';
+import { writeZipFile } from '../archive/zip-writer';
+import { buildWarcRecord, payloadDigest } from '../archive/warc-writer';
+import { parseWarcRecord, WarcRecord } from '../archive/warc';
+import { parseCdxj, CdxjEntry } from '../archive/cdxj';
+import { surtKey } from '../lib/url';
+import { cdxjTsToRfc3339 } from '../lib/time';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -70,7 +70,7 @@ function parseArgs(argv: string[]): Args {
     }
     if (positional.length > 0) args.input = path.resolve(positional[0]);
     if (!args.input) {
-        console.error('Usage: npx tsx src/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>]');
+        console.error('Usage: npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>]');
         process.exit(1);
     }
     if (!args.outputFile) {
@@ -141,8 +141,8 @@ function unescapeScheme(s: string): string {
     return s.replace(/%3a/gi, ':');
 }
 
-/** Regex for a Wayback-rewritten URL in text: either the bare `/web/<ts>[mod]/…`
- * route or the absolute `[scheme://]web.archive.org/web/<ts>[mod]/…` form. */
+/** Regex for a Wayback-rewritten URL in text: either the bare `/web/<ts>[mod]/...`
+ * route or the absolute `[scheme://]web.archive.org/web/<ts>[mod]/...` form. */
 const WB_TEXT_URL_RE =
     /(?:(?:https?:)?\/\/web\.archive\.org)?\/web\/(\d{4,14})(?:[a-z]{2}_)?\/([^"'<>\s)]+)/gi;
 
@@ -180,7 +180,7 @@ function stripWaybackChrome(html: string): string {
         out = out.slice(0, bi) + out.slice(ei + end.length);
     }
 
-    // 3. The trailing "FILE ARCHIVED ON …" + "playback timings" comments sit
+    // 3. The trailing "FILE ARCHIVED ON ..." + "playback timings" comments sit
     //    after </html>; truncate there.
     const he = out.search(/<\/html>/i);
     if (he >= 0) out = out.slice(0, he + 7);
@@ -236,7 +236,7 @@ function restoreHeaders(record: WarcRecord, fallbackMime: string): [string, stri
     const result: [string, string][] = [];
     const seen = new Set<string>();
 
-    // Historical headers first — highest fidelity, so they win.
+    // Historical headers first -- highest fidelity, so they win.
     for (const [name, value] of record.httpHeaders) {
         const lower = name.toLowerCase();
         if (!lower.startsWith(ORIG_HEADER_PREFIX)) continue;
@@ -386,7 +386,7 @@ function resolveChain(
 
 /**
  * Wayback records a *real* historical redirect (the era's server returned a
- * 3xx) not as a 3xx record but as a "redirect notice" interstitial — a 200
+ * 3xx) not as a 3xx record but as a "redirect notice" interstitial -- a 200
  * HTML page that immediately navigates the browser to the target. Two forms
  * show up in practice:
  *

@@ -23,9 +23,9 @@ export interface WarcRecord {
     /** RFC3339 timestamp from WARC-Date, if present. */
     date: string | null;
     contentType: string | null;
-    /** HTTP status line code (200, 404, …), or null if not an HTTP message. */
+    /** HTTP status line code (200, 404, ...), or null if not an HTTP message. */
     httpStatus: number | null;
-    /** HTTP status reason phrase ("OK", "Not Found", …), or '' if absent. */
+    /** HTTP status reason phrase ("OK", "Not Found", ...), or '' if absent. */
     httpStatusText: string;
     /** HTTP response headers, keyed by lowercased name. */
     httpHeaders: Map<string, string>;
@@ -35,7 +35,7 @@ export interface WarcRecord {
 
 /** Locate the blank line that ends a header block. Returns the offset of the
  * terminator and its length (4 for CRLF CRLF, 2 for LF LF), so the caller can
- * skip it completely — the block body starts right after it. */
+ * skip it completely -- the block body starts right after it. */
 function findHeaderEnd(buf: Buffer): { index: number; termLen: number } {
     // CRLF CRLF (the standard case)
     for (let i = 0; i < buf.length - 3; i++) {
@@ -74,7 +74,7 @@ export function parseWarcRecord(raw: Buffer): WarcRecord {
     let block = sep.index >= 0 ? raw.subarray(sep.index + sep.termLen) : Buffer.alloc(0);
 
     // The WARC `Content-Length` header is the exact octet length of the record
-    // block — for a `response` record, the HTTP message (status line + HTTP
+    // block -- for a `response` record, the HTTP message (status line + HTTP
     // headers + blank line + body). Prefer it over heuristics: it delimits the
     // body precisely, including binary payloads that happen to end in CRLFCRLF.
     const clHeader = headers.get('content-length');
@@ -105,9 +105,9 @@ export function parseWarcRecord(raw: Buffer): WarcRecord {
     // Fallback only, when the WARC record lacked a usable Content-Length:
     // wabac.js / archiveweb.page delimit the HTTP entity body with a trailing
     // CRLFCRLF that is not part of the payload (per WARC 1.1, a response
-    // record's payload is its entity-body — RFC 2616 — which is exactly the
+    // record's payload is its entity-body -- RFC 2616 -- which is exactly the
     // content-length bytes and matches warc-payload-digest). Strip it so binary
-    // resources (images, fonts, …) decode cleanly.
+    // resources (images, fonts, ...) decode cleanly.
     if (!trusted && httpStatus !== null && body.length >= 4 &&
         body[body.length - 4] === 0x0d && body[body.length - 3] === 0x0a &&
         body[body.length - 2] === 0x0d && body[body.length - 1] === 0x0a) {

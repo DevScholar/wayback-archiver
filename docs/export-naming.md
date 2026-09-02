@@ -1,6 +1,6 @@
 # Export naming scheme
 
-`export-to-html.ts` flattens every archived resource into a single directory and
+`src/cli/export-to-html.ts` flattens every archived resource into a single directory and
 renames files as `<prefix>~<n><ext>`.
 
 ## Rules
@@ -14,7 +14,10 @@ renames files as `<prefix>~<n><ext>`.
    the content type (`text/html` → `.html`, `image/jpeg` → `.jpg`,
    `image/png` → `.png`, `image/gif` → `.gif`, `text/css` → `.css`,
    `javascript` → `.js`, `application/json` → `.json`, `text/plain` → `.txt`);
-   otherwise omitted.
+   otherwise omitted. Server-side page extensions that produce HTML
+   (`.asp`, `.aspx`, `.php`, `.cfm`, `.cgi`, `.jsp`, `.shtml`) are rewritten to
+   `.html` so a browser opening the file over `file://` (which sniffs MIME from
+   the extension alone) renders the page instead of the raw markup.
 4. **Counter** — files sharing the same `prefix` + extension are numbered
    `~1`, `~2`, … in URL-sorted order.
 
@@ -23,8 +26,8 @@ renames files as `<prefix>~<n><ext>`.
 | URL                                | MIME        | Flat name     |
 | ---------------------------------- | ----------- | ------------- |
 | `/about.html`                      | text/html   | `about~1.html`|
-| `/information.asp`                 | text/html   | `infor~1.asp` |
-| `/information-archive.asp`         | text/html   | `infor~2.asp` |
+| `/information.asp`                 | text/html   | `infor~1.html`|
+| `/information-archive.asp`         | text/html   | `infor~2.html`|
 | `/cdx`                             | text/plain  | `cdx~1`       |
 | `/` (homepage)                     | text/html   | `index~1.html`|
 | `/pages/year2000/`                 | text/html   | `year2~1.html`|

@@ -7,19 +7,19 @@
  * local.
  *
  * Usage:
- *   npx tsx src/server.ts <archive.wacz> [--port 8080] [--expose]
+ *   npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose]
  */
 
 import * as http from 'http';
 import * as path from 'path';
 import * as os from 'os';
-import { Wacz } from './wacz';
-import { WarcRecord } from './warc';
-import { renderIndexPage, buildPageRows } from './index-page';
-import { rfc3339ToTs14 } from './time';
-import { createDefaultPipeline, ReplayContext } from './plugins';
-import { URL_FIXER_SCRIPT_ROUTE } from './url-fixer';
-import { URL_FIXER_SHIM } from './url-fixer-shim';
+import { Wacz } from '../archive/wacz';
+import { WarcRecord } from '../archive/warc';
+import { renderIndexPage, buildPageRows } from '../replay/index-page';
+import { rfc3339ToTs14 } from '../lib/time';
+import { createDefaultPipeline, ReplayContext } from '../replay/plugins';
+import { URL_FIXER_SCRIPT_ROUTE } from '../replay/url-fixer';
+import { URL_FIXER_SHIM } from '../replay/url-fixer-shim';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -43,7 +43,7 @@ function parseArgs(argv: string[]): Args {
     }
     if (positional.length > 0) args.wacz = path.resolve(positional[0]);
     if (!args.wacz) {
-        console.error('Usage: npx tsx src/server.ts <archive.wacz> [--port 8080] [--expose]');
+        console.error('Usage: npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose]');
         process.exit(1);
     }
     return args;
@@ -76,10 +76,10 @@ function sniffCharset(head: Buffer, mime: string): string | undefined {
 }
 
 /**
- * Framing + hop-by-hop headers (RFC 7230 §6.1) that Node's HTTP layer owns and
- * that can't be replayed verbatim — the body has been decompressed and
+ * Framing + hop-by-hop headers (RFC 7230 section 6.1) that Node's HTTP layer owns and
+ * that can't be replayed verbatim -- the body has been decompressed and
  * rewritten, so the original `content-length`/`content-encoding` no longer
- * match. Keyed lowercase → canonical name. When we strip one we emit its
+ * match. Keyed lowercase -> canonical name. When we strip one we emit its
  * original value under `X-Archive-Orig-<Name>` (below), so the archived value
  * stays inspectable.
  */
@@ -104,7 +104,7 @@ const ARCHIVE_PREFIX = 'X-Archive-Orig-';
  * Rebuild a replay's response headers, keeping every archived HTTP header
  * except the ones that *must* change:
  *
- *   - framing/hop-by-hop headers (above) are dropped — the body has been
+ *   - framing/hop-by-hop headers (above) are dropped -- the body has been
  *     decompressed and rewritten, so the originals would be wrong. Their
  *     original values are preserved under `X-Archive-Orig-<Name>`.
  *   - `location` is rewritten to a captive `/web/<ts>/<url>` route so a
@@ -157,7 +157,7 @@ function buildReplayHeaders(
     headers['content-type'] = contentType;
 
     // Bodyless responses (204/304/1xx) must not carry a Content-Length
-    // (RFC 7230 §3.3.2); we end those without a body below.
+    // (RFC 7230 section 3.3.2); we end those without a body below.
     const bodyless = status === 204 || status === 304 || (status >= 100 && status < 200);
     if (!bodyless) headers['content-length'] = String(body.length);
     return headers;
@@ -197,7 +197,7 @@ function main(): void {
             return;
         }
 
-        // Index page — generated on demand from the archive.
+        // Index page -- generated on demand from the archive.
         if (reqUrl === '/' || reqUrl === '/index.html') {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(buildIndexPage());
@@ -217,7 +217,7 @@ function main(): void {
             // whole URL up front is wrong: a percent-encoded reserved character
             // in a query value (e.g. `%23` = `#` inside a color parameter)
             // becomes a literal `#`, which lookupKey then treats as a fragment
-            // separator and strips — making the lookup miss entries the archive
+            // separator and strips -- making the lookup miss entries the archive
             // stores with the encoded form. Only fall back to a decoded form
             // when the raw URL genuinely misses (e.g. non-ASCII characters the
             // client percent-encoded).

@@ -2,8 +2,8 @@
  * time.ts
  *
  * Timestamp conversion helpers. WACZ mixes two timestamp forms:
- *   • CDXJ — a 17-digit value `YYYYMMDDHHMMSSmmm` (used for record lookup).
- *   • RFC3339 — ISO 8601 with milliseconds and a `Z` suffix (used by WARC-Date
+ *   - CDXJ -- a 17-digit value `YYYYMMDDHHMMSSmmm` (used for record lookup).
+ *   - RFC3339 -- ISO 8601 with milliseconds and a `Z` suffix (used by WARC-Date
  *     and pages.jsonl).
  */
 

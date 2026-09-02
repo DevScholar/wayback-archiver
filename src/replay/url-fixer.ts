@@ -8,7 +8,7 @@
  *      (`window.__urlFixerConfig`), and
  *   2. a `<script src="/__url-fixer.js">` that loads the url-fixer runtime
  *      shim as an *external* script served by the replay server (see
- *      url-fixer-shim.ts) — mirroring how the Wayback Machine injects
+ *      url-fixer-shim.ts) -- mirroring how the Wayback Machine injects
  *      wombat.js rather than inlining it.
  *
  * The injection is wrapped in `<!-- BEGIN/END URL FIXER INSERT -->` comment

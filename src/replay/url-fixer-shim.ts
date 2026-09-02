@@ -3,17 +3,17 @@
  *
  * The client-side script injected by the url-fixer plugin. It is a from-scratch
  * "wombat" equivalent: a small, zero-dependency runtime shim that patches the
- * browser APIs which produce URLs, so that every request a page makes — even
- * one constructed dynamically at runtime — is rewritten to stay inside the
+ * browser APIs which produce URLs, so that every request a page makes -- even
+ * one constructed dynamically at runtime -- is rewritten to stay inside the
  * replay.
  *
  * It reads its configuration from `window.__urlFixerConfig`, which the plugin
  * injects just before this script. Two modes are supported:
  *
- *   server — rewrite every URL to a /web/<ts>/<url> route (captive: anything
+ *   server -- rewrite every URL to a /web/<ts>/<url> route (captive: anything
  *            not in the archive becomes a local 404, so no request leaks to
  *            the live web).
- *   flat   — rewrite a URL to its exported flat file name via an inline map.
+ *   flat   -- rewrite a URL to its exported flat file name via an inline map.
  *
  * The string is deliberately plain ES5 (no template literals, no backticks) so
  * it can be embedded in a template literal and into any document without

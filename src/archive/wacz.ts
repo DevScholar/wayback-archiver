@@ -10,7 +10,7 @@ import * as zlib from 'zlib';
 import { ZipReader } from './zip';
 import { parseWarcRecord, WarcRecord } from './warc';
 import { parseCdxj, CdxjEntry } from './cdxj';
-import { candidateUrls, lookupKey, lookupPathKey, lookupKeyCi } from './url';
+import { candidateUrls, lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url';
 
 export interface WaczPage {
     url: string;
@@ -76,7 +76,7 @@ export class Wacz {
             /* datapackage.json is optional in practice */
         }
 
-        // indexes — take the first .cdx file
+        // indexes -- take the first .cdx file
         const indexName = this.zip.names().find((n) => n.endsWith('.cdx') && !n.endsWith('.cdx.gz'));
         if (indexName) {
             this._entries = parseCdxj(this.zip.readEntry(indexName).toString('utf8'));
@@ -159,7 +159,7 @@ export class Wacz {
 
     /**
      * Resolve a URL against the index, preferring the capture closest to a
-     * target timestamp prefix by absolute distance — the same rule the Wayback
+     * target timestamp prefix by absolute distance -- the same rule the Wayback
      * Machine uses for replay (a miss may resolve either forward to a later
      * capture or backward to an earlier one, whichever is nearer). Ties are
      * broken toward the earlier capture. `ts` may be a full 17-digit timestamp
@@ -217,7 +217,7 @@ export class Wacz {
      * WARC `revisit` records (deduplication) carry an empty body and a digest,
      * pointing at the original `response` record via WARC-Refers-To-Target-URI.
      * We follow that reference so the requested URL serves the original bytes
-     * under its own name — the entry and matchedUrl stay on the requested URL,
+     * under its own name -- the entry and matchedUrl stay on the requested URL,
      * only the record payload comes from the referred-to original.
      */
     resolveRecord(url: string, ts?: string): ResolvedRecord | null {

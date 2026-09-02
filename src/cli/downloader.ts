@@ -5,7 +5,7 @@
  * `server.ts` / `export-to-html.ts`.
  *
  * Usage:
- *   npx tsx src/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]
+ *   npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]
  *
  *   --url-list     path to a text file with one URL per line (blank lines and
  *                  `#` comments ignored). Only http/https URLs are fetched.
@@ -17,7 +17,7 @@
  *
  * Incremental: if `--output-file` already exists it is treated as the existing
  * archive. URLs already captured in it are skipped (not re-fetched), and only
- * new URLs are appended — the existing records, their offsets and timestamps
+ * new URLs are appended -- the existing records, their offsets and timestamps
  * are preserved byte-for-byte. Re-running with an extended URL list grows the
  * same file rather than replacing it.
  *
@@ -35,12 +35,12 @@ import * as http from 'http';
 import * as https from 'https';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
-import { writeZipFile } from './zip-writer';
-import { buildWarcRecord, payloadDigest } from './warc-writer';
-import { surtKey } from './url';
-import { nowTs17, cdxjTsToRfc3339 } from './time';
-import { ZipReader } from './zip';
-import { parseCdxj } from './cdxj';
+import { writeZipFile } from '../archive/zip-writer';
+import { buildWarcRecord, payloadDigest } from '../archive/warc-writer';
+import { surtKey } from '../lib/url';
+import { nowTs17, cdxjTsToRfc3339 } from '../lib/time';
+import { ZipReader } from '../archive/zip';
+import { parseCdxj } from '../archive/cdxj';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -65,7 +65,7 @@ function parseArgs(argv: string[]): Args {
         else if (key === '--concurrency') args.concurrency = parseInt(val, 10) || 8;
     }
     if (!args.urlList) {
-        console.error('Usage: npx tsx src/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]');
+        console.error('Usage: npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]');
         process.exit(1);
     }
     if (!args.outputFile) {
@@ -135,7 +135,7 @@ function fetchUrl(url: string): Promise<Fetched> {
                 const statusText = res.statusMessage || '';
                 const loc = res.headers.location;
 
-                // 429 Too Many Requests → back off 0.5s and retry (bounded).
+                // 429 Too Many Requests -> back off 0.5s and retry (bounded).
                 if (status === 429) {
                     res.resume();
                     if (retryCount < MAX_429_RETRIES) {
@@ -166,7 +166,7 @@ function fetchUrl(url: string): Promise<Fetched> {
                 // decoded payload (matching how the crawler stores it). When we
                 // decompress, the original `content-encoding` and the
                 // pre-decompression `content-length` no longer describe the
-                // body, so drop both — otherwise the record would claim to be
+                // body, so drop both -- otherwise the record would claim to be
                 // gzip while holding decoded bytes, and a third-party replayer
                 // would try to gunzip it again.
                 const encoding = String(res.headers['content-encoding'] || '').toLowerCase();
@@ -244,7 +244,7 @@ function loadExisting(filePath: string): ExistingArchive | null {
     const indexName = names.find((n) => n.endsWith('.cdx') && !n.endsWith('.cdx.gz'))
         || names.find((n) => n.endsWith('.cdx'));
     if (!indexName) {
-        throw new Error(`${filePath} exists but has no CDX index — not a WACZ.`);
+        throw new Error(`${filePath} exists but has no CDX index \u2014 not a WACZ.`);
     }
 
     let datapackage: Record<string, unknown> = {};
@@ -453,7 +453,7 @@ async function main(): Promise<void> {
 
     if (toFetch.length === 0) {
         if (existing && args.title === undefined) {
-            console.log('All URLs already archived and no title change — nothing to do.');
+            console.log('All URLs already archived and no title change \u2014 nothing to do.');
             return;
         }
         if (!existing) {

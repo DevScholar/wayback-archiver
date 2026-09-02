@@ -103,7 +103,7 @@ export class ZipReader {
         const e = this.entries.get(name);
         if (!e) throw new Error(`Entry not found in archive: ${name}`);
         const raw = this.buf.subarray(e.dataOffset, e.dataOffset + e.compressedSize);
-        if (e.method === 0) return Buffer.from(raw); // STORE — copy so the caller owns it
+        if (e.method === 0) return Buffer.from(raw); // STORE -- copy so the caller owns it
         if (e.method === 8) return zlib.inflateRawSync(raw); // DEFLATE
         throw new Error(`Unsupported compression method ${e.method} for ${name}`);
     }

@@ -4,10 +4,6 @@ Read [WACZ](https://webrecorder.net/wacz) web archives: capture URLs into a new
 WACZ, export them to a standalone flat HTML folder, or serve them for replay in
 a browser.
 
-The project was rewritten around the WACZ container format. All
-Archive.org-specific handling was removed, the TypeScript codebase is split into
-small single-purpose modules, and there are no runtime dependencies (only
-TypeScript and `tsx` are needed as dev dependencies — no GPL/AGPL libraries).
 
 ## Requirements
 
@@ -17,7 +13,7 @@ TypeScript and `tsx` are needed as dev dependencies — no GPL/AGPL libraries).
 ## Capture URLs into a WACZ
 
 ```
-npx tsx src/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]
+npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]
 ```
 
 `my-urls.txt` holds one URL per line (blank lines and `#` comments are
@@ -33,7 +29,7 @@ archive. Options: `--concurrency` (default 8).
 ## Export to standalone HTML
 
 ```
-npx tsx src/export-to-html.ts <archive.wacz> [--out <dir>]
+npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>]
 ```
 
 Extracts every archived resource into a flat folder. Files are named
@@ -51,7 +47,7 @@ If `--out` is omitted, output defaults to `<archive>-html/` next to the archive.
 ## Serve for replay
 
 ```
-npx tsx src/server.ts <archive.wacz> [--port 8080] [--expose]
+npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose]
 ```
 
 Serves the archive at `http://localhost:8080/`. The index page is generated on

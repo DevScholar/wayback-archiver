@@ -86,7 +86,7 @@ export function lookupPathKey(raw: string): string {
 /**
  * Case-insensitive lookup key: lowercase scheme, host, AND path, keeping the
  * query string as-is (query values may themselves be case-sensitive). This is
- * NOT the primary key — it is tried only as a last resort when an exact match
+ * NOT the primary key -- it is tried only as a last resort when an exact match
  * misses, to mirror the Wayback Machine's case-insensitive path matching
  * against legacy case-insensitive servers (old IIS/Win32 paths). Lowercasing
  * the path on the primary key would wrongly collapse `Foo.jpg` and `foo.jpg`

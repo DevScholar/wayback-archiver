@@ -4,13 +4,13 @@
  * Rewrites URL references inside text resources so they point at local content
  * instead of the live web. Three dialects are handled, selected by `kind`:
  *
- *   html — HTML attributes (href/src/action/background), CSS url() and @import
+ *   html -- HTML attributes (href/src/action/background), CSS url() and @import
  *          found inside <style> blocks, and any inline markup.
- *   css  — CSS url() and @import.
- *   js   — ES module specifiers: `import 'x'`, `import("x")`, and
+ *   css  -- CSS url() and @import.
+ *   js   -- ES module specifiers: `import 'x'`, `import("x")`, and
  *          `import/export ... from "x"`. These are the URLs a browser's module
  *          loader resolves *before* any page JavaScript runs, so the runtime
- *          shim cannot rewrite them — they must be rewritten here, in the
+ *          shim cannot rewrite them -- they must be rewritten here, in the
  *          source, at serve time.
  *
  * The caller supplies a single `rewrite` callback: absolute URL -> new string
@@ -65,7 +65,7 @@ function toAbsolute(ref: string, baseUrl: string): string | null {
 /**
  * Rewrite a srcset value correctly. Per the HTML spec, a candidate's URL is a
  * run of non-whitespace characters, so a comma *inside* a query string (e.g.
- * `?op_usm=1.5,0.65`) is part of the URL — only a comma at a candidate
+ * `?op_usm=1.5,0.65`) is part of the URL -- only a comma at a candidate
  * boundary (followed by whitespace, or at end) separates candidates. A naive
  * split-on-comma corrupts URLs with commas in their query, which is exactly
  * how the hero `srcset` above broke.
@@ -105,8 +105,8 @@ function rewriteHtml(content: string, baseUrl: string, rewrite: UrlRewriter): st
 
     // srcset: a comma-separated list of `URL [descriptor]` candidates (e.g.
     // `img.webp 1x, img.png 2x`). Each URL is rewritten in place, descriptors
-    // are left untouched. This is what makes <picture> WebP sources — which the
-    // crawler archives under their `?basic=.webp` variant — resolve locally.
+    // are left untouched. This is what makes <picture> WebP sources -- which the
+    // crawler archives under their `?basic=.webp` variant -- resolve locally.
     const SRCSET_RE = /srcset\s*=\s*(["'])(.*?)\1/gi;
     content = content.replace(SRCSET_RE, (match, quote: string, value: string) => {
         return `srcset=${quote}${rewriteSrcset(value, baseUrl, rewrite)}${quote}`;
@@ -133,9 +133,9 @@ function rewriteHtml(content: string, baseUrl: string, rewrite: UrlRewriter): st
         return `@import "${out}";`;
     });
 
-    // <meta http-equiv="refresh" content="…; URL=…">: a client-side redirect
+    // <meta http-equiv="refresh" content="...; URL=...">: a client-side redirect
     // whose target lives in the `content` attribute, not in href/src. It fires
-    // as soon as the head is parsed — before any runtime shim can touch it — so
+    // as soon as the head is parsed -- before any runtime shim can touch it -- so
     // it must be rewritten here or the page jumps straight to the live web.
     //
     // Non-standard `<meta>` fields (Open Graph, Twitter Card, schema.org) are
@@ -197,7 +197,7 @@ function rewriteCss(content: string, baseUrl: string, rewrite: UrlRewriter): str
 /** A module specifier is only worth rewriting if it resolves to a real URL:
  * relative (./ ../), root-relative (/), protocol-relative (//), or absolute
  * (scheme://). Bare names ("react") and non-URL fragments ("+m+") are left
- * alone — rewriting them would corrupt ordinary code (e.g. the English word
+ * alone -- rewriting them would corrupt ordinary code (e.g. the English word
  * "from" inside a string) and bare package names aren't archivable URLs. */
 function isUrlSpecifier(ref: string): boolean {
     const r = ref.trim();
