@@ -141,6 +141,16 @@ function unescapeScheme(s: string): string {
     return s.replace(/%3a/gi, ':');
 }
 
+/** Unwrap a Wayback replay URL written as either a bare `/web/<ts>[mod]/<url>`
+ * route or the absolute `https://web.archive.org/web/<ts>[mod]/<url>` form back
+ * to its inner `<url>`, or null when `raw` is not one. */
+function unwrapWaybackUrl(raw: string): string | null {
+    const rel = /^\/web\/(\d{4,14})(?:[a-z]{2}_)?\/(.+)$/i.exec(raw);
+    if (rel) return decodeInnerUrl(unescapeScheme(rel[2]));
+    const abs = parseWaybackUrl(raw);
+    return abs ? abs.innerUrl : null;
+}
+
 /** Regex for a Wayback-rewritten URL in text: either the bare `/web/<ts>[mod]/...`
  * route or the absolute `[scheme://]web.archive.org/web/<ts>[mod]/...` form. */
 const WB_TEXT_URL_RE =
@@ -475,19 +485,10 @@ function extractRedirectNotice(record: WarcRecord): string | null {
     if (record.httpStatus !== 200) return null;
     const body = record.body.toString('latin1');
 
-    // Unwrap a redirect target written as either a bare `/web/<ts>/<target>`
-    // route or the absolute `https://web.archive.org/web/<ts>/<target>` form.
-    const unwaybackUrl = (raw: string): string | null => {
-        const rel = /^\/web\/(\d{4,14})(?:[a-z]{2}_)?\/(.+)$/i.exec(raw);
-        if (rel) return decodeInnerUrl(unescapeScheme(rel[2]));
-        const abs = parseWaybackUrl(raw);
-        return abs ? abs.innerUrl : null;
-    };
-
     // 1. JavaScript redirect: document.location.href = "<wayback target>".
     const js = /document\.location\.href\s*=\s*["']([^"']+)["']/i.exec(body);
     if (js) {
-        const t = unwaybackUrl(js[1]);
+        const t = unwrapWaybackUrl(js[1]);
         if (t) return t;
     }
 
@@ -503,7 +504,7 @@ function extractRedirectNotice(record: WarcRecord): string | null {
         // would truncate the query string there.
         const urlm = /URL\s*=\s*([\s\S]*)$/i.exec(cm[1]);
         if (!urlm) continue;
-        const t = unwaybackUrl(urlm[1].replace(/&amp;/gi, '&').trim());
+        const t = unwrapWaybackUrl(urlm[1].replace(/&amp;/gi, '&').trim());
         if (t) return t;
     }
     return null;
@@ -663,15 +664,48 @@ function main(): void {
         // Drop Wayback chrome and any other archive.org-hosted resource.
         if (isArchiveOrgHost(hostOf(innerUrl))) continue;
 
-        // A 3xx response is always a *Wayback* replay redirect (a "found a
-        // capture at a later/earlier time" time-shift, or a case/canonical
-        // redirect to another capture), never the era's server responding. The
-        // era's real redirects were captured as 200 "redirect notice"
-        // interstitials (handled below). Drop the synthetic ones: closest-time
-        // resolution at replay reaches the target capture directly.
+        // A 3xx response is Wayback's own replay redirect -- either a time-shift
+        // ("found a capture at a later/earlier time") or a case/canonical
+        // redirect to another capture URL. It is NOT the era's server
+        // responding; the era's real redirects were captured as 200 "redirect
+        // notice" interstitials (handled below). But the redirect's `location`
+        // still records where the real capture lives -- often under a
+        // differently-cased path or a www/bare host name. When that target is a
+        // *different* URL, carry the redirect over as a 302 so the source URL
+        // resolves (archiveweb.page follows it) instead of 404ing. A
+        // self-redirect (a pure time-shift to the same URL) is dropped: the
+        // era's capture at the shifted time already covers the source URL.
         const own = byTarget.get(e.url);
         if (own && own.httpStatus !== null && REDIRECT_STATUS.has(own.httpStatus)) {
-            console.log(`skip: wayback redirect (${own.httpStatus}) for ${innerUrl}`);
+            const loc = own.httpHeaders.get('location');
+            const target = loc ? unwrapWaybackUrl(loc) : null;
+            if (target && target !== innerUrl && !isArchiveOrgHost(hostOf(target))) {
+                const ts14 = wayback
+                    ? wayback.ts14
+                    : (httpDateToTs14(own.date || '') ?? e.timestamp.slice(0, 14));
+                const ts17 = (ts14 + '000').slice(0, 17);
+                // One redirect per source URL: the crawl replays the same URL at
+                // several request times, each producing the same time-shift 302 to
+                // the same canonical capture. Keep the first (earliest, since the
+                // CDXJ is timestamp-ordered) and drop the rest.
+                const dedupKey = innerUrl;
+                if (!dedup.has(dedupKey)) {
+                    dedup.add(dedupKey);
+                    kept.push({
+                        innerUrl,
+                        ts17,
+                        kind: 'html',
+                        mime: 'text/html',
+                        status: own.httpStatus,
+                        statusText: own.httpStatusText || '',
+                        headers: [['location', target], ['content-type', 'text/html']],
+                        body: Buffer.alloc(0),
+                    });
+                    console.log(`redirect (wayback): ${innerUrl} -> ${target}`);
+                }
+            } else {
+                console.log(`skip: wayback redirect (${own.httpStatus}) for ${innerUrl}`);
+            }
             continue;
         }
 
