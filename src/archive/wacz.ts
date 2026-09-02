@@ -182,32 +182,47 @@ export class Wacz {
             }
         };
 
-        for (const cand of candidateUrls(url)) {
-            const list = this._indexByKey.get(lookupKey(cand));
-            if (list) for (const e of list) consider(e);
-        }
+        const nearestOf = (list: CdxjEntry[]): CdxjEntry | null => {
+            best.before = null;
+            best.after = null;
+            for (const e of list) consider(e);
+            const before = best.before;
+            const after = best.after;
+            if (!before) return after ?? null;
+            if (!after) return before;
+            const gapBefore = BigInt(target) - BigInt(before.timestamp);
+            const gapAfter = BigInt(after.timestamp) - BigInt(target);
+            return gapBefore <= gapAfter ? before : after;
+        };
+
+        // Exact URL first: pick the nearest capture of this exact URL. An
+        // exact hit must never be shadowed by a host/scheme variant (`www.` vs
+        // bare, http vs https) whose capture sits closer to the requested
+        // timestamp. That shadowing is exactly how a `www.` -> bare redirect
+        // loops: the bare target request re-matches the `www.` redirect record
+        // through the variant fallback and redirects straight back to bare.
+        const exact = this._indexByKey.get(lookupKey(url));
+        if (exact && exact.length) return nearestOf(exact);
 
         // Query-variant fallback: same scheme/host/port/path, any query.
-        if (!best.before && !best.after) {
-            const plist = this._indexByPath.get(lookupPathKey(url));
-            if (plist) for (const e of plist) consider(e);
+        const plist = this._indexByPath.get(lookupPathKey(url));
+        if (plist && plist.length) return nearestOf(plist);
+
+        // Host/scheme variants (www. vs bare, http vs https), tried only when
+        // the exact URL is not indexed at all.
+        for (const cand of candidateUrls(url)) {
+            if (cand === url) continue;
+            const list = this._indexByKey.get(lookupKey(cand));
+            if (list && list.length) return nearestOf(list);
         }
 
-        // Case-insensitive fallback (last resort): exact + query-variant both
-        // missed; try the same resource under a differently-cased path.
-        if (!best.before && !best.after) {
-            const cilist = this._indexByKeyCi.get(lookupKeyCi(url));
-            if (cilist) for (const e of cilist) consider(e);
-        }
+        // Case-insensitive fallback (last resort): exact + query-variant +
+        // host/scheme all missed; try the same resource under a differently
+        // cased path.
+        const cilist = this._indexByKeyCi.get(lookupKeyCi(url));
+        if (cilist && cilist.length) return nearestOf(cilist);
 
-        const before = best.before;
-        const after = best.after;
-        if (!before) return after ?? this.resolve(url);
-        if (!after) return before;
-        // Pick the closer side; on an exact tie, prefer the earlier capture.
-        const gapBefore = BigInt(target) - BigInt(before.timestamp);
-        const gapAfter = BigInt(after.timestamp) - BigInt(target);
-        return gapBefore <= gapAfter ? before : after;
+        return this.resolve(url);
     }
 
     /**

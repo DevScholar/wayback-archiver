@@ -240,9 +240,16 @@ function main(): void {
             const record = rec.record;
             const mime = record.httpHeaders.get('content-type') || rec.entry.mime || 'application/octet-stream';
 
+            // Replay the archived status, modifying only the few headers that
+            // would otherwise corrupt rendering or leak to the live web.
+            const status = record.httpStatus ?? 200;
+
             // Run the response through the plugin pipeline: static rewriting
             // plus the url-fixer shim injection. Non-text bodies pass through
-            // unchanged because neither plugin matches them.
+            // unchanged because neither plugin matches them. Redirects are
+            // skipped too: a 3xx has no page to rewrite or shim, and injecting
+            // the url-fixer script into its empty body would turn a bare 302
+            // into one that carries a script and a misleading content-length.
             const ctx: ReplayContext = {
                 url: rec.matchedUrl,
                 ts: rec.entry.timestamp.slice(0, 14),
@@ -250,11 +257,8 @@ function main(): void {
                 body: record.body,
                 mode: 'server',
             };
-            const body = pipeline.apply(ctx);
+            const body = status >= 300 && status < 400 ? record.body : pipeline.apply(ctx);
 
-            // Replay the archived status and headers, modifying only the few
-            // that would otherwise corrupt rendering or leak to the live web.
-            const status = record.httpStatus ?? 200;
             const headers = buildReplayHeaders(record, rec.matchedUrl, ctx.ts, mime, body, status);
             res.writeHead(status, record.httpStatusText || undefined, headers);
             if (status === 204 || status === 304 || (status >= 100 && status < 200)) {

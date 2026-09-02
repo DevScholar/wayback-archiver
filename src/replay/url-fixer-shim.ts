@@ -46,10 +46,17 @@ export const URL_FIXER_SHIM = `(function () {
     ref = String(ref).trim();
     if (!ref || ref.charAt(0) === '#' || SKIP.test(ref)) return null;
     // Already a replay route: leave it alone. Rewritten URLs flow back through
-    // fixUrl (e.g. when a rewritten <img src> is read and set again, or when
-    // innerHTML contains already-rewritten markup); re-resolving them against
-    // PAGE_URL would stack a second /web/.../https://host prefix.
-    if (/^\/web\/\d+\//.test(ref)) return null;
+    // fixUrl two ways:
+    //   1. relative form (/web/<ts>/...) — what the server wrote into the page,
+    //      or what an innerHTML rewrite produced;
+    //   2. absolute form (http://<replay-origin>/web/<ts>/...) — what the
+    //      browser hands back when a page *reads* img.src / a.href after we
+    //      rewrote them, then string-edits the value and writes it again (the
+    //      classic rollover: what.src = what.src.replace(...)).
+    // Both must be no-ops, else re-resolving them against PAGE_URL stacks a
+    // second /web/.../https://host prefix on every mouseover/mouseout.
+    if (/^\\/web\\/\\d+\\//.test(ref)) return null;
+    if (ref.indexOf(window.location.origin + '/web/') === 0) return null;
     try {
       if (ref.indexOf('//') === 0) {
         var b = new URL(PAGE_URL);
