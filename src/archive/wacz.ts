@@ -27,13 +27,14 @@ function waybackInner(url: string): { ts14: string; url: string } | null {
     return { ts14: m[1].slice(0, 14), url: inner };
 }
 
-/** If `url` is an ArchiveWeb.page page thumbnail (`urn:thumbnail:<page-url>`),
- * return the page it captures (its Wayback time + inner URL, or the bare URL
- * when the capture was direct); else null. */
-function thumbnailTarget(url: string): { ts14: string; url: string } | null {
+/** If `url` is a page thumbnail (`urn:thumbnail:<page-url>`), return the page
+ * it captures and that capture's time: the Wayback time + inner URL when the
+ * thumbnail wraps a replay URL, else the thumbnail record's own timestamp and
+ * the bare URL (a direct or already-restored capture). */
+function thumbnailTarget(url: string, ts17: string): { ts14: string; url: string } | null {
     const m = /^urn:thumbnail:(.+)$/i.exec(url);
     if (!m) return null;
-    return waybackInner(m[1]) ?? { ts14: '', url: m[1] };
+    return waybackInner(m[1]) ?? { ts14: ts17.slice(0, 14), url: m[1] };
 }
 
 export interface WaczPage {
@@ -85,14 +86,17 @@ export class Wacz {
     }
 
     /**
-     * Find the thumbnail (ArchiveWeb.page page screenshot) for a page capture,
-     * or null. `ts` is RFC3339 (pages.jsonl form); the thumbnail's URL embeds
-     * the capture time, so a page matches its own screenshot even when the same
-     * URL was captured many times.
+     * Find the thumbnail (page screenshot) for a page capture, or null. `ts` is
+     * RFC3339 (pages.jsonl form). A page is identified by its capture time and
+     * inner URL: for a Wayback replay URL the capture time is the timestamp
+     * embedded in the URL; for a direct or restored capture it is the page's
+     * own `ts`. The same pair is used to index each thumbnail, so a page always
+     * matches its own screenshot even when the same URL was captured many
+     * times.
      */
     thumbnailFor(url: string, ts: string): CdxjEntry | null {
         const t = waybackInner(url);
-        const ts14 = rfc3339ToTs14(ts);
+        const ts14 = t ? t.ts14 : rfc3339ToTs14(ts);
         const key = ts14 + ' ' + lookupKey(t ? t.url : url);
         return this._thumbnails.get(key) ?? null;
     }
@@ -151,7 +155,7 @@ export class Wacz {
             // `urn:thumbnail:<page-url>`; index them by the page they capture so
             // the index page can show one preview per capture.
             for (const e of this._entries) {
-                const t = thumbnailTarget(e.url);
+                const t = thumbnailTarget(e.url, e.timestamp);
                 if (!t) continue;
                 this._thumbnails.set(t.ts14 + ' ' + lookupKey(t.url), e);
             }
