@@ -4,7 +4,7 @@
  * Converts a WACZ that captured the *Wayback Machine replaying* old pages back
  * into a WACZ that looks like the pages were captured directly, in the past.
  *
- * When ArchiveWeb.page crawls `https://web.archive.org/web/<ts>/http://host/...`
+ * When a crawler walks `https://web.archive.org/web/<ts>/http://host/...`
  * it archives two very different things side by side:
  *
  *   1. the replayed page, wrapped in Wayback's own chrome (top toolbar, donation
@@ -114,6 +114,29 @@ function parseWaybackUrl(url: string): WaybackUrl | null {
         modifier: (m[2] || '').toLowerCase(),
         innerUrl: decodeInnerUrl(m[3]),
     };
+}
+
+/** A `urn:thumbnail:` / `urn:view:` record URL: the per-page screenshot (and
+ * full-page view) a WACZ stores, keyed by the page's URL. */
+const URN_SCREENSHOT_RE = /^urn:(thumbnail|view):/i;
+
+/** Unwrap `urn:thumbnail:<wayback-url>` / `urn:view:<wayback-url>` into the
+ * restored `urn:thumbnail:<inner-url>` / `urn:view:<inner-url>`, or null when
+ * `url` is not one of those (or the inner value is not a Wayback replay URL).
+ *
+ * The screenshot must follow the page: the restored page's URL is unwrapped to
+ * `<inner-url>`, so its thumbnail must be keyed the same way, as
+ * `urn:thumbnail:<inner-url>`. Keeping the thumbnail under its old
+ * `urn:thumbnail:https://web.archive.org/web/<ts>/<url>` key would orphan it
+ * (the page no longer lives at that Wayback URL) and leave the index with no
+ * thumbnail to show. */
+function parseUrnScreenshotUrl(url: string): { prefix: string; wayback: WaybackUrl; innerUrl: string } | null {
+    const m = URN_SCREENSHOT_RE.exec(url);
+    if (!m) return null;
+    const prefix = 'urn:' + m[1].toLowerCase() + ':';
+    const wb = parseWaybackUrl(url.slice(m[0].length));
+    if (!wb) return null;
+    return { prefix, wayback: wb, innerUrl: prefix + wb.innerUrl };
 }
 
 /** True when a host belongs to the Wayback chrome we want to discard. */
@@ -639,7 +662,13 @@ function main(): void {
             wayback = wb;
             innerUrl = wb.innerUrl;
         } else {
-            innerUrl = e.url;
+            const urn = parseUrnScreenshotUrl(e.url);
+            if (urn) {
+                wayback = urn.wayback;
+                innerUrl = urn.innerUrl;
+            } else {
+                innerUrl = e.url;
+            }
         }
 
         // Drop Wayback chrome and any other archive.org-hosted resource.
@@ -653,7 +682,7 @@ function main(): void {
         // still records where the real capture lives -- often under a
         // differently-cased path or a www/bare host name. When that target is a
         // *different* URL, carry the redirect over as a 302 so the source URL
-        // resolves (archiveweb.page follows it) instead of 404ing. A
+        // resolves (a replay tool follows it) instead of 404ing. A
         // self-redirect (a pure time-shift to the same URL) is dropped: the
         // era's capture at the shifted time already covers the source URL.
         const own = byTarget.get(e.url);
