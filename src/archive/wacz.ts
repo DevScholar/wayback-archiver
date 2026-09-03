@@ -172,9 +172,12 @@ export class Wacz {
         // bound of that unit (e.g. "20260831074847" -> "...74847999").
         const target = ts.padEnd(17, '9');
 
-        const best = { before: null as CdxjEntry | null, after: null as CdxjEntry | null };
+        // Tracks the nearest capture on either side of `target`. A fresh one is
+        // built per lookup rather than reset in place, so the `null` reset never
+        // narrows the shared object's properties and defeats the guards below.
+        type Best = { before: CdxjEntry | null; after: CdxjEntry | null };
 
-        const consider = (e: CdxjEntry): void => {
+        const consider = (best: Best, e: CdxjEntry): void => {
             if (e.timestamp <= target) {
                 if (!best.before || e.timestamp > best.before.timestamp) best.before = e;
             } else {
@@ -183,9 +186,8 @@ export class Wacz {
         };
 
         const nearestOf = (list: CdxjEntry[]): CdxjEntry | null => {
-            best.before = null;
-            best.after = null;
-            for (const e of list) consider(e);
+            const best: Best = { before: null, after: null };
+            for (const e of list) consider(best, e);
             const before = best.before;
             const after = best.after;
             if (!before) return after ?? null;
