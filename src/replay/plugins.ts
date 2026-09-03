@@ -14,9 +14,9 @@
  * (server rewrites to /web/ routes; flat rewrites to exported file names).
  */
 
-import { rewriteContent, detectContentKind, UrlRewriter } from './rewrite';
-import { lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url';
-import { createUrlFixerPlugin } from './url-fixer';
+import { rewriteContent, detectContentKind, UrlRewriter } from './rewrite.js';
+import { lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url.js';
+import { createUrlFixerPlugin } from './url-fixer.js';
 
 export interface ReplayContext {
     /** Original URL of this resource -- the base for resolving relative refs. */

@@ -22,7 +22,7 @@
  * shim under file://.
  */
 
-import type { ResponsePlugin } from './plugins';
+import type { ResponsePlugin } from './plugins.js';
 
 /** Route the replay server serves the url-fixer runtime shim from. Kept in one
  * place so the plugin's `<script src>` and the server's route stay in sync. */

@@ -13,13 +13,13 @@
 import * as http from 'http';
 import * as path from 'path';
 import * as os from 'os';
-import { Wacz } from '../archive/wacz';
-import { WarcRecord } from '../archive/warc';
-import { renderIndexPage, buildPageRows } from '../replay/index-page';
-import { rfc3339ToTs14 } from '../lib/time';
-import { createDefaultPipeline, ReplayContext } from '../replay/plugins';
-import { URL_FIXER_SCRIPT_ROUTE } from '../replay/url-fixer';
-import { URL_FIXER_SHIM } from '../replay/url-fixer-shim';
+import { Wacz } from '../archive/wacz.js';
+import { WarcRecord } from '../archive/warc.js';
+import { renderIndexPage, buildPageRows } from '../replay/index-page.js';
+import { rfc3339ToTs14 } from '../lib/time.js';
+import { createDefaultPipeline, ReplayContext } from '../replay/plugins.js';
+import { URL_FIXER_SCRIPT_ROUTE } from '../replay/url-fixer.js';
+import { URL_FIXER_SHIM } from '../replay/url-fixer-shim.js';
 
 // ---------------------------------------------------------------------------
 // Arguments

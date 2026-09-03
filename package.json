@@ -3,6 +3,7 @@
   "version": "2.0.0",
   "description": "Read WACZ web archives: export to standalone HTML and serve for replay",
   "private": true,
+  "type": "module",
   "scripts": {
     "download": "tsx src/cli/downloader.ts",
     "export": "tsx src/cli/export-to-html.ts",

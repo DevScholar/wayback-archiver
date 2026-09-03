@@ -39,13 +39,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
-import { ZipReader } from '../archive/zip';
-import { writeZipFile } from '../archive/zip-writer';
-import { buildWarcRecord, payloadDigest } from '../archive/warc-writer';
-import { parseWarcRecord, WarcRecord } from '../archive/warc';
-import { parseCdxj, CdxjEntry } from '../archive/cdxj';
-import { surtKey } from '../lib/url';
-import { cdxjTsToRfc3339 } from '../lib/time';
+import { ZipReader } from '../archive/zip.js';
+import { writeZipFile } from '../archive/zip-writer.js';
+import { buildWarcRecord, payloadDigest } from '../archive/warc-writer.js';
+import { parseWarcRecord, WarcRecord } from '../archive/warc.js';
+import { parseCdxj, CdxjEntry } from '../archive/cdxj.js';
+import { surtKey } from '../lib/url.js';
+import { cdxjTsToRfc3339 } from '../lib/time.js';
 
 // ---------------------------------------------------------------------------
 // Arguments

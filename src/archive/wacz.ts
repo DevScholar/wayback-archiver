@@ -7,11 +7,11 @@
  */
 
 import * as zlib from 'zlib';
-import { ZipReader } from './zip';
-import { parseWarcRecord, WarcRecord } from './warc';
-import { parseCdxj, CdxjEntry } from './cdxj';
-import { candidateUrls, lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url';
-import { rfc3339ToTs14 } from '../lib/time';
+import { ZipReader } from './zip.js';
+import { parseWarcRecord, WarcRecord } from './warc.js';
+import { parseCdxj, CdxjEntry } from './cdxj.js';
+import { candidateUrls, lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url.js';
+import { rfc3339ToTs14 } from '../lib/time.js';
 
 /** If `url` is a Wayback replay URL (`https://web.archive.org/web/<ts>/<url>`),
  * return its capture time (14 digits) and inner URL; else null. */

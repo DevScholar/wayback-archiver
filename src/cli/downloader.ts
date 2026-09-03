@@ -35,12 +35,12 @@ import * as http from 'http';
 import * as https from 'https';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
-import { writeZipFile } from '../archive/zip-writer';
-import { buildWarcRecord, payloadDigest } from '../archive/warc-writer';
-import { surtKey } from '../lib/url';
-import { nowTs17, cdxjTsToRfc3339 } from '../lib/time';
-import { ZipReader } from '../archive/zip';
-import { parseCdxj } from '../archive/cdxj';
+import { writeZipFile } from '../archive/zip-writer.js';
+import { buildWarcRecord, payloadDigest } from '../archive/warc-writer.js';
+import { surtKey } from '../lib/url.js';
+import { nowTs17, cdxjTsToRfc3339 } from '../lib/time.js';
+import { ZipReader } from '../archive/zip.js';
+import { parseCdxj } from '../archive/cdxj.js';
 
 // ---------------------------------------------------------------------------
 // Arguments

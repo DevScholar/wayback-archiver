@@ -24,12 +24,12 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Wacz, ResolvedRecord } from '../archive/wacz';
-import { CdxjEntry } from '../archive/cdxj';
-import { lookupKey, lookupVariants, lookupPathKey, lookupKeyCi } from '../lib/url';
-import { renderIndexPage, buildPageRows, IndexRow } from '../replay/index-page';
-import { cdxjTsToRfc3339, rfc3339ToTs14 } from '../lib/time';
-import { createExportPipeline, ReplayContext, FLAT_NOT_FOUND_FILE } from '../replay/plugins';
+import { Wacz, ResolvedRecord } from '../archive/wacz.js';
+import { CdxjEntry } from '../archive/cdxj.js';
+import { lookupKey, lookupVariants, lookupPathKey, lookupKeyCi } from '../lib/url.js';
+import { renderIndexPage, buildPageRows, IndexRow } from '../replay/index-page.js';
+import { cdxjTsToRfc3339, rfc3339ToTs14 } from '../lib/time.js';
+import { createExportPipeline, ReplayContext, FLAT_NOT_FOUND_FILE } from '../replay/plugins.js';
 
 // ---------------------------------------------------------------------------
 // Arguments
