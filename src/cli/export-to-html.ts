@@ -400,8 +400,13 @@ function main(): void {
 
     // index.html (pre-generated) -- lists the archive's *pages*, linking to the
     // flat file name each page was exported to.
-    const pageRows = buildPageRows(wacz.pages, (url, ts) =>
-        flatName.get(captureKey(url, rfc3339ToTs14(ts))) ?? null,
+    const pageRows = buildPageRows(
+        wacz.pages,
+        (url, ts) => flatName.get(captureKey(url, rfc3339ToTs14(ts))) ?? null,
+        (url, ts) => {
+            const thumb = wacz.thumbnailFor(url, ts);
+            return thumb ? flatName.get(captureKey(thumb.url, thumb.timestamp.slice(0, 14))) ?? null : null;
+        },
     );
     fs.writeFileSync(
         path.join(outDir, 'index.html'),

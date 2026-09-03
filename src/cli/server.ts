@@ -177,7 +177,14 @@ function main(): void {
     // The index page lists the archive's *pages* (from pages.jsonl), not every
     // captured resource. Each entry points at a /web/<ts>/<url> replay route.
     const buildIndexPage = (): string => {
-        const rows = buildPageRows(wacz.pages, (url, ts) => `/web/${rfc3339ToTs14(ts)}/${url}`);
+        const rows = buildPageRows(
+            wacz.pages,
+            (url, ts) => `/web/${rfc3339ToTs14(ts)}/${url}`,
+            (url, ts) => {
+                const thumb = wacz.thumbnailFor(url, ts);
+                return thumb ? `/web/${thumb.timestamp.slice(0, 14)}/${thumb.url}` : null;
+            },
+        );
         return renderIndexPage(wacz.title, rows, ['Page', 'Timestamp', 'Original URL']);
     };
 
@@ -209,7 +216,10 @@ function main(): void {
         if (m) {
             const reqTs = m[1];
             let rawUrl = m[2];
-            if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
+            // `urn:` URLs (page thumbnails: `urn:thumbnail:<page-url>`) already
+            // carry a scheme but not the `://` form the check below assumes; a
+            // bare hostname still needs `http://`. Leave `urn:` untouched.
+            if (!/^urn:/i.test(rawUrl) && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
                 rawUrl = 'http://' + rawUrl.replace(/^(https?|ftp)\//, '');
             }
 

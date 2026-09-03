@@ -14,6 +14,8 @@ export interface IndexRow {
     timestamp: string;
     /** Text shown in the "Original URL" column. */
     url: string;
+    /** Optional preview image URL (relative), rendered in a leading column. */
+    thumbnail?: string;
 }
 
 function escapeHtml(str: string): string {
@@ -32,12 +34,26 @@ export function renderIndexPage(
     rows: IndexRow[],
     headers: [string, string, string] = DEFAULT_HEADERS,
 ): string {
+    // A "Preview" column is added only when at least one row carries a
+    // thumbnail, so archives without screenshots keep the classic 3-column
+    // layout. The fixed-width timestamp column shifts right by one in that case.
+    const hasThumbs = rows.some((r) => r.thumbnail);
+    const tsIndex = hasThumbs ? 2 : 1;
+    const headerRow = (hasThumbs ? ['Preview', ...headers] : [...headers])
+        .map((h, i) => `<th${i === tsIndex ? ' width="180"' : ''}>${escapeHtml(h)}</th>`)
+        .join('\n        ');
+
     const body = rows
         .map(
             (r, i) => {
                 const cls = i % 2 === 0 ? 'row-norm' : 'row-alt';
+                const thumbCell = hasThumbs
+                    ? `<td>${r.thumbnail
+                        ? `<a href="${escapeHtml(r.href)}"><img src="${escapeHtml(r.thumbnail)}" width="160" alt="" border="0"></a>`
+                        : '&nbsp;'}</td>\n        `
+                    : '';
                 return `    <tr class="${cls}">
-        <td><a href="${escapeHtml(r.href)}">${escapeHtml(r.name)}</a></td>
+        ${thumbCell}<td><a href="${escapeHtml(r.href)}">${escapeHtml(r.name)}</a></td>
         <td class="sml">${escapeHtml(r.timestamp)}</td>
         <td class="sml">${escapeHtml(r.url)}</td>
     </tr>`;
@@ -69,9 +85,7 @@ export function renderIndexPage(
 <h1>${escapeHtml(title)} (${rows.length} Pages)</h1>
 <table cellpadding="0" cellspacing="0">
     <tr>
-        <th>${escapeHtml(headers[0])}</th>
-        <th width="180">${escapeHtml(headers[1])}</th>
-        <th>${escapeHtml(headers[2])}</th>
+        ${headerRow}
     </tr>
 ${body}
 </table>
@@ -92,12 +106,20 @@ ${body}
 export function buildPageRows(
     pages: { url: string; ts: string; title?: string }[],
     hrefFor: (url: string, ts: string) => string | null,
+    thumbFor?: (url: string, ts: string) => string | null,
 ): IndexRow[] {
     const rows: IndexRow[] = [];
     for (const p of pages) {
         const href = hrefFor(p.url, p.ts);
         if (href === null) continue;
-        rows.push({ href, name: p.title || p.url, timestamp: p.ts, url: p.url });
+        const thumbnail = thumbFor ? thumbFor(p.url, p.ts) : null;
+        rows.push({
+            href,
+            name: p.title || p.url,
+            timestamp: p.ts,
+            url: p.url,
+            thumbnail: thumbnail ?? undefined,
+        });
     }
     return rows;
 }

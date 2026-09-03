@@ -11,6 +11,30 @@ import { ZipReader } from './zip';
 import { parseWarcRecord, WarcRecord } from './warc';
 import { parseCdxj, CdxjEntry } from './cdxj';
 import { candidateUrls, lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url';
+import { rfc3339ToTs14 } from '../lib/time';
+
+/** If `url` is a Wayback replay URL (`https://web.archive.org/web/<ts>/<url>`),
+ * return its capture time (14 digits) and inner URL; else null. */
+function waybackInner(url: string): { ts14: string; url: string } | null {
+    const m = /^https?:\/\/web\.archive\.org\/web\/(\d{4,14})(?:[a-z]{2}_)?\/(.+)$/i.exec(url);
+    if (!m) return null;
+    let inner = m[2];
+    try {
+        inner = decodeURIComponent(inner);
+    } catch {
+        /* keep raw */
+    }
+    return { ts14: m[1].slice(0, 14), url: inner };
+}
+
+/** If `url` is an ArchiveWeb.page page thumbnail (`urn:thumbnail:<page-url>`),
+ * return the page it captures (its Wayback time + inner URL, or the bare URL
+ * when the capture was direct); else null. */
+function thumbnailTarget(url: string): { ts14: string; url: string } | null {
+    const m = /^urn:thumbnail:(.+)$/i.exec(url);
+    if (!m) return null;
+    return waybackInner(m[1]) ?? { ts14: '', url: m[1] };
+}
 
 export interface WaczPage {
     url: string;
@@ -37,6 +61,8 @@ export class Wacz {
     private _indexByPath = new Map<string, CdxjEntry[]>();
     /** lookupKeyCi(url) -> all captures whose scheme/host/path differ only by case. */
     private _indexByKeyCi = new Map<string, CdxjEntry[]>();
+    /** Page identity (`ts14 +   + lookupKey(innerUrl)`) -> thumbnail record. */
+    private _thumbnails = new Map<string, CdxjEntry>();
     /** Maps a WARC file basename (from CDXJ `filename`) to its ZIP entry path. */
     private _warcEntries = new Map<string, string>();
     private _title = '';
@@ -56,6 +82,19 @@ export class Wacz {
 
     get entries(): CdxjEntry[] {
         return this._entries;
+    }
+
+    /**
+     * Find the thumbnail (ArchiveWeb.page page screenshot) for a page capture,
+     * or null. `ts` is RFC3339 (pages.jsonl form); the thumbnail's URL embeds
+     * the capture time, so a page matches its own screenshot even when the same
+     * URL was captured many times.
+     */
+    thumbnailFor(url: string, ts: string): CdxjEntry | null {
+        const t = waybackInner(url);
+        const ts14 = rfc3339ToTs14(ts);
+        const key = ts14 + ' ' + lookupKey(t ? t.url : url);
+        return this._thumbnails.get(key) ?? null;
     }
 
     private load(): void {
@@ -106,6 +145,15 @@ export class Wacz {
             }
             for (const list of this._indexByKeyCi.values()) {
                 list.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+            }
+
+            // Page thumbnails (ArchiveWeb.page screenshots) are stored under
+            // `urn:thumbnail:<page-url>`; index them by the page they capture so
+            // the index page can show one preview per capture.
+            for (const e of this._entries) {
+                const t = thumbnailTarget(e.url);
+                if (!t) continue;
+                this._thumbnails.set(t.ts14 + ' ' + lookupKey(t.url), e);
             }
         }
 
