@@ -7,6 +7,7 @@
     "download": "tsx src/cli/downloader.ts",
     "export": "tsx src/cli/export-to-html.ts",
     "server": "tsx src/cli/server.ts",
+    "restore": "tsx src/cli/wayback-machine-restorer.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc"
   },

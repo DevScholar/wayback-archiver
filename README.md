@@ -26,6 +26,38 @@ re-fetched), existing records are kept byte-for-byte, and only new URLs are
 added. Omitting `--title` keeps the existing title; providing it renames the
 archive. Options: `--concurrency` (default 8).
 
+## Restore a Wayback Machine capture
+
+```
+npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>]
+```
+
+When ArchiveWeb.page crawls `https://web.archive.org/web/<ts>/http://host/...`,
+it archives the replayed page *wrapped in Wayback's own chrome* (top toolbar,
+donation banner, `wombat.js`, `bundle-playback.js`, analytics) side by side with
+the real, third-party content, every URL rewritten to a `/web/<ts>[mod_]/<url>`
+route. This tool inverts those transforms to produce a WACZ that looks as if the
+pages were captured directly, in the past:
+
+- drops every record hosted on `*.archive.org` (the Wayback chrome), keeping only
+  the real third-party content;
+- unwraps `/web/<ts>[mod_]/<url>` (and the absolute
+  `https://web.archive.org/web/<ts>[mod_]/<url>` form) back to the inner `<url>`;
+- strips the injected `<head>` scripts, the toolbar, and the trailing
+  "FILE ARCHIVED ON ..." footer from HTML;
+- follows 302 redirect chains and WARC `revisit` references to the final record,
+  then stamps it with the *actual* capture time (the final URL's timestamp or
+  `x-archive-orig-date`), not the requested replay time — including converting
+  Wayback's "redirect notice" interstitials back into real 3xx records;
+- restores the historical HTTP headers from `X-Archive-Orig-*`, so a modern
+  replay artifact (`server: nginx`, CSP, `cache-control`) never leaks into the
+  restored record.
+
+Every record Wayback actually served is kept verbatim, including empty bodies,
+error pages, and tiny stubs. If `--output-file` is omitted, output defaults to
+`<archive>-restored.wacz` next to the input; the title defaults to
+`<original-title> (restored)`.
+
 ## Export to standalone HTML
 
 ```
