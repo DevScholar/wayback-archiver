@@ -28,7 +28,7 @@ import { Wacz, ResolvedRecord } from '../archive/wacz';
 import { CdxjEntry } from '../archive/cdxj';
 import { lookupKey, lookupVariants, lookupPathKey, lookupKeyCi } from '../lib/url';
 import { renderIndexPage, buildPageRows, IndexRow } from '../replay/index-page';
-import { cdxjTsToRfc3339 } from '../lib/time';
+import { cdxjTsToRfc3339, rfc3339ToTs14 } from '../lib/time';
 import { createExportPipeline, ReplayContext, FLAT_NOT_FOUND_FILE } from '../replay/plugins';
 
 // ---------------------------------------------------------------------------
@@ -96,11 +96,39 @@ function sanitizeName(s: string): string {
  */
 const HTML_SCRIPT_EXTS = new Set(['.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml']);
 
-/** Rewrite server-side HTML extensions to `.html`, but only when the resource
- * really is HTML — a `.php` endpoint serving JSON or an image must keep its
- * own identity rather than being mislabeled as a page. */
+/**
+ * Top-level domains that show up as the tail of a bare hostname when a URL is
+ * just a domain root — e.g. `http://www.microsoft.com/` seen through a Wayback
+ * replay URL gives basename `www.microsoft.com`. `splitName` then splits at the
+ * last dot and treats `.com`/`.org`/… as if they were file extensions, but a
+ * browser under `file://` has no MIME for them and offers to download the page
+ * instead of rendering it. Like the SSI extensions above, a TLD "extension" on
+ * an HTML resource is rewritten to `.html`.
+ */
+const DOMAIN_TLDS = new Set([
+    '.com', '.org', '.net', '.edu', '.gov', '.mil', '.int',
+    '.io', '.co', '.tv', '.me', '.cc', '.info', '.biz', '.name', '.mobi', '.asia',
+    '.uk', '.us', '.ca', '.au', '.nz', '.de', '.fr', '.it', '.es', '.nl', '.se',
+    '.no', '.dk', '.fi', '.at', '.be', '.ch', '.pl', '.cz', '.sk', '.hu', '.gr',
+    '.pt', '.ru', '.cn', '.jp', '.kr', '.tw', '.hk', '.sg', '.in', '.br', '.mx',
+    '.za', '.ar', '.cl', '.tr', '.il', '.ie', '.is',
+]);
+
+/** Rewrite extensions that are not real file types, but only when the resource
+ * is known:
+ *
+ *   - A bare-hostname TLD (`.com`, `.org`, …) is never a real file extension:
+ *     under `file://` the browser has no MIME for it and offers to download the
+ *     resource instead of rendering it. Fall back to the content-type's own
+ *     extension — a page becomes `.html`, a `urn:view:` screenshot becomes
+ *     `.png`, and so on.
+ *   - A server-side script extension (`.php`, `.asp`, …) on an HTML body must
+ *     become `.html`; the same suffix on a JSON or image response keeps its own
+ *     identity. */
 function normalizeExt(ext: string, mime: string): string {
-    if (HTML_SCRIPT_EXTS.has(ext) && extFromMime(mime) === '.html') return '.html';
+    const fromMime = extFromMime(mime);
+    if (DOMAIN_TLDS.has(ext)) return fromMime || ext;
+    if (HTML_SCRIPT_EXTS.has(ext) && fromMime === '.html') return '.html';
     return ext;
 }
 
@@ -134,6 +162,17 @@ function splitName(url: string): NameParts {
         return { stem: base.slice(0, dot), urlExt: base.slice(dot).toLowerCase() };
     }
     return { stem: base, urlExt: '' };
+}
+
+/**
+ * Identity of a single capture: normalized URL + 14-digit timestamp. Two
+ * captures of the same URL at different times are distinct pages and must each
+ * be exported (a multi-capture archive lists every version). The 14-digit
+ * timestamp is the shared unit here: pages.jsonl carries second precision and
+ * the restorer stamps whole seconds, so it uniquely identifies a capture.
+ */
+function captureKey(url: string, ts14: string): string {
+    return lookupKey(url) + ' ' + ts14;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,24 +233,27 @@ function main(): void {
 
     const wacz = new Wacz(waczPath);
 
-    // Deduplicate entries by normalized URL, keeping the first occurrence.
+    // Deduplicate entries by capture (normalized URL + timestamp), keeping the
+    // first occurrence of a true duplicate. Distinct timestamps of the same URL
+    // are distinct captures and must each be exported -- a multi-capture archive
+    // (e.g. the same Microsoft homepage in 1996 and 1998) lists every version.
     const seen = new Set<string>();
     const unique: CdxjEntry[] = [];
     for (const e of wacz.entries) {
-        const k = lookupKey(e.url);
+        const k = captureKey(e.url, e.timestamp.slice(0, 14));
         if (seen.has(k)) continue;
         seen.add(k);
         unique.push(e);
     }
     unique.sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
-    console.log(`  ${unique.length} unique URLs in index`);
+    console.log(`  ${unique.length} unique captures in index`);
 
     // Assign flat names to the entries we will actually export (200 responses,
     // skipping warc/revisit records).
     const exported = unique.filter((e) => e.mime !== 'warc/revisit' && (e.status == null || e.status === 200));
 
     const counters = new Map<string, number>();
-    const flatName = new Map<string, string>(); // lookupKey(url) -> flat name
+    const flatName = new Map<string, string>(); // captureKey(url, ts14) -> flat name
 
     for (const e of exported) {
         const { stem, urlExt } = splitName(e.url);
@@ -226,7 +268,7 @@ function main(): void {
         const n = (counters.get(groupKey) || 0) + 1;
         counters.set(groupKey, n);
         const name = `${prefix}~${n}${ext}`;
-        flatName.set(lookupKey(e.url), name);
+        flatName.set(captureKey(e.url, e.timestamp.slice(0, 14)), name);
     }
 
     // URL -> flat name, including www/protocol variants for link rewriting.
@@ -239,7 +281,7 @@ function main(): void {
     // IIS) where the page and the capture disagree on path case.
     const flatByKeyCi = new Map<string, string>();
     for (const e of exported) {
-        const name = flatName.get(lookupKey(e.url));
+        const name = flatName.get(captureKey(e.url, e.timestamp.slice(0, 14)));
         if (!name) continue;
         for (const v of lookupVariants(e.url)) {
             const k = lookupKey(v);
@@ -310,12 +352,15 @@ function main(): void {
     let skipped = 0;
 
     for (const e of exported) {
-        const name = flatName.get(lookupKey(e.url));
+        const name = flatName.get(captureKey(e.url, e.timestamp.slice(0, 14)));
         if (!name) continue;
 
         let rec: ResolvedRecord;
         try {
-            rec = wacz.resolveRecord(e.url)!;
+            // Resolve at this capture's own timestamp: a multi-capture URL has
+            // several records, and the default (earliest) would export the wrong
+            // version for every later capture.
+            rec = wacz.resolveRecord(e.url, e.timestamp)!;
         } catch (err) {
             console.error('  ERROR reading ' + e.url + ': ' + (err as Error).message);
             skipped++;
@@ -355,7 +400,9 @@ function main(): void {
 
     // index.html (pre-generated) -- lists the archive's *pages*, linking to the
     // flat file name each page was exported to.
-    const pageRows = buildPageRows(wacz.pages, (url) => flatByKey.get(lookupKey(url)) ?? null);
+    const pageRows = buildPageRows(wacz.pages, (url, ts) =>
+        flatName.get(captureKey(url, rfc3339ToTs14(ts))) ?? null,
+    );
     fs.writeFileSync(
         path.join(outDir, 'index.html'),
         renderIndexPage(wacz.title, pageRows, ['Page', 'Timestamp', 'Original URL']),
