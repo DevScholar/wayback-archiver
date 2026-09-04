@@ -76,6 +76,22 @@ function sniffCharset(head: Buffer, mime: string): string | undefined {
 }
 
 /**
+ * The charset the crawler identified for this payload, from the WARC-level
+ * `WARC-Identified-Payload-Type` header (e.g. `text/html; charset=windows-1252`),
+ * or undefined. This is the browser's sniff of the *actual stored bytes*, so it
+ * is the most faithful declaration available when the historical HTTP
+ * `Content-Type` (and the page's own `<meta>`) never declared one -- the common
+ * case for 1990s servers, whose bodies carry raw Windows-1252 bytes (an em-dash
+ * as 0x97) with no encoding metadata at all.
+ */
+function identifiedCharset(record: WarcRecord): string | undefined {
+    const ipt = record.headers.get('warc-identified-payload-type');
+    if (!ipt) return undefined;
+    const m = /[;\s]charset\s*=\s*"?([a-zA-Z0-9._-]+)"?/i.exec(ipt);
+    return m ? m[1] : undefined;
+}
+
+/**
  * Framing + hop-by-hop headers (RFC 7230 section 6.1) that Node's HTTP layer owns and
  * that can't be replayed verbatim -- the body has been decompressed and
  * rewritten, so the original `content-length`/`content-encoding` no longer
@@ -148,11 +164,19 @@ function buildReplayHeaders(
     }
 
     let contentType = headers['content-type'] || mime;
-    const charset = sniffCharset(body, contentType);
-    if (charset && !/charset=/i.test(contentType)) {
-        contentType += `; charset=${charset}`;
-    } else if (TEXT_HTML.test(contentType) && !/charset=/i.test(contentType)) {
-        contentType += '; charset=utf-8';
+    // Resolve the charset to declare. The historical server's own `Content-Type`
+    // charset (already in `contentType`) wins; otherwise prefer the crawler's
+    // `WARC-Identified-Payload-Type` (matches the stored bytes), then a `<meta>`
+    // charset in the body, and finally a UTF-8 default for HTML. Declaring the
+    // identified charset -- not transcoding -- keeps the stored bytes verbatim
+    // while telling the browser how to decode them.
+    if (!/charset=/i.test(contentType)) {
+        const charset = identifiedCharset(record) ?? sniffCharset(body, contentType);
+        if (charset) {
+            contentType += `; charset=${charset}`;
+        } else if (TEXT_HTML.test(contentType)) {
+            contentType += '; charset=utf-8';
+        }
     }
     headers['content-type'] = contentType;
 
