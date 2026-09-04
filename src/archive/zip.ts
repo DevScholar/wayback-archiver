@@ -6,6 +6,12 @@
  * byte ranges (HTTP Range semantics), and the smaller metadata files are
  * either STORE or DEFLATE. We support both, using nothing but the Node
  * standard library.
+ *
+ * The reader keeps a file descriptor and reads only what it needs: the central
+ * directory (one small header + name per entry) stays in memory, while entry
+ * payloads -- including individual WARC records -- are pulled from disk on
+ * demand via positional reads. This keeps memory proportional to the number of
+ * entries, not the archive size.
  */
 
 import * as fs from 'fs';
@@ -26,56 +32,88 @@ export interface ZipEntry {
 }
 
 export class ZipReader {
-    private buf: Buffer;
+    private fd: number;
+    private size: number;
     private entries = new Map<string, ZipEntry>();
+    private closed = false;
 
-    constructor(buf: Buffer) {
-        this.buf = buf;
+    private constructor(fd: number, size: number) {
+        this.fd = fd;
+        this.size = size;
         this.parse();
     }
 
     static open(filePath: string): ZipReader {
-        return new ZipReader(fs.readFileSync(filePath));
+        const fd = fs.openSync(filePath, 'r');
+        try {
+            const size = fs.fstatSync(fd).size;
+            return new ZipReader(fd, size);
+        } catch (err) {
+            fs.closeSync(fd);
+            throw err;
+        }
+    }
+
+    /** Read exactly `length` bytes at `offset`, looping over short reads. */
+    private readRange(offset: number, length: number): Buffer {
+        const buf = Buffer.alloc(length);
+        let read = 0;
+        while (read < length) {
+            const n = fs.readSync(this.fd, buf, read, length - read, offset + read);
+            if (n === 0) break;
+            read += n;
+        }
+        if (read !== length) {
+            throw new Error(`Short read in ZIP (wanted ${length}, got ${read})`);
+        }
+        return buf;
     }
 
     private parse(): void {
-        const buf = this.buf;
-
-        // Locate the End Of Central Directory record by scanning backwards.
-        // It is followed by an optional comment of up to 65535 bytes.
+        // Locate the End Of Central Directory record by scanning backwards. It
+        // is followed by an optional comment of up to 65535 bytes, so it sits
+        // within the last 65557 bytes of the file.
+        const tailLen = Math.min(this.size, 65557);
+        const tail = this.readRange(this.size - tailLen, tailLen);
         let eocd = -1;
-        const min = Math.max(0, buf.length - 65557);
-        for (let i = buf.length - 22; i >= min; i--) {
-            if (buf.readUInt32LE(i) === EOCD_SIG) {
+        for (let i = tailLen - 22; i >= 0; i--) {
+            if (tail.readUInt32LE(i) === EOCD_SIG) {
                 eocd = i;
                 break;
             }
         }
         if (eocd < 0) throw new Error('Not a valid ZIP file (End Of Central Directory not found)');
 
-        const entryCount = buf.readUInt16LE(eocd + 10);
-        let offset = buf.readUInt32LE(eocd + 16);
+        const entryCount = tail.readUInt16LE(eocd + 10);
+        const cdLength = tail.readUInt32LE(eocd + 12);
+        const cdOffset = tail.readUInt32LE(eocd + 16);
 
+        // Read the central directory in one shot; it is small (one ~46-byte
+        // header + name per entry). Entry payloads are not read here.
+        const cd = this.readRange(cdOffset, cdLength);
+
+        let offset = 0;
         for (let i = 0; i < entryCount; i++) {
-            if (buf.readUInt32LE(offset) !== CEN_SIG) {
+            if (cd.readUInt32LE(offset) !== CEN_SIG) {
                 throw new Error('Corrupt ZIP: bad central directory entry');
             }
 
-            const method = buf.readUInt16LE(offset + 10);
-            const compressedSize = buf.readUInt32LE(offset + 20);
-            const uncompressedSize = buf.readUInt32LE(offset + 24);
-            const nameLen = buf.readUInt16LE(offset + 28);
-            const extraLen = buf.readUInt16LE(offset + 30);
-            const commentLen = buf.readUInt16LE(offset + 32);
-            const localHeaderOffset = buf.readUInt32LE(offset + 42);
-            const name = buf.toString('utf8', offset + 46, offset + 46 + nameLen);
+            const method = cd.readUInt16LE(offset + 10);
+            const compressedSize = cd.readUInt32LE(offset + 20);
+            const uncompressedSize = cd.readUInt32LE(offset + 24);
+            const nameLen = cd.readUInt16LE(offset + 28);
+            const extraLen = cd.readUInt16LE(offset + 30);
+            const commentLen = cd.readUInt16LE(offset + 32);
+            const localHeaderOffset = cd.readUInt32LE(offset + 42);
+            const name = cd.toString('utf8', offset + 46, offset + 46 + nameLen);
 
             // Resolve the actual start of the file data from the local header.
-            if (buf.readUInt32LE(localHeaderOffset) !== LOC_SIG) {
+            const local = this.readRange(localHeaderOffset, 30);
+            if (local.readUInt32LE(0) !== LOC_SIG) {
                 throw new Error(`Corrupt ZIP: bad local header for ${name}`);
             }
-            const lNameLen = buf.readUInt16LE(localHeaderOffset + 26);
-            const lExtraLen = buf.readUInt16LE(localHeaderOffset + 28);
+            const lNameLen = local.readUInt16LE(26);
+            const lExtraLen = local.readUInt16LE(28);
             const dataOffset = localHeaderOffset + 30 + lNameLen + lExtraLen;
 
             this.entries.set(name, {
@@ -102,21 +140,28 @@ export class ZipReader {
     readEntry(name: string): Buffer {
         const e = this.entries.get(name);
         if (!e) throw new Error(`Entry not found in archive: ${name}`);
-        const raw = this.buf.subarray(e.dataOffset, e.dataOffset + e.compressedSize);
-        if (e.method === 0) return Buffer.from(raw); // STORE -- copy so the caller owns it
+        const raw = this.readRange(e.dataOffset, e.compressedSize);
+        if (e.method === 0) return raw; // STORE
         if (e.method === 8) return zlib.inflateRawSync(raw); // DEFLATE
         throw new Error(`Unsupported compression method ${e.method} for ${name}`);
     }
 
     /**
-     * Read a byte range of a STORE entry without copying or decompressing the
-     * whole thing. Used to gunzip a single WARC record from data.warc.gz.
-     * The returned buffer shares memory with the archive buffer.
+     * Read a byte range of a STORE entry without decompressing the whole thing.
+     * Used to gunzip a single WARC record from data.warc.gz. The returned buffer
+     * is owned by the caller.
      */
     storedRange(name: string, start: number, length: number): Buffer {
         const e = this.entries.get(name);
         if (!e) throw new Error(`Entry not found in archive: ${name}`);
         if (e.method !== 0) throw new Error(`storedRange requires a STORE entry: ${name}`);
-        return this.buf.subarray(e.dataOffset + start, e.dataOffset + start + length);
+        return this.readRange(e.dataOffset + start, length);
+    }
+
+    /** Release the file descriptor. Safe to call more than once. */
+    close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        fs.closeSync(this.fd);
     }
 }
