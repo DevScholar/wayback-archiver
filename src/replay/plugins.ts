@@ -74,9 +74,9 @@ function flatNotFoundLink(url: string): string {
 export function createStaticRewritePlugin(): ResponsePlugin {
     return {
         name: 'static-rewrite',
-        matches: (ctx) => detectContentKind(ctx.mime, ctx.url) !== null,
+        matches: (ctx) => detectContentKind(ctx.mime) !== null,
         transform: (ctx) => {
-            const kind = detectContentKind(ctx.mime, ctx.url)!;
+            const kind = detectContentKind(ctx.mime)!;
             const rewriter: UrlRewriter = (abs) => {
                 if (ctx.mode === 'flat') {
                     // Exact match first (lookupKey covers scheme/www/`?&` variants).

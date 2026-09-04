@@ -255,23 +255,18 @@ export function rewriteContent(
 }
 
 /** Classify a resource as html/css/js for rewriting, or null if it is not
- * text we should rewrite (binary, JSON, plain text, ...). */
-export function detectContentKind(mime: string, url: string): ContentKind | null {
+ * text we should rewrite (binary, JSON, plain text, ...).
+ *
+ * The decision rests on the archive's own content-type -- the mime already
+ * resolved at ingest (the restorer falls back to the record's HTTP
+ * content-type, then the CDXJ mime). The URL's extension is deliberately not
+ * consulted: a `.php`/`.asp`/`.jsp`/`.cgi` path was server-rendered to HTML
+ * *before* it was archived, so the extension describes the template, not the
+ * bytes. The mime is what the response actually was. */
+export function detectContentKind(mime: string): ContentKind | null {
     const m = (mime || '').toLowerCase();
     if (/html/.test(m)) return 'html';
     if (/css/.test(m)) return 'css';
     if (/javascript|ecmascript/.test(m)) return 'js';
-    if (/svg/.test(m)) return 'html'; // SVG carries href/src via markup
-
-    let pathname = '';
-    try {
-        pathname = new URL(url).pathname;
-    } catch {
-        return null;
-    }
-    const ext = pathname.slice(pathname.lastIndexOf('.')).toLowerCase();
-    if (['.html', '.htm', '.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml', '.svg'].includes(ext)) return 'html';
-    if (ext === '.css') return 'css';
-    if (ext === '.js' || ext === '.mjs') return 'js';
     return null;
 }
