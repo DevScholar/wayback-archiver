@@ -527,6 +527,13 @@ interface KeptRecord {
     statusText: string;
     headers: [string, string][];
     body: Buffer;
+    /**
+     * The crawler's `WARC-Identified-Payload-Type` (charset-bearing) header, if
+     * the original record carried one. Preserved verbatim so legacy bodies whose
+     * server never declared a charset (e.g. Windows-1252 em-dashes) still decode
+     * correctly on replay.
+     */
+    identifiedPayloadType?: string;
 }
 
 function resource(name: string, p: string, data: Buffer): Record<string, unknown> {
@@ -775,6 +782,16 @@ function main(): void {
 
         const headers = restoreHeaders(resolved.record, mime, body);
 
+        // Preserve the crawler's charset identification (`WARC-Identified-
+        // Payload-Type`, e.g. `text/html; charset=windows-1252`). The 1996-era
+        // server usually sent no charset on its `Content-Type`, so without this
+        // the raw bytes (an em-dash as 0x97) have no declared encoding and
+        // replay as a replacement character. The body is kept verbatim (a
+        // latin1 round-trip through the transforms above), so the original
+        // charset still describes it faithfully.
+        const identifiedPayloadType =
+            resolved.record.headers.get('warc-identified-payload-type') || undefined;
+
         kept.push({
             innerUrl,
             ts17,
@@ -784,6 +801,7 @@ function main(): void {
             statusText: resolved.record.httpStatusText || '',
             headers,
             body,
+            identifiedPayloadType,
         });
 
         // List a resource on the index only when the crawl recorded a title for
@@ -826,6 +844,7 @@ function main(): void {
                 headers: r.headers,
                 body: r.body,
             },
+            identifiedPayloadType: r.identifiedPayloadType,
         });
         const member = zlib.gzipSync(record);
         warcParts.push(member);

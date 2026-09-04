@@ -42,6 +42,15 @@ export function buildWarcRecord(opts: {
     targetUri: string;
     dateRfc3339: string;
     response: HttpResponse;
+    /**
+     * The crawler's best guess at the payload's MIME type and charset (the WARC
+     * `WARC-Identified-Payload-Type` header, e.g. `text/html; charset=windows-1252`),
+     * when known. Distinct from the HTTP `Content-Type`: that header records what
+     * the server actually sent, while this one records how the payload bytes
+     * should be decoded -- essential for legacy bodies (e.g. Windows-1252) whose
+     * server never declared a charset. Omit to write no such header.
+     */
+    identifiedPayloadType?: string;
 }): Buffer {
     const { recordId, targetUri, dateRfc3339, response } = opts;
 
@@ -58,12 +67,17 @@ export function buildWarcRecord(opts: {
     const payloadDigest = crypto.createHash('sha256').update(response.body).digest('hex');
     const blockDigest = crypto.createHash('sha256').update(httpMessage).digest('hex');
 
+    const identifiedType = opts.identifiedPayloadType
+        ? `WARC-Identified-Payload-Type: ${opts.identifiedPayloadType}\r\n`
+        : '';
+
     const warcHead =
         'WARC/1.1\r\n' +
         `WARC-Record-ID: ${recordId}\r\n` +
         `WARC-Target-URI: ${targetUri}\r\n` +
         `WARC-Date: ${dateRfc3339}\r\n` +
         'WARC-Type: response\r\n' +
+        identifiedType +
         'Content-Type: application/http; msgtype=response\r\n' +
         `WARC-Payload-Digest: sha256:${payloadDigest}\r\n` +
         `WARC-Block-Digest: sha256:${blockDigest}\r\n` +
