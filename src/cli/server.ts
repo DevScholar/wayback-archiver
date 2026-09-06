@@ -272,6 +272,19 @@ function main(): void {
                 return;
             }
 
+            // The requested timestamp may not be a real capture: the archive
+            // resolves to the *nearest* capture at or around the requested time.
+            // When that capture's own timestamp differs from what the URL asked
+            // for, redirect to the faithful timestamp -- the same way the Wayback
+            // Machine 302s a time-shifted request to the capture's actual time --
+            // so the address bar never claims one time while serving another.
+            const actualTs = rec.entry.timestamp.slice(0, 14);
+            if (actualTs !== reqTs) {
+                res.writeHead(302, { 'Location': `/web/${actualTs}/${rawUrl}` });
+                res.end('Redirecting to the capture at ' + actualTs);
+                return;
+            }
+
             const record = rec.record;
             const mime = record.httpHeaders.get('content-type') || rec.entry.mime || 'application/octet-stream';
 
