@@ -87,6 +87,10 @@ demand from the archive's index, and archived content is served through
 `/web/<timestamp>/<url>` routes with links rewritten to stay local. Pass
 `--expose` to bind `0.0.0.0` and allow LAN access.
 
+Replay routes accept the Wayback `id_` modifier: `/web/<timestamp>id_/<url>`
+serves the capture's *identity* — the original bytes exactly as archived, with
+no link rewriting and no url-fixer shim injected.
+
 ## License
 
 MIT

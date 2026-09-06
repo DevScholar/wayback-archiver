@@ -236,11 +236,18 @@ function main(): void {
             return;
         }
 
-        // Replay route: /web/<timestamp>/<url>
-        const m = reqUrl.match(/^\/web\/(\d{4,14})\/(.+)$/);
+        // Replay route: /web/<timestamp>[mod_]/<url>. The `mod_` segment is the
+        // Wayback replay modifier; `id_` requests the *identity* of a capture --
+        // the original bytes as archived, with no link rewriting or url-fixer
+        // shim. Any other modifier (if_, im_, ...) is parsed but replays as a
+        // normal capture: this server injects no toolbar, so the only modifier
+        // with distinct behaviour is `id_`.
+        const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
         if (m) {
             const reqTs = m[1];
-            let rawUrl = m[2];
+            const modifier = m[2] ? m[2].toLowerCase() : '';
+            const identity = modifier === 'id_';
+            let rawUrl = m[3];
             // `urn:` URLs (page thumbnails: `urn:thumbnail:<page-url>`) already
             // carry a scheme but not the `://` form the check below assumes; a
             // bare hostname still needs `http://`. Leave `urn:` untouched.
@@ -280,7 +287,10 @@ function main(): void {
             // so the address bar never claims one time while serving another.
             const actualTs = rec.entry.timestamp.slice(0, 14);
             if (actualTs !== reqTs) {
-                res.writeHead(302, { 'Location': `/web/${actualTs}/${rawUrl}` });
+                // Preserve the modifier across the time-shift redirect so an
+                // `id_` request stays in identity mode after it lands on the
+                // capture's faithful timestamp.
+                res.writeHead(302, { 'Location': `/web/${actualTs}${m[2] || ''}/${rawUrl}` });
                 res.end('Redirecting to the capture at ' + actualTs);
                 return;
             }
@@ -305,7 +315,10 @@ function main(): void {
                 body: record.body,
                 mode: 'server',
             };
-            const body = status >= 300 && status < 400 ? record.body : pipeline.apply(ctx);
+            // Identity mode serves the archived bytes untouched: skip the
+            // pipeline (no link rewriting, no url-fixer shim). Redirects also
+            // skip it -- a 3xx has no page to rewrite or shim.
+            const body = identity || (status >= 300 && status < 400) ? record.body : pipeline.apply(ctx);
 
             const headers = buildReplayHeaders(record, rec.matchedUrl, ctx.ts, mime, body, status);
             res.writeHead(status, record.httpStatusText || undefined, headers);
