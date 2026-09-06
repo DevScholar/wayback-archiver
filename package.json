@@ -1,16 +1,41 @@
 {
-  "name": "wayback-archiver",
+  "name": "@devscholar/wayback-archiver",
   "version": "2.0.0",
-  "description": "Read WACZ web archives: export to standalone HTML and serve for replay",
+  "description": "Read WACZ web archives: capture, restore, export to standalone HTML, and serve for replay",
   "private": true,
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "bin": {
+    "wayback-download": "./dist/cli/downloader.js",
+    "wayback-export": "./dist/cli/export-to-html.js",
+    "wayback-server": "./dist/cli/server.js",
+    "wayback-restore": "./dist/cli/wayback-machine-restorer.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
   "scripts": {
     "download": "tsx src/cli/downloader.ts",
     "export": "tsx src/cli/export-to-html.ts",
     "server": "tsx src/cli/server.ts",
     "restore": "tsx src/cli/wayback-machine-restorer.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "build": "tsc",
+    "prepack": "npm run build"
   },
   "keywords": [
     "wacz",
@@ -18,8 +43,12 @@
     "replay",
     "warc"
   ],
-  "author": "",
+  "author": "DevScholar <devscholar@foxmail.com>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DevScholar/wayback-archiver.git"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "tsx": "^4.19.0",

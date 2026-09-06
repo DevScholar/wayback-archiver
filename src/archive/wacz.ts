@@ -78,11 +78,11 @@ export class Wacz {
     }
 
     get pages(): WaczPage[] {
-        return this._pages;
+        return [...this._pages];
     }
 
     get entries(): CdxjEntry[] {
-        return this._entries;
+        return [...this._entries];
     }
 
     /**
@@ -99,6 +99,17 @@ export class Wacz {
         const ts14 = t ? t.ts14 : rfc3339ToTs14(ts);
         const key = ts14 + ' ' + lookupKey(t ? t.url : url);
         return this._thumbnails.get(key) ?? null;
+    }
+
+    /** Release the archive's underlying file descriptor. Safe to call more than
+     * once; the archive cannot be read after this. */
+    close(): void {
+        this.zip.close();
+    }
+
+    /** Allow `using`-style ownership: `using w = new Wacz(...)`. */
+    [Symbol.dispose](): void {
+        this.close();
     }
 
     private load(): void {
