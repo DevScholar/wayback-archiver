@@ -9,18 +9,28 @@
  *
  * Usage:
  *   npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose]
+ *                                     [--max-connections 64] [--workers N]
+ *
+ * `--workers N` forks N worker processes (N=0, the default, runs a single
+ * process). Each worker serves the same archive on the shared port, so
+ * replay stays responsive while a worker is blocked decompressing a large
+ * capture. The sync fallback path (`id_`, redirects) still blocks its own
+ * worker's event loop, which is exactly what the extra workers absorb.
  */
 
 import * as http from 'http';
 import * as path from 'path';
 import * as os from 'os';
+import cluster from 'cluster';
 import { Wacz } from '../archive/wacz.js';
 import { WarcRecord } from '../archive/warc.js';
 import { renderIndexPage, buildPageRows } from '../replay/index-page.js';
 import { rfc3339ToTs14 } from '../lib/time.js';
 import { createDefaultPipeline, ReplayContext } from '../replay/plugins.js';
+import { detectContentKind } from '../replay/rewrite.js';
 import { URL_FIXER_SCRIPT_ROUTE } from '../replay/url-fixer.js';
 import { URL_FIXER_SHIM } from '../replay/url-fixer-shim.js';
+import { LruCache } from '../lib/lru.js';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -30,21 +40,27 @@ interface Args {
     wacz: string;
     port: number;
     expose: boolean;
+    maxConnections: number;
+    workers: number;
 }
 
 function parseArgs(argv: string[]): Args {
-    const args: Args = { wacz: '', port: 8080, expose: false };
+    const args: Args = { wacz: '', port: 8080, expose: false, maxConnections: 64, workers: 0 };
     const positional: string[] = [];
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--port') args.port = parseInt(argv[++i] || '8080', 10);
         else if (a.startsWith('--port=')) args.port = parseInt(a.slice('--port='.length), 10);
         else if (a === '--expose') args.expose = true;
+        else if (a === '--max-connections') args.maxConnections = parseInt(argv[++i] || '64', 10);
+        else if (a.startsWith('--max-connections=')) args.maxConnections = parseInt(a.slice('--max-connections='.length), 10);
+        else if (a === '--workers') args.workers = parseInt(argv[++i] || '0', 10);
+        else if (a.startsWith('--workers=')) args.workers = parseInt(a.slice('--workers='.length), 10);
         else if (!a.startsWith('--')) positional.push(a);
     }
     if (positional.length > 0) args.wacz = path.resolve(positional[0]);
     if (!args.wacz) {
-        console.error('Usage: npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose]');
+        console.error('Usage: npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose] [--max-connections 64] [--workers N]');
         process.exit(1);
     }
     return args;
@@ -116,6 +132,20 @@ const STRIP_HEADERS: Record<string, string> = {
 /** Prefix for the original value of any header we had to change during replay.
  * This is the shared pywb / archiveweb.page convention (`X-Archive-Orig-*`). */
 const ARCHIVE_PREFIX = 'X-Archive-Orig-';
+
+/**
+ * Whether a replay body needs the plugin pipeline run over it. Text content
+ * (HTML/CSS/JS) does; binary content, identity (`id_`) requests, and redirects
+ * (3xx, which carry no page to rewrite) do not -- their stored bytes are served
+ * verbatim. This mirrors the condition the pipeline plugin `matches` checks,
+ * kept here so the server can decide between streaming (verbatim) and buffered
+ * rewrite (transform) without duplicating the mime classification.
+ */
+function shouldRewrite(mime: string, status: number, identity: boolean): boolean {
+    if (identity) return false;
+    if (status >= 300 && status < 400) return false;
+    return detectContentKind(mime) !== null;
+}
 
 /**
  * Rebuild a replay's response headers, keeping every archived HTTP header
@@ -194,6 +224,29 @@ function buildReplayHeaders(
 
 function main(): void {
     const args = parseArgs(process.argv.slice(2));
+
+    // With `--workers N`, run as a cluster: each worker process opens its own
+    // WACZ (the file is read-only, so concurrent processes reading it are
+    // safe) and serves the shared port. A worker blocked decompressing a large
+    // capture stops its own requests, not the others'. This branch runs before
+    // the archive is opened, so the primary never holds a useless descriptor.
+    if (cluster.isPrimary && args.workers > 1) {
+        const n = Math.max(1, Math.min(args.workers, 256));
+        for (let i = 0; i < n; i++) cluster.fork();
+        cluster.on('exit', (worker) => {
+            cluster.fork();
+        });
+        const shutdownAll = (): void => {
+            for (const id of Object.keys(cluster.workers || {})) {
+                cluster.workers?.[id]?.kill();
+            }
+            process.exit(0);
+        };
+        process.on('SIGINT', shutdownAll);
+        process.on('SIGTERM', shutdownAll);
+        return;
+    }
+
     const wacz = new Wacz(args.wacz);
     const pipeline = createDefaultPipeline();
 
@@ -213,8 +266,140 @@ function main(): void {
         return renderIndexPage(wacz.title, rows, ['Page', 'Timestamp', 'Original URL']);
     };
 
-    const server = http.createServer((req, res) => {
+    /** The fully-computed response for a replay request, ready to write. */
+    interface RenderedResponse {
+        status: number;
+        statusText?: string;
+        headers: Record<string, string>;
+        body: Buffer;
+    }
+
+    /**
+     * The rendered-response cache, keyed by the request path (`/web/<ts>/<url>`).
+     * The archive is immutable while it is being served, and the pipeline is
+     * stateless, so a given path always renders to the same bytes -- caching the
+     * final response (not just the decompressed record) skips the read + gunzip +
+     * link-rewrite + header rebuild for every repeat request of a hot resource.
+     * The index page is deliberately NOT cached: its footer carries the current
+     * time, and it never reads a record, so there is nothing expensive to skip.
+     */
+    const replayCache = new LruCache<RenderedResponse>({
+        maxEntries: 1024,
+        maxBytes: 256 * 1024 * 1024,
+        // A rendered response larger than 8 MiB is served directly, not cached:
+        // caching one big binary would evict the small HTML/CSS/JS responses
+        // that make a page's repeated navigation instant.
+        maxEntryBytes: 8 * 1024 * 1024,
+        sizeOf: (r) => r.body.length,
+    });
+
+    /** Compute the response for a `/web/<ts>/<url>` request, or null for a 404.
+     * Moved out of the request handler so it can be cached whole. */
+    const renderReplay = async (reqUrl: string): Promise<RenderedResponse | null> => {
+        const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
+        if (!m) return null;
+
+        const reqTs = m[1];
+        const modifier = m[2] ? m[2].toLowerCase() : '';
+        const identity = modifier === 'id_';
+        let rawUrl = m[3];
+        // `urn:` URLs (page thumbnails: `urn:thumbnail:<page-url>`) already
+        // carry a scheme but not the `://` form the check below assumes; a
+        // bare hostname still needs `http://`. Leave `urn:` untouched.
+        if (!/^urn:/i.test(rawUrl) && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
+            rawUrl = 'http://' + rawUrl.replace(/^(https?|ftp)\//, '');
+        }
+
+        // Resolve the raw (still percent-encoded) URL first. Decoding the
+        // whole URL up front is wrong: a percent-encoded reserved character
+        // in a query value (e.g. `%23` = `#` inside a color parameter)
+        // becomes a literal `#`, which lookupKey then treats as a fragment
+        // separator and strips -- making the lookup miss entries the archive
+        // stores with the encoded form. Only fall back to a decoded form
+        // when the raw URL genuinely misses (e.g. non-ASCII characters the
+        // client percent-encoded).
+        let rec = await wacz.resolveRecordAsync(rawUrl, reqTs);
+        if (!rec) {
+            let decoded: string;
+            try {
+                decoded = decodeURIComponent(rawUrl);
+            } catch {
+                decoded = rawUrl;
+            }
+            if (decoded !== rawUrl) rec = await wacz.resolveRecordAsync(decoded, reqTs);
+        }
+        if (!rec) return null;
+
+        // The requested timestamp may not be a real capture: the archive
+        // resolves to the *nearest* capture at or around the requested time.
+        // When that capture's own timestamp differs from what the URL asked
+        // for, redirect to the faithful timestamp -- the same way the Wayback
+        // Machine 302s a time-shifted request to the capture's actual time --
+        // so the address bar never claims one time while serving another.
+        const actualTs = rec.entry.timestamp.slice(0, 14);
+        if (actualTs !== reqTs) {
+            // Preserve the modifier across the time-shift redirect so an
+            // `id_` request stays in identity mode after it lands on the
+            // capture's faithful timestamp.
+            return {
+                status: 302,
+                headers: { Location: `/web/${actualTs}${m[2] || ''}/${rawUrl}` },
+                body: Buffer.from('Redirecting to the capture at ' + actualTs),
+            };
+        }
+
+        const record = rec.record;
+        const mime = record.httpHeaders.get('content-type') || rec.entry.mime || 'application/octet-stream';
+
+        // Replay the archived status, modifying only the few headers that
+        // would otherwise corrupt rendering or leak to the live web.
+        const status = record.httpStatus ?? 200;
+
+        // Run the response through the plugin pipeline: static rewriting
+        // plus the url-fixer shim injection. Non-text bodies pass through
+        // unchanged because neither plugin matches them. Redirects are
+        // skipped too: a 3xx has no page to rewrite or shim, and injecting
+        // the url-fixer script into its empty body would turn a bare 302
+        // into one that carries a script and a misleading content-length.
+        const ctx: ReplayContext = {
+            url: rec.matchedUrl,
+            ts: rec.entry.timestamp.slice(0, 14),
+            mime,
+            body: record.body,
+            mode: 'server',
+        };
+        // The body is rewritten only when the mime is text (and the request is
+        // not identity mode / a redirect). Everything else is served verbatim,
+        // so a large binary never has to be copied through a rewrite buffer.
+        const rewrite = shouldRewrite(mime, status, identity);
+        const body = rewrite ? pipeline.apply(ctx) : record.body;
+
+        const headers = buildReplayHeaders(record, rec.matchedUrl, ctx.ts, mime, body, status);
+        return { status, statusText: record.httpStatusText || undefined, headers, body };
+    };
+
+    // Bound how many connections are open at once. A slow (or idle, keep-alive)
+    // client holds a socket open without doing useful work, and each open socket
+    // pins a file descriptor plus its buffers. Capping the open-connection count
+    // bounds what a pile of slow clients can pin, and hands everyone beyond the
+    // cap a clean 503 to retry against instead of silently degrading.
+    let activeConnections = 0;
+    const connectionCloseListener = (): void => {
+        activeConnections--;
+    };
+
+    const server = http.createServer(async (req, res) => {
         const reqUrl = req.url || '/';
+
+        if (activeConnections > args.maxConnections) {
+            res.writeHead(503, {
+                'Content-Type': 'text/plain',
+                'Retry-After': '1',
+                'Connection': 'close',
+            });
+            res.end('503 Service Unavailable -- too many concurrent connections.');
+            return;
+        }
 
         // The url-fixer runtime shim, served as an external script. Injected
         // into every HTML page by the url-fixer plugin via a <script src> that
@@ -236,96 +421,28 @@ function main(): void {
             return;
         }
 
-        // Replay route: /web/<timestamp>[mod_]/<url>. The `mod_` segment is the
-        // Wayback replay modifier; `id_` requests the *identity* of a capture --
-        // the original bytes as archived, with no link rewriting or url-fixer
-        // shim. Any other modifier (if_, im_, ...) is parsed but replays as a
-        // normal capture: this server injects no toolbar, so the only modifier
-        // with distinct behaviour is `id_`.
+        // Replay route: /web/<timestamp>[mod_]/<url>. The response is a pure
+        // function of the request path (the archive is immutable and the
+        // pipeline is stateless), so it is computed once and cached whole --
+        // repeat requests for a hot resource skip the read + gunzip + rewrite.
         const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
         if (m) {
-            const reqTs = m[1];
-            const modifier = m[2] ? m[2].toLowerCase() : '';
-            const identity = modifier === 'id_';
-            let rawUrl = m[3];
-            // `urn:` URLs (page thumbnails: `urn:thumbnail:<page-url>`) already
-            // carry a scheme but not the `://` form the check below assumes; a
-            // bare hostname still needs `http://`. Leave `urn:` untouched.
-            if (!/^urn:/i.test(rawUrl) && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
-                rawUrl = 'http://' + rawUrl.replace(/^(https?|ftp)\//, '');
-            }
-
-            // Resolve the raw (still percent-encoded) URL first. Decoding the
-            // whole URL up front is wrong: a percent-encoded reserved character
-            // in a query value (e.g. `%23` = `#` inside a color parameter)
-            // becomes a literal `#`, which lookupKey then treats as a fragment
-            // separator and strips -- making the lookup miss entries the archive
-            // stores with the encoded form. Only fall back to a decoded form
-            // when the raw URL genuinely misses (e.g. non-ASCII characters the
-            // client percent-encoded).
-            let rec = wacz.resolveRecord(rawUrl, reqTs);
-            if (!rec) {
-                let decoded: string;
-                try {
-                    decoded = decodeURIComponent(rawUrl);
-                } catch {
-                    decoded = rawUrl;
+            let rendered: RenderedResponse | null = replayCache.get(reqUrl) ?? null;
+            if (!rendered) {
+                rendered = await renderReplay(reqUrl);
+                if (!rendered) {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' });
+                    res.end('404 Not Found');
+                    return;
                 }
-                if (decoded !== rawUrl) rec = wacz.resolveRecord(decoded, reqTs);
-            }
-            if (!rec) {
-                res.writeHead(404, { 'Content-Type': 'text/plain' });
-                res.end('404 Not Found');
-                return;
+                replayCache.set(reqUrl, rendered);
             }
 
-            // The requested timestamp may not be a real capture: the archive
-            // resolves to the *nearest* capture at or around the requested time.
-            // When that capture's own timestamp differs from what the URL asked
-            // for, redirect to the faithful timestamp -- the same way the Wayback
-            // Machine 302s a time-shifted request to the capture's actual time --
-            // so the address bar never claims one time while serving another.
-            const actualTs = rec.entry.timestamp.slice(0, 14);
-            if (actualTs !== reqTs) {
-                // Preserve the modifier across the time-shift redirect so an
-                // `id_` request stays in identity mode after it lands on the
-                // capture's faithful timestamp.
-                res.writeHead(302, { 'Location': `/web/${actualTs}${m[2] || ''}/${rawUrl}` });
-                res.end('Redirecting to the capture at ' + actualTs);
-                return;
-            }
-
-            const record = rec.record;
-            const mime = record.httpHeaders.get('content-type') || rec.entry.mime || 'application/octet-stream';
-
-            // Replay the archived status, modifying only the few headers that
-            // would otherwise corrupt rendering or leak to the live web.
-            const status = record.httpStatus ?? 200;
-
-            // Run the response through the plugin pipeline: static rewriting
-            // plus the url-fixer shim injection. Non-text bodies pass through
-            // unchanged because neither plugin matches them. Redirects are
-            // skipped too: a 3xx has no page to rewrite or shim, and injecting
-            // the url-fixer script into its empty body would turn a bare 302
-            // into one that carries a script and a misleading content-length.
-            const ctx: ReplayContext = {
-                url: rec.matchedUrl,
-                ts: rec.entry.timestamp.slice(0, 14),
-                mime,
-                body: record.body,
-                mode: 'server',
-            };
-            // Identity mode serves the archived bytes untouched: skip the
-            // pipeline (no link rewriting, no url-fixer shim). Redirects also
-            // skip it -- a 3xx has no page to rewrite or shim.
-            const body = identity || (status >= 300 && status < 400) ? record.body : pipeline.apply(ctx);
-
-            const headers = buildReplayHeaders(record, rec.matchedUrl, ctx.ts, mime, body, status);
-            res.writeHead(status, record.httpStatusText || undefined, headers);
-            if (status === 204 || status === 304 || (status >= 100 && status < 200)) {
+            res.writeHead(rendered.status, rendered.statusText || undefined, rendered.headers);
+            if (rendered.status === 204 || rendered.status === 304 || (rendered.status >= 100 && rendered.status < 200)) {
                 res.end();
             } else {
-                res.end(body);
+                res.end(rendered.body);
             }
             return;
         }
@@ -334,8 +451,41 @@ function main(): void {
         res.end('404 Not Found');
     });
 
+    // A request handler that never yields means one slow client can hold a
+    // socket open indefinitely. Bound the per-socket windows so a dead or
+    // malicious client can't pin the event loop: the time to receive request
+    // headers, the time to receive the whole request, and the keep-alive idle
+    // window before an idle socket is closed.
+    server.headersTimeout = 60_000;
+    server.requestTimeout = 60_000;
+    server.keepAliveTimeout = 5_000;
+
+    // Count open connections so `--max-connections` can bound them. The
+    // 'connection' event fires once per accepted TCP socket; 'close' fires when
+    // it is fully torn down (including keep-alive idle timeouts), so the counter
+    // tracks exactly the sockets a slow client can pin.
+    server.on('connection', (socket) => {
+        activeConnections++;
+        socket.on('close', connectionCloseListener);
+    });
+
+    // Graceful shutdown: stop accepting connections, let in-flight requests
+    // finish, then release the archive's file descriptor. A hard timer forces
+    // the exit if a client holds a connection open past the drain window.
+    const shutdown = (signal: string): void => {
+        console.log(`\n${signal} received -- shutting down.`);
+        server.close(() => {
+            wacz.close();
+            process.exit(0);
+        });
+        setTimeout(() => process.exit(1), 5000).unref();
+    };
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
     server.listen(args.port, host, () => {
-        console.log(`\n=== WACZ Replay Server ===`);
+        const workerTag = cluster.isWorker ? ` [worker ${cluster.worker?.id}]` : '';
+        console.log(`\n=== WACZ Replay Server${workerTag} ===`);
         console.log(`- Local Access: http://localhost:${args.port}`);
         if (args.expose) {
             console.log(`- LAN Access:   http://${getLocalExternalIP()}:${args.port}`);

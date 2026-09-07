@@ -158,6 +158,38 @@ export class ZipReader {
         return this.readRange(e.dataOffset + start, length);
     }
 
+    /** Async counterpart of `readRange` for the replay server's hot path. The
+     * positional read (explicit `position`) never moves the shared file offset,
+     * so it is safe to interleave with the synchronous reads. */
+    private readRangeAsync(offset: number, length: number): Promise<Buffer> {
+        return new Promise((resolve, reject) => {
+            if (length === 0) {
+                resolve(Buffer.alloc(0));
+                return;
+            }
+            const buf = Buffer.alloc(length);
+            let read = 0;
+            const next = (err: NodeJS.ErrnoException | null, n: number): void => {
+                if (err) return reject(err);
+                if (n === 0) return reject(new Error(`Short read in ZIP (wanted ${length}, got ${read})`));
+                read += n;
+                if (read >= length) return resolve(buf);
+                fs.read(this.fd, buf, read, length - read, offset + read, next);
+            };
+            fs.read(this.fd, buf, 0, length, offset, next);
+        });
+    }
+
+    /** Async counterpart of `storedRange`: read a byte range of a STORE entry
+     * without decompressing the whole thing. Used to gunzip a single WARC record
+     * from data.warc.gz off the event loop. */
+    async storedRangeAsync(name: string, start: number, length: number): Promise<Buffer> {
+        const e = this.entries.get(name);
+        if (!e) throw new Error(`Entry not found in archive: ${name}`);
+        if (e.method !== 0) throw new Error(`storedRangeAsync requires a STORE entry: ${name}`);
+        return this.readRangeAsync(e.dataOffset + start, length);
+    }
+
     /** Release the file descriptor. Safe to call more than once. */
     close(): void {
         if (this.closed) return;

@@ -12,6 +12,16 @@ import { parseWarcRecord, WarcRecord } from './warc.js';
 import { parseCdxj, CdxjEntry } from './cdxj.js';
 import { candidateUrls, lookupKey, lookupPathKey, lookupKeyCi } from '../lib/url.js';
 import { rfc3339ToTs14 } from '../lib/time.js';
+import { LruCache } from '../lib/lru.js';
+
+/** Gunzip a buffer off the event loop: `zlib.gunzip` runs the deflate work on
+ * libuv's threadpool, so a large record's decompression does not block the
+ * server's event loop the way `gunzipSync` does. */
+function gunzipAsync(buf: Buffer): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        zlib.gunzip(buf, (err, out) => (err ? reject(err) : resolve(out)));
+    });
+}
 
 /** If `url` is a Wayback replay URL (`https://web.archive.org/web/<ts>/<url>`),
  * return its capture time (14 digits) and inner URL; else null. */
@@ -67,6 +77,30 @@ export class Wacz {
     /** Maps a WARC file basename (from CDXJ `filename`) to its ZIP entry path. */
     private _warcEntries = new Map<string, string>();
     private _title = '';
+
+    /**
+     * Decompressed WARC records, keyed by `<filename>@<offset>`. Reading and
+     * gunzipping a record on every request is the dominant cost of replaying a
+     * hot URL; caching the parsed result turns repeated requests for the same
+     * capture into a map lookup. The byte budget bounds the cache regardless of
+     * archive size, and the value is keyed on the CDXJ location rather than the
+     * URL so two distinct captures of the same URL (or a revisit and its
+     * referred-to original) never collide.
+     */
+    private _recordCache = new LruCache<WarcRecord>({
+        maxEntries: 512,
+        maxBytes: 128 * 1024 * 1024,
+        // Records larger than 8 MiB are not cached: they are still read and
+        // decompressed on demand, but caching one huge binary would evict the
+        // whole working set of small records that dominate a page's replay.
+        maxEntryBytes: 8 * 1024 * 1024,
+        sizeOf: (r) => r.body.length,
+    });
+
+    /** In-flight async reads, keyed like `_recordCache`. Concurrent requests for
+     * a cold record share one decompression instead of each starting its own;
+     * the promise is removed once it settles. */
+    private _pendingRecords = new Map<string, Promise<WarcRecord>>();
 
     constructor(private filePath: string) {
         this.zip = ZipReader.open(filePath);
@@ -325,11 +359,77 @@ export class Wacz {
         return { entry, matchedUrl, record };
     }
 
+    /**
+     * Async counterpart of `resolveRecord` for the replay server. Same revisit
+     * chain-following, but each record read is awaited off the event loop so a
+     * slow decompression never blocks other requests.
+     */
+    async resolveRecordAsync(url: string, ts?: string): Promise<ResolvedRecord | null> {
+        const entry = ts ? this.resolveAt(url, ts) : this.resolve(url);
+        if (!entry) return null;
+
+        let record = await this.readRecordAsync(entry);
+        let matchedUrl = entry.url;
+
+        for (let i = 0; i < 8; i++) {
+            const refersTo = record.headers.get('warc-refers-to-target-uri');
+            if (refersTo && (record.warcType === 'revisit' || record.body.length === 0)) {
+                const original = this.resolveAt(refersTo, entry.timestamp);
+                if (!original || original.url === matchedUrl) break;
+                record = await this.readRecordAsync(original);
+            } else {
+                break;
+            }
+        }
+
+        return { entry, matchedUrl, record };
+    }
+
     /** Decompress and parse a single index entry's WARC record. */
     private readRecord(entry: CdxjEntry): WarcRecord {
         const zipName = this._warcEntries.get(entry.filename) || entry.filename;
+        const cacheKey = `${zipName}@${entry.offset}`;
+        const cached = this._recordCache.get(cacheKey);
+        if (cached) return cached;
+
         const raw = this.zip.storedRange(zipName, entry.offset, entry.length);
         const inflated = zlib.gunzipSync(raw);
-        return parseWarcRecord(inflated);
+        const record = parseWarcRecord(inflated);
+        this._recordCache.set(cacheKey, record);
+        return record;
+    }
+
+    /**
+     * Async counterpart of `readRecord` for the replay server: reads and gunzips
+     * a record without blocking the event loop. Cold records from concurrent
+     * requests are de-duplicated through `_pendingRecords`, so a burst of clients
+     * hitting the same uncached capture triggers one decompression, not N.
+     */
+    private readRecordAsync(entry: CdxjEntry): Promise<WarcRecord> {
+        const zipName = this._warcEntries.get(entry.filename) || entry.filename;
+        const cacheKey = `${zipName}@${entry.offset}`;
+
+        const cached = this._recordCache.get(cacheKey);
+        if (cached) return Promise.resolve(cached);
+
+        const pending = this._pendingRecords.get(cacheKey);
+        if (pending) return pending;
+
+        const loading = this.loadRecordAsync(zipName, entry, cacheKey);
+        this._pendingRecords.set(cacheKey, loading);
+        return loading;
+    }
+
+    /** Perform the actual async read + gunzip + parse + cache for a cold record. */
+    private async loadRecordAsync(zipName: string, entry: CdxjEntry, cacheKey: string): Promise<WarcRecord> {
+        try {
+            const raw = await this.zip.storedRangeAsync(zipName, entry.offset, entry.length);
+            const inflated = await gunzipAsync(raw);
+            const record = parseWarcRecord(inflated);
+            this._recordCache.set(cacheKey, record);
+            return record;
+        } finally {
+            this._pendingRecords.delete(cacheKey);
+        }
     }
 }
