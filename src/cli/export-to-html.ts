@@ -19,8 +19,13 @@
  *   index.html -- a pre-generated index page (the replay server also generates
  *                this on demand).
  *
+ * The per-page screenshots (`urn:thumbnail:` and `urn:view:` records) are
+ * large -- a PNG per page -- and are only used for the index-page preview, so
+ * they are NOT exported by default. Pass `--with=thumbnail` (and/or
+ * `--with=view`) to include them.
+ *
  * Usage:
- *   npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>]
+ *   npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>] [--with=thumbnail,view]
  */
 
 import * as fs from 'fs';
@@ -36,29 +41,40 @@ import { createExportPipeline, ReplayContext, FLAT_NOT_FOUND_FILE } from '../rep
 // Arguments
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv: string[]): { wacz: string; out: string } {
+function parseArgs(argv: string[]): { wacz: string; out: string; withTypes: Set<string> } {
     let wacz = '';
     let out = '';
+    const withTypes = new Set<string>();
     const positional: string[] = [];
+    const collectWith = (raw: string): void => {
+        for (const t of raw.split(',')) {
+            const tt = t.trim().toLowerCase();
+            if (tt) withTypes.add(tt);
+        }
+    };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--out') {
             out = argv[++i] || '';
         } else if (a.startsWith('--out=')) {
             out = a.slice('--out='.length);
+        } else if (a === '--with') {
+            collectWith(argv[++i] || '');
+        } else if (a.startsWith('--with=')) {
+            collectWith(a.slice('--with='.length));
         } else if (!a.startsWith('--')) {
             positional.push(a);
         }
     }
     if (positional.length > 0) wacz = positional[0];
     if (!wacz) {
-        console.error('Usage: npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>]');
+        console.error('Usage: npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>] [--with=thumbnail,view]');
         process.exit(1);
     }
     if (!out) {
         out = path.join(path.dirname(path.resolve(wacz)), path.basename(wacz, '.wacz') + '-html');
     }
-    return { wacz: path.resolve(wacz), out: path.resolve(out) };
+    return { wacz: path.resolve(wacz), out: path.resolve(out), withTypes };
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +242,7 @@ function renderNotFoundPage(): string {
 // ---------------------------------------------------------------------------
 
 function main(): void {
-    const { wacz: waczPath, out: outDir } = parseArgs(process.argv.slice(2));
+    const { wacz: waczPath, out: outDir, withTypes } = parseArgs(process.argv.slice(2));
 
     console.log('=== WACZ Export to HTML ===');
     console.log('Archive:  ' + waczPath);
@@ -250,8 +266,17 @@ function main(): void {
     console.log(`  ${unique.length} unique captures in index`);
 
     // Assign flat names to the entries we will actually export (200 responses,
-    // skipping warc/revisit records).
-    const exported = unique.filter((e) => e.mime !== 'warc/revisit' && (e.status == null || e.status === 200));
+    // skipping warc/revisit records, and skipping the per-page screenshot
+    // records -- `urn:thumbnail:` / `urn:view:` -- unless their type was
+    // requested via `--with`).
+    const SCREENSHOT_URN_RE = /^urn:(thumbnail|view):/i;
+    const exported = unique.filter((e) => {
+        if (e.mime === 'warc/revisit') return false;
+        if (e.status != null && e.status !== 200) return false;
+        const urn = SCREENSHOT_URN_RE.exec(e.url);
+        if (urn && !withTypes.has(urn[1].toLowerCase())) return false;
+        return true;
+    });
 
     const counters = new Map<string, number>();
     const flatName = new Map<string, string>(); // captureKey(url, ts14) -> flat name
@@ -400,14 +425,18 @@ function main(): void {
     fs.writeFileSync(path.join(outDir, 'urls.csv'), csvLines.join('\n') + '\n');
 
     // index.html (pre-generated) -- lists the archive's *pages*, linking to the
-    // flat file name each page was exported to.
+    // flat file name each page was exported to. The preview column is only
+    // built when thumbnails were exported (`--with=thumbnail`), otherwise the
+    // screenshot files don't exist and the column would point at nothing.
     const pageRows = buildPageRows(
         wacz.pages,
         (url, ts) => flatName.get(captureKey(url, rfc3339ToTs14(ts))) ?? null,
-        (url, ts) => {
-            const thumb = wacz.thumbnailFor(url, ts);
-            return thumb ? flatName.get(captureKey(thumb.url, thumb.timestamp.slice(0, 14))) ?? null : null;
-        },
+        withTypes.has('thumbnail')
+            ? (url, ts) => {
+                  const thumb = wacz.thumbnailFor(url, ts);
+                  return thumb ? flatName.get(captureKey(thumb.url, thumb.timestamp.slice(0, 14))) ?? null : null;
+              }
+            : undefined,
     );
     fs.writeFileSync(
         path.join(outDir, 'index.html'),
