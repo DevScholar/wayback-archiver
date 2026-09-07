@@ -22,12 +22,16 @@
  * are preserved byte-for-byte. Re-running with an extended URL list grows the
  * same file rather than replacing it.
  *
- * Each URL is fetched once and written as a WARC 1.1 `response` record into
- * `archive/data.warc.gz` (stored uncompressed in the ZIP, so a single record
- * can be read by byte range). `indexes/index.cdx` maps SURT-key + timestamp to
- * each record's offset/length, and `pages/pages.jsonl` lists every fetched URL
- * as an entry point. Redirects are followed transparently; the final response
- * is archived under the URL that was requested.
+ * Each URL is fetched once and written as a WARC 1.1 `request`/`response` pair
+ * into `archive/data.warc.gz` (stored uncompressed in the ZIP, so a single
+ * record can be read by byte range). The `request` record records how the URL
+ * was fetched -- the client identity (`User-Agent`, `Accept`, `Accept-Language`
+ * headers actually sent) -- and the `response` record carries the archived
+ * payload; the two are linked by `WARC-Concurrent-To`. `indexes/index.cdx` maps
+ * SURT-key + timestamp to each response record's offset/length (the request
+ * records are unindexed annotations), and `pages/pages.jsonl` lists every
+ * fetched URL as an entry point. Redirects are followed transparently; the
+ * final response is archived under the URL that was requested.
  */
 
 import * as fs from 'fs';
@@ -37,7 +41,7 @@ import * as https from 'https';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
 import { writeZipFile } from '../archive/zip-writer.js';
-import { buildWarcRecord, payloadDigest } from '../archive/warc-writer.js';
+import { buildWarcRecord, buildWarcRequestRecord, payloadDigest } from '../archive/warc-writer.js';
 import { surtKey } from '../lib/url.js';
 import { nowTs17, cdxjTsToRfc3339 } from '../lib/time.js';
 import { ZipReader } from '../archive/zip.js';
@@ -97,11 +101,12 @@ function readUrlList(filePath: string): string[] {
 // ---------------------------------------------------------------------------
 
 const USER_AGENT =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.0.0 Safari/537.36';
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36';
 
 const DEFAULT_HEADERS: http.OutgoingHttpHeaders = {
     'User-Agent': USER_AGENT,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
 };
 
 // 429 (Too Many Requests) handling: retry with a fixed delay between attempts.
@@ -207,11 +212,40 @@ function fetchUrl(url: string): Promise<Fetched> {
     });
 }
 
+/**
+ * Build the WARC `request` record that accompanies a fetched URL's `response`
+ * record. It records exactly how the crawler asked for the resource: the
+ * request line against the original URL, plus the `Host` Node derived from that
+ * URL and the client-identity headers in `DEFAULT_HEADERS`. The request is
+ * captured against the URL the crawler was *told* to fetch (redirects are
+ * followed transparently and not recorded as separate requests here), so the
+ * request/response pair always share one `WARC-Target-URI`.
+ */
+function buildRequestRecord(url: string, responseRecordId: string, dateRfc3339: string): Buffer {
+    const u = new URL(url);
+    const headers: [string, string][] = [['Host', u.host]];
+    for (const [k, v] of Object.entries(DEFAULT_HEADERS)) {
+        if (v === undefined) continue;
+        headers.push([k, Array.isArray(v) ? v.join(', ') : String(v)]);
+    }
+    return buildWarcRequestRecord({
+        recordId: `<urn:uuid:${crypto.randomUUID()}>`,
+        targetUri: url,
+        dateRfc3339,
+        concurrentTo: responseRecordId,
+        request: {
+            method: 'GET',
+            path: u.pathname + u.search,
+            headers,
+        },
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Packaging
 // ---------------------------------------------------------------------------
 
-/** A fetched URL + its serialized WARC record (offset/length assigned later). */
+/** A fetched URL + its serialized WARC records (offset/length assigned later). */
 interface NewRecord {
     url: string;
     ts: string;
@@ -220,7 +254,10 @@ interface NewRecord {
     digest: string;
     /** Page title extracted from the HTML body, when this is a web page. */
     title?: string;
-    record: Buffer;
+    /** The `request` record describing how this URL was fetched (headers sent). */
+    requestRecord: Buffer;
+    /** The `response` record carrying the archived payload. */
+    responseRecord: Buffer;
 }
 
 /** MIME types that represent a web page (HTML) rather than a subresource. */
@@ -361,16 +398,24 @@ function writeWacz(opts: {
     let offset = baseOffset;
 
     for (const r of newRecords) {
-        const member = zlib.gzipSync(r.record);
-        warcParts.push(member);
-        newIndexLines.push(indexLine(r, offset, member.length));
+        // The `request` record is written first as its own member, immediately
+        // before the `response` member it produced. It is NOT indexed -- the
+        // CDXJ entry points only at the response member, so the request stays
+        // a self-describing annotation in the WARC stream without being served.
+        const reqMember = zlib.gzipSync(r.requestRecord);
+        warcParts.push(reqMember);
+        offset += reqMember.length;
+
+        const respMember = zlib.gzipSync(r.responseRecord);
+        warcParts.push(respMember);
+        newIndexLines.push(indexLine(r, offset, respMember.length));
         // Only web pages become entry points listed on the index page.
         // Subresources (images, CSS, JS, ...) are still archived in the WARC,
         // but omitting them from pages.jsonl keeps the home page to just pages.
         if (isHtmlMime(r.mime)) {
             newPageObjs.push({ url: r.url, ts: cdxjTsToRfc3339(r.ts), title: r.title || r.url });
         }
-        offset += member.length;
+        offset += respMember.length;
     }
     const warcGz = Buffer.concat(warcParts);
 
@@ -465,8 +510,10 @@ async function main(): Promise<void> {
             const url = toFetch[i];
             try {
                 const resp = await fetchUrl(url);
-                const record = buildWarcRecord({
-                    recordId: `<urn:uuid:${crypto.randomUUID()}>`,
+                const responseRecordId = `<urn:uuid:${crypto.randomUUID()}>`;
+                const requestRecord = buildRequestRecord(url, responseRecordId, resp.dateRfc3339);
+                const responseRecord = buildWarcRecord({
+                    recordId: responseRecordId,
                     targetUri: url,
                     dateRfc3339: resp.dateRfc3339,
                     response: {
@@ -485,7 +532,8 @@ async function main(): Promise<void> {
                     mime,
                     digest: payloadDigest(resp.body),
                     title: isHtmlMime(mime) ? extractTitle(resp.body) : undefined,
-                    record,
+                    requestRecord,
+                    responseRecord,
                 });
                 ok++;
                 console.log(`[${id}] OK ${resp.status} ${url}`);
