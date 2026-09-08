@@ -6,17 +6,21 @@
  * `server.ts` / `export-to-html.ts`.
  *
  * Usage:
- *   npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."]
+ *   npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."] [--accept="..."] [--accept-language="..."]
  *
- *   --url-list     path to a text file with one URL per line (blank lines and
- *                  `#` comments ignored). Only http/https URLs are fetched.
- *   --output-file  destination .wacz path.
- *   --title        archive title. Defaults to the output file's basename for a
- *                  new archive; when the file already exists, omitting --title
- *                  keeps its current title and providing it renames it.
- *   --user-agent   `User-Agent` header to fetch with (defaults to a Chrome 100
- *                  on Windows NT 10.0 string). Recorded in the request record.
- *   --concurrency  number of parallel fetches (default 8).
+ *   --url-list        path to a text file with one URL per line (blank lines and
+ *                     `#` comments ignored). Only http/https URLs are fetched.
+ *   --output-file     destination .wacz path.
+ *   --title           archive title. Defaults to the output file's basename for a
+ *                     new archive; when the file already exists, omitting --title
+ *                     keeps its current title and providing it renames it.
+ *   --user-agent      `User-Agent` header to fetch with (defaults to a Chrome 100
+ *                     on Windows NT 10.0 string). Recorded in the request record.
+ *   --accept          `Accept` header to fetch with (defaults to a Chrome-style
+ *                     HTML-first value). Recorded in the request record.
+ *   --accept-language `Accept-Language` header to fetch with (defaults to
+ *                     `en-US,en;q=0.9`). Recorded in the request record.
+ *   --concurrency     number of parallel fetches (default 8).
  *
  * Incremental: if `--output-file` already exists it is treated as the existing
  * archive. URLs already captured in it are skipped (not re-fetched), and only
@@ -58,6 +62,8 @@ interface Args {
     outputFile: string;
     title?: string;
     userAgent?: string;
+    accept?: string;
+    acceptLanguage?: string;
     concurrency: number;
 }
 
@@ -71,10 +77,12 @@ function parseArgs(argv: string[]): Args {
         else if (key === '--output-file') args.outputFile = val;
         else if (key === '--title') args.title = val;
         else if (key === '--user-agent') args.userAgent = val;
+        else if (key === '--accept') args.accept = val;
+        else if (key === '--accept-language') args.acceptLanguage = val;
         else if (key === '--concurrency') args.concurrency = parseInt(val, 10) || 8;
     }
     if (!args.urlList) {
-        console.error('Usage: npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."]');
+        console.error('Usage: npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."] [--accept="..."] [--accept-language="..."]');
         process.exit(1);
     }
     if (!args.outputFile) {
@@ -106,15 +114,18 @@ function readUrlList(filePath: string): string[] {
 
 const DEFAULT_USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36';
+const DEFAULT_ACCEPT =
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8';
+const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
 
 /** Client-identity headers sent on every fetch (and recorded in the request
- * record). Only the `User-Agent` varies; `Accept` and `Accept-Language` are
- * fixed. */
-function clientHeaders(userAgent: string): http.OutgoingHttpHeaders {
+ * record). Each is overridable via `--user-agent` / `--accept` /
+ * `--accept-language`; the defaults together read as a Chrome 100 browser. */
+function clientHeaders(userAgent: string, accept: string, acceptLanguage: string): http.OutgoingHttpHeaders {
     return {
         'User-Agent': userAgent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': accept,
+        'Accept-Language': acceptLanguage,
     };
 }
 
@@ -136,7 +147,7 @@ interface Fetched {
 
 /** Follow redirects (up to 8 hops) and collect the final response body.
  * 429 responses are retried a few times with a fixed delay before giving up. */
-function fetchUrl(url: string, userAgent: string): Promise<Fetched> {
+function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage: string): Promise<Fetched> {
     const started = new Date();
     return new Promise((resolve, reject) => {
         const attempt = (current: string, hops: number, retryCount: number): void => {
@@ -145,7 +156,7 @@ function fetchUrl(url: string, userAgent: string): Promise<Fetched> {
                 return;
             }
             const lib = current.startsWith('https:') ? https : http;
-            const req = lib.get(current, { headers: clientHeaders(userAgent) }, (res) => {
+            const req = lib.get(current, { headers: clientHeaders(userAgent, accept, acceptLanguage) }, (res) => {
                 const status = res.statusCode || 0;
                 const statusText = res.statusMessage || '';
                 const loc = res.headers.location;
@@ -225,15 +236,15 @@ function fetchUrl(url: string, userAgent: string): Promise<Fetched> {
  * Build the WARC `request` record that accompanies a fetched URL's `response`
  * record. It records exactly how the crawler asked for the resource: the
  * request line against the original URL, plus the `Host` Node derived from that
- * URL and the client-identity headers in `clientHeaders(userAgent)`. The request
- * is captured against the URL the crawler was *told* to fetch (redirects are
+ * URL and the client-identity headers in `clientHeaders(...)`. The request is
+ * captured against the URL the crawler was *told* to fetch (redirects are
  * followed transparently and not recorded as separate requests here), so the
  * request/response pair always share one `WARC-Target-URI`.
  */
-function buildRequestRecord(url: string, responseRecordId: string, dateRfc3339: string, userAgent: string): Buffer {
+function buildRequestRecord(url: string, responseRecordId: string, dateRfc3339: string, userAgent: string, accept: string, acceptLanguage: string): Buffer {
     const u = new URL(url);
     const headers: [string, string][] = [['Host', u.host]];
-    for (const [k, v] of Object.entries(clientHeaders(userAgent))) {
+    for (const [k, v] of Object.entries(clientHeaders(userAgent, accept, acceptLanguage))) {
         if (v === undefined) continue;
         headers.push([k, Array.isArray(v) ? v.join(', ') : String(v)]);
     }
@@ -501,12 +512,16 @@ async function main(): Promise<void> {
     const skipped = urls.length - toFetch.length;
     const title = args.title ?? (existing && existing.title ? existing.title : basename);
     const userAgent = args.userAgent || DEFAULT_USER_AGENT;
+    const accept = args.accept || DEFAULT_ACCEPT;
+    const acceptLanguage = args.acceptLanguage || DEFAULT_ACCEPT_LANGUAGE;
 
     console.log('=== WACZ Downloader ===');
     console.log('URL list:  ' + args.urlList);
     console.log('Output:    ' + outputFile + (existing ? ' (appending)' : ' (new)'));
     console.log('Title:     ' + title);
     console.log('User-Agent: ' + userAgent);
+    console.log('Accept: ' + accept);
+    console.log('Accept-Language: ' + acceptLanguage);
     console.log(`${skipped} already archived, fetching ${toFetch.length} URL(s) (concurrency ${args.concurrency})...\n`);
 
     const newRecords: NewRecord[] = [];
@@ -520,9 +535,9 @@ async function main(): Promise<void> {
             if (i >= toFetch.length) break;
             const url = toFetch[i];
             try {
-                const resp = await fetchUrl(url, userAgent);
+                const resp = await fetchUrl(url, userAgent, accept, acceptLanguage);
                 const responseRecordId = `<urn:uuid:${crypto.randomUUID()}>`;
-                const requestRecord = buildRequestRecord(url, responseRecordId, resp.dateRfc3339, userAgent);
+                const requestRecord = buildRequestRecord(url, responseRecordId, resp.dateRfc3339, userAgent, accept, acceptLanguage);
                 const responseRecord = buildWarcRecord({
                     recordId: responseRecordId,
                     targetUri: url,
