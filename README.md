@@ -13,7 +13,7 @@ a browser.
 ## Capture URLs into a WACZ
 
 ```
-npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"]
+npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."]
 ```
 
 `my-urls.txt` holds one URL per line (blank lines and `#` comments are
@@ -27,7 +27,8 @@ The download is **incremental**: if `--output-file` already exists, it is
 appended to rather than replaced. URLs already in the archive are skipped (not
 re-fetched), existing records are kept byte-for-byte, and only new URLs are
 added. Omitting `--title` keeps the existing title; providing it renames the
-archive. Options: `--concurrency` (default 8).
+archive. Options: `--concurrency` (default 8), `--user-agent` (defaults to the
+Chrome 100 / Windows NT 10.0 string; recorded in the request record).
 
 ## Restore a Wayback Machine capture
 
