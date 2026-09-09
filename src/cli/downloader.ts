@@ -47,7 +47,7 @@ import * as https from 'https';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
 import { writeZipFile } from '../archive/zip-writer.js';
-import { buildWarcRecord, buildWarcRequestRecord, payloadDigest } from '../archive/warc-writer.js';
+import { buildWarcRecord, buildWarcRequestRecord, buildWarcMetadataRecord, payloadDigest } from '../archive/warc-writer.js';
 import { surtKey } from '../lib/url.js';
 import { nowTs17, cdxjTsToRfc3339 } from '../lib/time.js';
 import { ZipReader } from '../archive/zip.js';
@@ -137,21 +137,45 @@ function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
 }
 
-interface Fetched {
+interface FetchedHop {
+    url: string;
     status: number;
     statusText: string;
     headers: [string, string][];
     body: Buffer;
+}
+
+interface FetchResult {
+    /** One entry per redirect hop plus the final response, in request order. */
+    hops: FetchedHop[];
+    /** Shared RFC3339 capture time for the whole chain. */
     dateRfc3339: string;
 }
 
-/** Follow redirects (up to 8 hops) and collect the final response body.
- * 429 responses are retried a few times with a fixed delay before giving up. */
-function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage: string): Promise<Fetched> {
-    const started = new Date();
+/** Collect an incoming response's headers as name/value pairs, verbatim. */
+function collectHeaders(h: http.IncomingHttpHeaders): [string, string][] {
+    const out: [string, string][] = [];
+    for (const [k, v] of Object.entries(h)) {
+        if (v === undefined) continue;
+        out.push([k, Array.isArray(v) ? v.join(', ') : v]);
+    }
+    return out;
+}
+
+/**
+ * Follow redirects (up to 8 hops) and record every hop, not just the final
+ * response. A 3xx is archived as its own (empty-body) response under its own
+ * URL -- the redirect itself is historical material, exactly as the restorer
+ * treats redirect notices -- and the final 200/error is the last hop. All hops
+ * share one capture timestamp. 429 responses are retried a few times with a
+ * fixed delay before giving up.
+ */
+function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage: string): Promise<FetchResult> {
+    const dateRfc3339 = new Date().toISOString();
+    const hops: FetchedHop[] = [];
     return new Promise((resolve, reject) => {
-        const attempt = (current: string, hops: number, retryCount: number): void => {
-            if (hops > 8) {
+        const attempt = (current: string, redirects: number, retryCount: number): void => {
+            if (redirects > 8) {
                 reject(new Error('too many redirects'));
                 return;
             }
@@ -165,15 +189,18 @@ function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage
                 if (status === 429) {
                     res.resume();
                     if (retryCount < MAX_429_RETRIES) {
-                        sleep(RETRY_DELAY_MS).then(() => attempt(current, hops, retryCount + 1));
+                        sleep(RETRY_DELAY_MS).then(() => attempt(current, redirects, retryCount + 1));
                     } else {
                         reject(new Error(`HTTP 429 (gave up after ${MAX_429_RETRIES} retries)`));
                     }
                     return;
                 }
 
+                // Redirect: archive this hop (empty body) under its own URL, then
+                // follow `location`. The 3xx + location is kept, not swallowed.
                 if (status >= 300 && status < 400 && loc) {
                     res.resume();
+                    hops.push({ url: current, status, statusText, headers: collectHeaders(res.headers), body: Buffer.alloc(0) });
                     let next: string;
                     try {
                         next = new URL(loc, current).href;
@@ -184,7 +211,7 @@ function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage
                         reject(new Error(`bad redirect location: ${loc}`));
                         return;
                     }
-                    attempt(next, hops + 1, retryCount);
+                    attempt(next, redirects + 1, retryCount);
                     return;
                 }
 
@@ -198,13 +225,10 @@ function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage
                 const encoding = String(res.headers['content-encoding'] || '').toLowerCase();
                 const decompress = encoding.includes('gzip') || encoding.includes('deflate');
 
-                const headers: [string, string][] = [];
-                for (const [k, v] of Object.entries(res.headers)) {
-                    if (v === undefined) continue;
+                const headers = collectHeaders(res.headers).filter(([k]) => {
                     const lower = k.toLowerCase();
-                    if (decompress && (lower === 'content-encoding' || lower === 'content-length')) continue;
-                    headers.push([k, Array.isArray(v) ? v.join(', ') : v]);
-                }
+                    return !(decompress && (lower === 'content-encoding' || lower === 'content-length'));
+                });
 
                 let stream: NodeJS.ReadableStream = res;
                 if (encoding.includes('gzip')) stream = res.pipe(zlib.createGunzip());
@@ -214,13 +238,8 @@ function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage
                 stream.on('data', (c: Buffer) => chunks.push(c));
                 stream.on('error', (e) => reject(e));
                 stream.on('end', () => {
-                    resolve({
-                        status,
-                        statusText,
-                        headers,
-                        body: Buffer.concat(chunks),
-                        dateRfc3339: started.toISOString(),
-                    });
+                    hops.push({ url: current, status, statusText, headers, body: Buffer.concat(chunks) });
+                    resolve({ hops, dateRfc3339 });
                 });
             });
             req.on('error', (e) => reject(e));
@@ -233,15 +252,17 @@ function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage
 }
 
 /**
- * Build the WARC `request` record that accompanies a fetched URL's `response`
- * record. It records exactly how the crawler asked for the resource: the
- * request line against the original URL, plus the `Host` Node derived from that
- * URL and the client-identity headers in `clientHeaders(...)`. The request is
- * captured against the URL the crawler was *told* to fetch (redirects are
- * followed transparently and not recorded as separate requests here), so the
- * request/response pair always share one `WARC-Target-URI`.
+ * Build the WARC `request` record that accompanies a fetched URL's outcome. It
+ * records exactly how the crawler asked for the resource: the request line
+ * against the original URL, plus the `Host` Node derived from that URL and the
+ * client-identity headers in `clientHeaders(...)`. The request is captured
+ * against the URL the crawler was *told* to fetch (redirects are followed
+ * transparently and not recorded as separate requests here). On success
+ * `concurrentToId` is the first response hop; on failure it is the `metadata`
+ * record that documents the error -- `WARC-Concurrent-To` is bidirectional, so
+ * the one-sided link from the request suffices in both cases.
  */
-function buildRequestRecord(url: string, responseRecordId: string, dateRfc3339: string, userAgent: string, accept: string, acceptLanguage: string): Buffer {
+function buildRequestRecord(url: string, concurrentToId: string, dateRfc3339: string, userAgent: string, accept: string, acceptLanguage: string): Buffer {
     const u = new URL(url);
     const headers: [string, string][] = [['Host', u.host]];
     for (const [k, v] of Object.entries(clientHeaders(userAgent, accept, acceptLanguage))) {
@@ -252,7 +273,7 @@ function buildRequestRecord(url: string, responseRecordId: string, dateRfc3339: 
         recordId: `<urn:uuid:${crypto.randomUUID()}>`,
         targetUri: url,
         dateRfc3339,
-        concurrentTo: responseRecordId,
+        concurrentTo: concurrentToId,
         request: {
             method: 'GET',
             path: u.pathname + u.search,
@@ -265,19 +286,33 @@ function buildRequestRecord(url: string, responseRecordId: string, dateRfc3339: 
 // Packaging
 // ---------------------------------------------------------------------------
 
-/** A fetched URL + its serialized WARC records (offset/length assigned later). */
-interface NewRecord {
+/** One hop of a fetched URL's redirect chain, already serialized as a WARC
+ * `response` record (offset/length assigned later). A chain of length 1 means
+ * the fetch returned a final response with no redirect. */
+interface HopRecord {
     url: string;
-    ts: string;
     status: number;
     mime: string;
     digest: string;
-    /** Page title extracted from the HTML body, when this is a web page. */
+    responseRecord: Buffer;
+}
+
+/** A fetched URL, as a `request` record plus the WARC records that record its
+ * outcome. On success there is one `response` record per redirect hop; on
+ * failure there are no response records, only a `metadata` record documenting
+ * the error. The request record is always written, so the archive records the
+ * *intent* even when nothing came back. */
+interface NewRecord {
+    url: string;
+    ts: string;
+    /** Page title extracted from the final hop's HTML body, when it is a page. */
     title?: string;
     /** The `request` record describing how this URL was fetched (headers sent). */
     requestRecord: Buffer;
-    /** The `response` record carrying the archived payload. */
-    responseRecord: Buffer;
+    /** Serialized response records, one per redirect hop, in request order. */
+    hops: HopRecord[];
+    /** Serialized `metadata` record documenting a fetch error; null on success. */
+    errorRecord: Buffer | null;
 }
 
 /** MIME types that represent a web page (HTML) rather than a subresource. */
@@ -387,17 +422,17 @@ function resource(name: string, p: string, data: Buffer): Record<string, unknown
     };
 }
 
-function indexLine(r: NewRecord, offset: number, length: number): string {
+function indexLine(url: string, ts: string, status: number, mime: string, digest: string, offset: number, length: number): string {
     const json = {
-        url: r.url,
-        digest: r.digest,
-        mime: r.mime,
+        url,
+        digest,
+        mime,
         offset,
         length,
-        status: r.status,
+        status,
         filename: 'data.warc.gz',
     };
-    return `${surtKey(r.url)} ${r.ts} ${JSON.stringify(json)}`;
+    return `${surtKey(url)} ${ts} ${JSON.stringify(json)}`;
 }
 
 function writeWacz(opts: {
@@ -418,24 +453,45 @@ function writeWacz(opts: {
     let offset = baseOffset;
 
     for (const r of newRecords) {
-        // The `request` record is written first as its own member, immediately
-        // before the `response` member it produced. It is NOT indexed -- the
-        // CDXJ entry points only at the response member, so the request stays
-        // a self-describing annotation in the WARC stream without being served.
+        // The `request` record is written first as its own member -- always,
+        // success or failure -- so the archive records the *intent* (what was
+        // asked for, under which client identity) even when nothing came back.
+        // It is NOT indexed: the CDXJ entries point only at response members, so
+        // the request stays a self-describing annotation in the WARC stream
+        // without being served.
         const reqMember = zlib.gzipSync(r.requestRecord);
         warcParts.push(reqMember);
         offset += reqMember.length;
 
-        const respMember = zlib.gzipSync(r.responseRecord);
-        warcParts.push(respMember);
-        newIndexLines.push(indexLine(r, offset, respMember.length));
-        // Only web pages become entry points listed on the index page.
-        // Subresources (images, CSS, JS, ...) are still archived in the WARC,
-        // but omitting them from pages.jsonl keeps the home page to just pages.
-        if (isHtmlMime(r.mime)) {
+        if (r.errorRecord) {
+            // A failed fetch: no response members, only the metadata record that
+            // documents the error, written after (and Concurrent-To'd from) the
+            // request record. Nothing is indexed -- a URL with no capture must
+            // not resolve on replay.
+            const errMember = zlib.gzipSync(r.errorRecord);
+            warcParts.push(errMember);
+            offset += errMember.length;
+            continue;
+        }
+
+        // One response record + CDXJ entry per redirect hop, each under its own
+        // URL, so a replay of the original URL follows the 3xx chain hop by hop.
+        for (const hop of r.hops) {
+            const respMember = zlib.gzipSync(hop.responseRecord);
+            warcParts.push(respMember);
+            newIndexLines.push(indexLine(hop.url, r.ts, hop.status, hop.mime, hop.digest, offset, respMember.length));
+            offset += respMember.length;
+        }
+
+        // Only web pages become entry points listed on the index page, and only
+        // one per url-list entry (keyed to the requested URL). Redirect hop URLs
+        // stay in the index but are not pages. Subresources (images, CSS, JS, ...)
+        // are still archived in the WARC, but omitting them from pages.jsonl keeps
+        // the home page to just pages.
+        const last = r.hops[r.hops.length - 1];
+        if (isHtmlMime(last.mime)) {
             newPageObjs.push({ url: r.url, ts: cdxjTsToRfc3339(r.ts), title: r.title || r.url });
         }
-        offset += respMember.length;
     }
     const warcGz = Buffer.concat(warcParts);
 
@@ -536,36 +592,75 @@ async function main(): Promise<void> {
             const url = toFetch[i];
             try {
                 const resp = await fetchUrl(url, userAgent, accept, acceptLanguage);
-                const responseRecordId = `<urn:uuid:${crypto.randomUUID()}>`;
-                const requestRecord = buildRequestRecord(url, responseRecordId, resp.dateRfc3339, userAgent, accept, acceptLanguage);
-                const responseRecord = buildWarcRecord({
-                    recordId: responseRecordId,
-                    targetUri: url,
-                    dateRfc3339: resp.dateRfc3339,
-                    response: {
-                        status: resp.status,
-                        statusText: resp.statusText,
-                        headers: resp.headers,
-                        body: resp.body,
-                    },
+                // One response record per hop, keyed to its own URL. Generate the
+                // IDs up front so the request record can reference the first hop.
+                const ids = resp.hops.map(() => `<urn:uuid:${crypto.randomUUID()}>`);
+                const requestRecord = buildRequestRecord(url, ids[0], resp.dateRfc3339, userAgent, accept, acceptLanguage);
+                const hops: HopRecord[] = resp.hops.map((hop, j) => {
+                    const responseRecord = buildWarcRecord({
+                        recordId: ids[j],
+                        targetUri: hop.url,
+                        dateRfc3339: resp.dateRfc3339,
+                        response: {
+                            status: hop.status,
+                            statusText: hop.statusText,
+                            headers: hop.headers,
+                            body: hop.body,
+                        },
+                    });
+                    const ctype = (hop.headers.find(([n]) => n.toLowerCase() === 'content-type')?.[1] || '').split(';')[0].trim();
+                    const mime = ctype || 'application/octet-stream';
+                    return { url: hop.url, status: hop.status, mime, digest: payloadDigest(hop.body), responseRecord };
                 });
-                const ctype = (resp.headers.find(([n]) => n.toLowerCase() === 'content-type')?.[1] || '').split(';')[0].trim();
-                const mime = ctype || 'application/octet-stream';
+                const finalHop = resp.hops[resp.hops.length - 1];
+                const finalMime = hops[hops.length - 1].mime;
                 newRecords.push({
                     url,
                     ts: nowTs17(),
-                    status: resp.status,
-                    mime,
-                    digest: payloadDigest(resp.body),
-                    title: isHtmlMime(mime) ? extractTitle(resp.body) : undefined,
+                    title: isHtmlMime(finalMime) ? extractTitle(finalHop.body) : undefined,
                     requestRecord,
-                    responseRecord,
+                    hops,
+                    errorRecord: null,
                 });
                 ok++;
-                console.log(`[${id}] OK ${resp.status} ${url}`);
+                console.log(`[${id}] OK ${finalHop.status} ${url}`);
             } catch (e) {
                 failed++;
-                console.log(`[${id}] FAIL ${(e as Error).message} | ${url}`);
+                // Normalize to a non-empty string: Node's connection errors can
+                // carry only a `code` (ECONNREFUSED) with no message, some
+                // rejections are not `Error` instances at all, and the http
+                // client wraps them in an AggregateError whose `errors` array
+                // holds the real cause.
+                let error = (e as Error)?.message || '';
+                if ((!error || error === 'AggregateError') && (e as AggregateError)?.errors?.length) {
+                    error = (e as AggregateError).errors.map((err) => (err as Error)?.message || String(err)).join('; ');
+                }
+                if (!error) error = String(e) || 'fetch failed';
+                const ts = nowTs17();
+                const dateRfc3339 = cdxjTsToRfc3339(ts);
+                // The failure is a WARC `metadata` record (WARC 1.1 section 6.8):
+                // native WARC's way to describe a harvest event that produced no
+                // response. The request record Concurrent-To's it, linking intent
+                // to outcome without inventing a new record type or file.
+                const errorRecordId = `<urn:uuid:${crypto.randomUUID()}>`;
+                const errorRecord = buildWarcMetadataRecord({
+                    recordId: errorRecordId,
+                    targetUri: url,
+                    dateRfc3339,
+                    fields: [
+                        ['fetchError', error],
+                        ['via', url],
+                    ],
+                });
+                const requestRecord = buildRequestRecord(url, errorRecordId, dateRfc3339, userAgent, accept, acceptLanguage);
+                newRecords.push({
+                    url,
+                    ts,
+                    requestRecord,
+                    hops: [],
+                    errorRecord,
+                });
+                console.log(`[${id}] FAIL ${error} | ${url}`);
             }
         }
     };

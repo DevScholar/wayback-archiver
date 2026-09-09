@@ -35,8 +35,10 @@ export interface WarcRecord {
 
 /** Locate the blank line that ends a header block. Returns the offset of the
  * terminator and its length (4 for CRLF CRLF, 2 for LF LF), so the caller can
- * skip it completely -- the block body starts right after it. */
-function findHeaderEnd(buf: Buffer): { index: number; termLen: number } {
+ * skip it completely -- the block body starts right after it. Exported so the
+ * verify command can re-derive the exact byte spans a WARC record's digests
+ * cover, without re-parsing the record. */
+export function findHeaderEnd(buf: Buffer): { index: number; termLen: number } {
     // CRLF CRLF (the standard case)
     for (let i = 0; i < buf.length - 3; i++) {
         if (buf[i] === 0x0d && buf[i + 1] === 0x0a && buf[i + 2] === 0x0d && buf[i + 3] === 0x0a) {

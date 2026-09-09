@@ -144,6 +144,42 @@ export function buildWarcRequestRecord(opts: {
     ]);
 }
 
+/** Serialize a WARC `metadata` record: native WARC's way to describe, explain,
+ * or accompany a harvest event without a response payload (WARC 1.1 section
+ * 6.8). The block is `application/warc-fields` -- one `name: value` line per
+ * entry in `fields`. `WARC-Concurrent-To` is bidirectional, so a one-sided link
+ * from the request record suffices; `concurrentTo` is left unset here and the
+ * caller points the request at this record's `recordId` instead. */
+export function buildWarcMetadataRecord(opts: {
+    recordId: string;
+    targetUri: string;
+    dateRfc3339: string;
+    /** `application/warc-fields` body: one line per [name, value] pair. */
+    fields: [string, string][];
+}): Buffer {
+    const { recordId, targetUri, dateRfc3339, fields } = opts;
+
+    const block = Buffer.from(fields.map(([n, v]) => `${n}: ${v}\r\n`).join(''), 'latin1');
+    const blockDigest = crypto.createHash('sha256').update(block).digest('hex');
+
+    const warcHead =
+        'WARC/1.1\r\n' +
+        `WARC-Record-ID: ${recordId}\r\n` +
+        `WARC-Target-URI: ${targetUri}\r\n` +
+        `WARC-Date: ${dateRfc3339}\r\n` +
+        'WARC-Type: metadata\r\n' +
+        'Content-Type: application/warc-fields\r\n' +
+        `WARC-Block-Digest: sha256:${blockDigest}\r\n` +
+        `Content-Length: ${block.length}\r\n`;
+
+    return Buffer.concat([
+        Buffer.from(warcHead, 'latin1'),
+        Buffer.from('\r\n', 'latin1'),
+        block,
+        Buffer.from('\r\n\r\n', 'latin1'),
+    ]);
+}
+
 /** CDXJ `digest` field: `sha-256:<hex of the HTTP payload>` (note the dash). */
 export function payloadDigest(body: Buffer): string {
     return 'sha-256:' + crypto.createHash('sha256').update(body).digest('hex');

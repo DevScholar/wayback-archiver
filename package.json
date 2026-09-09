@@ -22,7 +22,8 @@
     "wayback-download": "./dist/cli/downloader.js",
     "wayback-export": "./dist/cli/export-to-html.js",
     "wayback-server": "./dist/cli/server.js",
-    "wayback-restore": "./dist/cli/wayback-machine-restorer.js"
+    "wayback-restore": "./dist/cli/wayback-machine-restorer.js",
+    "wayback-verify": "./dist/cli/verify.js"
   },
   "engines": {
     "node": ">=20"
@@ -33,6 +34,7 @@
     "export": "tsx src/cli/export-to-html.ts",
     "server": "tsx src/cli/server.ts",
     "restore": "tsx src/cli/wayback-machine-restorer.ts",
+    "verify": "tsx src/cli/verify.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "prepack": "npm run build"
