@@ -30,14 +30,12 @@ original URL therefore walks the same redirect chain the live fetch did, and the
 redirect itself — the era's server deciding where to send the browser — survives
 as historical material.
 
-Every attempt is recorded natively in the WARC, success or failure. A success
-writes one `response` record per redirect hop; a failure writes a WARC 1.1
-`metadata` record (with a `fetchError` field in its `application/warc-fields`
-block) linked to the `request` record via `WARC-Concurrent-To`. The `request`
-record is always written, so the archive preserves the *intent* — what was asked
-for, under which client identity — even when nothing came back. This is what lets
-an audit distinguish "this URL was never asked for" from "this URL was asked for
-but the fetch failed".
+Every URL is fetched once and archived as a WARC 1.1 `request`/`response` pair.
+A success writes one `response` record per redirect hop. A failed fetch is not
+archived: the WARC record vocabulary has no standard field for a capture error,
+so (rather than inventing a non-standard extension) nothing is written for the
+URL, matching ArchiveWeb.page. A fresh archive begins with a single `warcinfo`
+record describing the crawl (`software`, `format`, `isPartOf`).
 
 The download is **incremental**: if `--output-file` already exists, it is
 appended to rather than replaced. URLs already in the archive are skipped (not

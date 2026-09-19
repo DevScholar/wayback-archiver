@@ -47,7 +47,7 @@ import * as https from 'https';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
 import { writeZipFile } from '../archive/zip-writer.js';
-import { buildWarcRecord, buildWarcRequestRecord, buildWarcMetadataRecord, payloadDigest } from '../archive/warc-writer.js';
+import { buildWarcRecord, buildWarcRequestRecord, buildWarcinfoRecord, payloadDigest } from '../archive/warc-writer.js';
 import { surtKey } from '../lib/url.js';
 import { nowTs17, cdxjTsToRfc3339 } from '../lib/time.js';
 import { ZipReader } from '../archive/zip.js';
@@ -117,6 +117,11 @@ const DEFAULT_USER_AGENT =
 const DEFAULT_ACCEPT =
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8';
 const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
+
+/** The `software` value written to both the `warcinfo` record and
+ * `datapackage.json`. The `name/version` form follows the WARC 1.1 spec's own
+ * example ("heritrix/1.12.0"). */
+const SOFTWARE = 'wayback-archiver/2.0.0';
 
 /** Client-identity headers sent on every fetch (and recorded in the request
  * record). Each is overridable via `--user-agent` / `--accept` /
@@ -298,10 +303,11 @@ interface HopRecord {
 }
 
 /** A fetched URL, as a `request` record plus the WARC records that record its
- * outcome. On success there is one `response` record per redirect hop; on
- * failure there are no response records, only a `metadata` record documenting
- * the error. The request record is always written, so the archive records the
- * *intent* even when nothing came back. */
+ * outcome. On success there is one `response` record per redirect hop. A
+ * failed fetch is not archived at all: the WARC record types (and the
+ * `metadata` field vocabulary) have no standard way to record a capture error,
+ * so nothing is written for it -- matching ArchiveWeb.page, which also omits
+ * failed fetches. */
 interface NewRecord {
     url: string;
     ts: string;
@@ -311,8 +317,6 @@ interface NewRecord {
     requestRecord: Buffer;
     /** Serialized response records, one per redirect hop, in request order. */
     hops: HopRecord[];
-    /** Serialized `metadata` record documenting a fetch error; null on success. */
-    errorRecord: Buffer | null;
 }
 
 /** MIME types that represent a web page (HTML) rather than a subresource. */
@@ -443,14 +447,29 @@ function writeWacz(opts: {
 }): void {
     const { outputFile, title, existing, newRecords } = opts;
 
-    // Append each new record as its own gzip member after the existing WARC
-    // stream. Offsets of existing records are untouched; new offsets start at
-    // the end of the existing stream.
-    const baseOffset = existing ? existing.warcGz.length : 0;
+    // Each record is its own gzip member so a single record can be read by byte
+    // range. A fresh archive begins with a `warcinfo` record describing the
+    // crawl; on append the existing stream (and its own warcinfo) is carried
+    // over unchanged, so the warcinfo is written exactly once per archive.
+    const nowIso = new Date().toISOString();
     const warcParts: Buffer[] = existing ? [existing.warcGz] : [];
+    let offset = existing ? existing.warcGz.length : 0;
+
+    if (!existing) {
+        const warcinfo = buildWarcinfoRecord({
+            recordId: `<urn:uuid:${crypto.randomUUID()}>`,
+            dateRfc3339: nowIso,
+            warcFilename: `${path.basename(outputFile)}#/archive/data.warc.gz`,
+            software: SOFTWARE,
+            isPartOf: title,
+        });
+        const member = zlib.gzipSync(warcinfo);
+        warcParts.push(member);
+        offset += member.length;
+    }
+
     const newIndexLines: string[] = [];
     const newPageObjs: Record<string, unknown>[] = [];
-    let offset = baseOffset;
 
     for (const r of newRecords) {
         // The `request` record is written first as its own member -- always,
@@ -462,17 +481,6 @@ function writeWacz(opts: {
         const reqMember = zlib.gzipSync(r.requestRecord);
         warcParts.push(reqMember);
         offset += reqMember.length;
-
-        if (r.errorRecord) {
-            // A failed fetch: no response members, only the metadata record that
-            // documents the error, written after (and Concurrent-To'd from) the
-            // request record. Nothing is indexed -- a URL with no capture must
-            // not resolve on replay.
-            const errMember = zlib.gzipSync(r.errorRecord);
-            warcParts.push(errMember);
-            offset += errMember.length;
-            continue;
-        }
 
         // One response record + CDXJ entry per redirect hop, each under its own
         // URL, so a replay of the original URL follows the 3xx chain hop by hop.
@@ -517,7 +525,6 @@ function writeWacz(opts: {
     const pages = Buffer.from(pagesText, 'utf-8');
 
     // datapackage: preserve existing metadata, override title/resources/modified.
-    const nowIso = new Date().toISOString();
     const resources = [
         resource('pages.jsonl', 'pages/pages.jsonl', pages),
         resource('data.warc.gz', 'archive/data.warc.gz', warcGz),
@@ -528,7 +535,7 @@ function writeWacz(opts: {
         : {
               profile: 'data-package',
               wacz_version: '1.1.1',
-              software: 'wayback-archiver',
+              software: SOFTWARE,
               created: nowIso,
           };
     dp.title = title;
@@ -620,46 +627,21 @@ async function main(): Promise<void> {
                     title: isHtmlMime(finalMime) ? extractTitle(finalHop.body) : undefined,
                     requestRecord,
                     hops,
-                    errorRecord: null,
                 });
                 ok++;
                 console.log(`[${id}] OK ${finalHop.status} ${url}`);
             } catch (e) {
                 failed++;
-                // Normalize to a non-empty string: Node's connection errors can
-                // carry only a `code` (ECONNREFUSED) with no message, some
-                // rejections are not `Error` instances at all, and the http
-                // client wraps them in an AggregateError whose `errors` array
-                // holds the real cause.
+                // A failed fetch is not archived: the WARC record vocabulary has
+                // no standard field for a capture error, so writing one would
+                // mean inventing a non-standard extension (e.g. a `fetchError`
+                // field) or borrowing an unrelated standard field's meaning.
+                // Nothing is written for the URL, matching ArchiveWeb.page.
                 let error = (e as Error)?.message || '';
                 if ((!error || error === 'AggregateError') && (e as AggregateError)?.errors?.length) {
                     error = (e as AggregateError).errors.map((err) => (err as Error)?.message || String(err)).join('; ');
                 }
                 if (!error) error = String(e) || 'fetch failed';
-                const ts = nowTs17();
-                const dateRfc3339 = cdxjTsToRfc3339(ts);
-                // The failure is a WARC `metadata` record (WARC 1.1 section 6.8):
-                // native WARC's way to describe a harvest event that produced no
-                // response. The request record Concurrent-To's it, linking intent
-                // to outcome without inventing a new record type or file.
-                const errorRecordId = `<urn:uuid:${crypto.randomUUID()}>`;
-                const errorRecord = buildWarcMetadataRecord({
-                    recordId: errorRecordId,
-                    targetUri: url,
-                    dateRfc3339,
-                    fields: [
-                        ['fetchError', error],
-                        ['via', url],
-                    ],
-                });
-                const requestRecord = buildRequestRecord(url, errorRecordId, dateRfc3339, userAgent, accept, acceptLanguage);
-                newRecords.push({
-                    url,
-                    ts,
-                    requestRecord,
-                    hops: [],
-                    errorRecord,
-                });
                 console.log(`[${id}] FAIL ${error} | ${url}`);
             }
         }

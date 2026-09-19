@@ -144,32 +144,40 @@ export function buildWarcRequestRecord(opts: {
     ]);
 }
 
-/** Serialize a WARC `metadata` record: native WARC's way to describe, explain,
- * or accompany a harvest event without a response payload (WARC 1.1 section
- * 6.8). The block is `application/warc-fields` -- one `name: value` line per
- * entry in `fields`. `WARC-Concurrent-To` is bidirectional, so a one-sided link
- * from the request record suffices; `concurrentTo` is left unset here and the
- * caller points the request at this record's `recordId` instead. */
-export function buildWarcMetadataRecord(opts: {
+/** Serialize a WARC `warcinfo` record (WARC 1.1 section 6.2): describes the
+ * crawl that produced the records that follow it. Written once, as the first
+ * record of the WARC stream. Unlike the `response`/`request` records, a
+ * `warcinfo` record has no `WARC-Target-URI` (the spec forbids it) and instead
+ * carries a `WARC-Filename` naming the member it lives in. The block is
+ * `application/warc-fields` with `software`, `format`, and `isPartOf` fields,
+ * matching what ArchiveWeb.page / warcio.js write. */
+export function buildWarcinfoRecord(opts: {
     recordId: string;
-    targetUri: string;
     dateRfc3339: string;
-    /** `application/warc-fields` body: one line per [name, value] pair. */
-    fields: [string, string][];
+    /** e.g. "ms-2026-test.wacz#/archive/data.warc.gz" */
+    warcFilename: string;
+    /** e.g. "wayback-archiver/2.0.0" */
+    software: string;
+    /** Defaults to "WARC File Format 1.1". */
+    format?: string;
+    /** Archive title (the WACZ `title`), written as `isPartOf`. */
+    isPartOf?: string;
 }): Buffer {
-    const { recordId, targetUri, dateRfc3339, fields } = opts;
+    const fields: [string, string][] = [
+        ['software', opts.software],
+        ['format', opts.format ?? 'WARC File Format 1.1'],
+    ];
+    if (opts.isPartOf) fields.push(['isPartOf', opts.isPartOf]);
 
     const block = Buffer.from(fields.map(([n, v]) => `${n}: ${v}\r\n`).join(''), 'latin1');
-    const blockDigest = crypto.createHash('sha256').update(block).digest('hex');
 
     const warcHead =
         'WARC/1.1\r\n' +
-        `WARC-Record-ID: ${recordId}\r\n` +
-        `WARC-Target-URI: ${targetUri}\r\n` +
-        `WARC-Date: ${dateRfc3339}\r\n` +
-        'WARC-Type: metadata\r\n' +
+        `WARC-Record-ID: ${opts.recordId}\r\n` +
+        `WARC-Filename: ${opts.warcFilename}\r\n` +
+        `WARC-Date: ${opts.dateRfc3339}\r\n` +
+        'WARC-Type: warcinfo\r\n' +
         'Content-Type: application/warc-fields\r\n' +
-        `WARC-Block-Digest: sha256:${blockDigest}\r\n` +
         `Content-Length: ${block.length}\r\n`;
 
     return Buffer.concat([
