@@ -599,10 +599,19 @@ function main(): void {
     }
 
     let title = args.title ?? 'Web Archive';
+    // Provenance is carried across, not invented: the input datapackage's
+    // `software` and `created` describe who actually captured the bytes
+    // (e.g. ArchiveWeb.page), so they are preserved verbatim. The restorer is
+    // a conversion, not a capture event, so it writes no warcinfo and does not
+    // substitute its own identity here.
+    let origSoftware: string | undefined;
+    let origCreated: string | undefined;
     let origPages = '';
     try {
         const dp = JSON.parse(zip.readEntry('datapackage.json').toString('utf8'));
         if (typeof dp.title === 'string' && !args.title) title = dp.title + ' (restored)';
+        if (typeof dp.software === 'string') origSoftware = dp.software;
+        if (typeof dp.created === 'string') origCreated = dp.created;
     } catch {
         /* optional */
     }
@@ -876,8 +885,8 @@ function main(): void {
     const dp = {
         profile: 'data-package',
         wacz_version: '1.1.1',
-        software: 'wayback-archiver / wayback-machine-restorer',
-        created: nowIso,
+        software: origSoftware ?? 'WaybackArchiver/1.0.0',
+        created: origCreated ?? nowIso,
         title,
         modified: nowIso,
         resources: [

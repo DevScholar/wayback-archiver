@@ -119,9 +119,10 @@ const DEFAULT_ACCEPT =
 const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
 
 /** The `software` value written to both the `warcinfo` record and
- * `datapackage.json`. The `name/version` form follows the WARC 1.1 spec's own
- * example ("heritrix/1.12.0"). */
-const SOFTWARE = 'wayback-archiver/2.0.0';
+ * `datapackage.json`. The `ProductToken/Version` form follows the WARC 1.1
+ * spec's own example ("heritrix/1.12.0") and the browser User-Agent
+ * convention of a CamelCase product name. */
+const SOFTWARE = 'WaybackArchiver/1.0.0';
 
 /** Client-identity headers sent on every fetch (and recorded in the request
  * record). Each is overridable via `--user-agent` / `--accept` /

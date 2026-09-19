@@ -156,7 +156,7 @@ export function buildWarcinfoRecord(opts: {
     dateRfc3339: string;
     /** e.g. "ms-2026-test.wacz#/archive/data.warc.gz" */
     warcFilename: string;
-    /** e.g. "wayback-archiver/2.0.0" */
+    /** e.g. "WaybackArchiver/1.0.0" */
     software: string;
     /** Defaults to "WARC File Format 1.1". */
     format?: string;
