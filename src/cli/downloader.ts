@@ -14,7 +14,7 @@
  *   --title           archive title. Defaults to the output file's basename for a
  *                     new archive; when the file already exists, omitting --title
  *                     keeps its current title and providing it renames it.
- *   --user-agent      `User-Agent` header to fetch with (defaults to a Chrome 100
+ *   --user-agent      `User-Agent` header to fetch with (defaults to an Edge 150
  *                     on Windows NT 10.0 string). Recorded in the request record.
  *   --accept          `Accept` header to fetch with (defaults to a Chrome-style
  *                     HTML-first value). Recorded in the request record.
@@ -113,7 +113,7 @@ function readUrlList(filePath: string): string[] {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_USER_AGENT =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36';
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0';
 const DEFAULT_ACCEPT =
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8';
 const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
@@ -125,7 +125,7 @@ const SOFTWARE = 'wayback-archiver/2.0.0';
 
 /** Client-identity headers sent on every fetch (and recorded in the request
  * record). Each is overridable via `--user-agent` / `--accept` /
- * `--accept-language`; the defaults together read as a Chrome 100 browser. */
+ * `--accept-language`; the defaults together read as an Edge 150 browser. */
 function clientHeaders(userAgent: string, accept: string, acceptLanguage: string): http.OutgoingHttpHeaders {
     return {
         'User-Agent': userAgent,

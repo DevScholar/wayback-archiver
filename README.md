@@ -19,7 +19,7 @@ npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wa
 `my-urls.txt` holds one URL per line (blank lines and `#` comments are
 ignored). Each URL is fetched once and archived as a WARC 1.1 `response` record
 inside `archive/data.warc.gz`, preceded by a `request` record that records the
-client identity it was fetched under (a Windows NT 10.0 / Chrome 100
+client identity it was fetched under (a Windows NT 10.0 / Edge 150
 `User-Agent`, plus `Accept` and `Accept-Language: en-US,en;q=0.9`). The title
 defaults to the output file's basename.
 
