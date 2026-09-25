@@ -65,12 +65,14 @@ export function lookupKey(raw: string): string {
 export function surtKey(raw: string): string {
     const p = parseUrl(raw);
     if (!p) return raw;
-    let host = p.hostname;
-    if (p.port) host += ':' + p.port;
-    const reversed = host.split('.').reverse().join(',');
+    const reversed = p.hostname.split('.').reverse().join(',');
+    // The port is appended to the *last* reversed label (the hostname's
+    // original first label), per the SURT convention: `example.org:8080`
+    // becomes `org,example:8080)`, not `org:8080,example)`.
+    const hostPart = p.port ? reversed + ':' + p.port : reversed;
     let path = p.pathname;
     if (path === '') path = '/';
-    return reversed + ')' + path + p.search;
+    return hostPart + ')' + path + p.search;
 }
 
 /** Lookup key ignoring the query string and fragment: `scheme://host:port/path`.

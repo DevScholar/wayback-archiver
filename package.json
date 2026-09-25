@@ -36,6 +36,7 @@
     "restore": "tsx src/cli/wayback-machine-restorer.ts",
     "verify": "tsx src/cli/verify.ts",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "build": "tsc",
     "prepack": "npm run build"
   },

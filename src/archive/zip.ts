@@ -20,6 +20,53 @@ import * as zlib from 'zlib';
 const EOCD_SIG = 0x06054b50; // End Of Central Directory
 const CEN_SIG = 0x02014b50; // Central directory file header
 const LOC_SIG = 0x04034b50; // Local file header
+const ZIP64_EOCD_SIG = 0x06064b50; // ZIP64 End Of Central Directory record
+const ZIP64_EOCD_LOCATOR_SIG = 0x07064b50; // ZIP64 End Of Central Directory locator
+const ZIP64_EXTRA_ID = 0x0001; // ZIP64 extended information extra field
+
+// ZIP64 saturation sentinel: a 32-bit field at this value carries its real
+// value in the ZIP64 extra field (sizes/offset) or the ZIP64 EOCD (counts,
+// central-dir size/offset).
+const ZIP32_MAX = 0xffffffff;
+
+/**
+ * Read the 64-bit values a ZIP64 extra field (ID 0x0001) carries. The field
+ * lists, in order, only the values whose standard 32-bit field is saturated to
+ * 0xFFFFFFFF: uncompressed size, compressed size, local-header offset, disk
+ * number. `want` says which of the first three are saturated (hence present);
+ * each present value is an 8-byte little-endian integer. Returns `null` for a
+ * value that was not requested.
+ */
+function readZip64Extra(
+    extra: Buffer,
+    want: { uncompressed: boolean; compressed: boolean; offset: boolean },
+): { uncompressed: number | null; compressed: number | null; offset: number | null } {
+    let uncompressed: number | null = null;
+    let compressed: number | null = null;
+    let offset: number | null = null;
+    for (let p = 0; p + 4 <= extra.length; ) {
+        const id = extra.readUInt16LE(p);
+        const len = extra.readUInt16LE(p + 2);
+        const data = extra.subarray(p + 4, p + 4 + len);
+        if (id === ZIP64_EXTRA_ID) {
+            let q = 0;
+            if (want.uncompressed && q + 8 <= data.length) {
+                uncompressed = Number(data.readBigUInt64LE(q));
+                q += 8;
+            }
+            if (want.compressed && q + 8 <= data.length) {
+                compressed = Number(data.readBigUInt64LE(q));
+                q += 8;
+            }
+            if (want.offset && q + 8 <= data.length) {
+                offset = Number(data.readBigUInt64LE(q));
+            }
+            break;
+        }
+        p += 4 + len;
+    }
+    return { uncompressed, compressed, offset };
+}
 
 export interface ZipEntry {
     name: string;
@@ -84,9 +131,26 @@ export class ZipReader {
         }
         if (eocd < 0) throw new Error('Not a valid ZIP file (End Of Central Directory not found)');
 
-        const entryCount = tail.readUInt16LE(eocd + 10);
-        const cdLength = tail.readUInt32LE(eocd + 12);
-        const cdOffset = tail.readUInt32LE(eocd + 16);
+        let entryCount = tail.readUInt16LE(eocd + 10);
+        let cdLength = tail.readUInt32LE(eocd + 12);
+        let cdOffset = tail.readUInt32LE(eocd + 16);
+
+        // ZIP64: when a count/size/offset saturates its 32-bit field, the real
+        // value lives in the ZIP64 EOCD record, found via the ZIP64 EOCD
+        // locator that sits immediately before the classic EOCD.
+        if (entryCount === 0xffff || cdLength === ZIP32_MAX || cdOffset === ZIP32_MAX) {
+            const locatorAt = this.size - tailLen + eocd - 20;
+            const locator = this.readRange(locatorAt, 20);
+            if (locator.readUInt32LE(0) === ZIP64_EOCD_LOCATOR_SIG) {
+                const z64At = Number(locator.readBigUInt64LE(8));
+                const z64 = this.readRange(z64At, 56);
+                if (z64.readUInt32LE(0) === ZIP64_EOCD_SIG) {
+                    entryCount = Number(z64.readBigUInt64LE(32));
+                    cdLength = Number(z64.readBigUInt64LE(40));
+                    cdOffset = Number(z64.readBigUInt64LE(48));
+                }
+            }
+        }
 
         // Read the central directory in one shot; it is small (one ~46-byte
         // header + name per entry). Entry payloads are not read here.
@@ -99,13 +163,31 @@ export class ZipReader {
             }
 
             const method = cd.readUInt16LE(offset + 10);
-            const compressedSize = cd.readUInt32LE(offset + 20);
-            const uncompressedSize = cd.readUInt32LE(offset + 24);
+            let compressedSize = cd.readUInt32LE(offset + 20);
+            let uncompressedSize = cd.readUInt32LE(offset + 24);
             const nameLen = cd.readUInt16LE(offset + 28);
             const extraLen = cd.readUInt16LE(offset + 30);
             const commentLen = cd.readUInt16LE(offset + 32);
-            const localHeaderOffset = cd.readUInt32LE(offset + 42);
+            let localHeaderOffset = cd.readUInt32LE(offset + 42);
             const name = cd.toString('utf8', offset + 46, offset + 46 + nameLen);
+
+            // ZIP64: a size/offset saturated to 0xFFFFFFFF carries its real
+            // 64-bit value in the central entry's ZIP64 extra field.
+            if (
+                compressedSize === ZIP32_MAX ||
+                uncompressedSize === ZIP32_MAX ||
+                localHeaderOffset === ZIP32_MAX
+            ) {
+                const extra = cd.subarray(offset + 46 + nameLen, offset + 46 + nameLen + extraLen);
+                const z64 = readZip64Extra(extra, {
+                    uncompressed: uncompressedSize === ZIP32_MAX,
+                    compressed: compressedSize === ZIP32_MAX,
+                    offset: localHeaderOffset === ZIP32_MAX,
+                });
+                if (z64.uncompressed !== null) uncompressedSize = z64.uncompressed;
+                if (z64.compressed !== null) compressedSize = z64.compressed;
+                if (z64.offset !== null) localHeaderOffset = z64.offset;
+            }
 
             // Resolve the actual start of the file data from the local header.
             const local = this.readRange(localHeaderOffset, 30);

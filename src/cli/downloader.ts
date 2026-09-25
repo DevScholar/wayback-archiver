@@ -51,11 +51,12 @@ import * as https from 'https';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
 import { writeZipFile } from '../archive/zip-writer.js';
-import { buildWarcRecord, buildWarcRequestRecord, buildWarcinfoRecord, payloadDigest } from '../archive/warc-writer.js';
-import { surtKey } from '../lib/url.js';
+import { buildWarcRecord, buildWarcinfoRecord, payloadDigest } from '../archive/warc-writer.js';
 import { nowTs17, cdxjTsToRfc3339 } from '../lib/time.js';
-import { ZipReader } from '../archive/zip.js';
 import { parseCdxj } from '../archive/cdxj.js';
+import { parseWaybackUrl, restoreWaybackHeaders, type WaybackTarget } from '../lib/wayback.js';
+import { DEFAULT_USER_AGENT, DEFAULT_ACCEPT, DEFAULT_ACCEPT_LANGUAGE, clientHeaders, collectHeaders, sleep, buildRequestRecord } from '../lib/http.js';
+import { SOFTWARE, isHtmlMime, loadExisting, resource, indexLine, type ExistingArchive } from '../archive/wacz-append.js';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -118,147 +119,9 @@ function readUrlList(filePath: string): string[] {
 // Wayback replay URLs (--wayback)
 // ---------------------------------------------------------------------------
 
-/** A parsed Wayback replay URL: `https://web.archive.org/web/<ts>[mod_]/<url>`. */
-interface WaybackTarget {
-    /** 14-digit capture timestamp from the URL path. */
-    ts14: string;
-    /** The inner, original URL the capture is of (percent-decoded). */
-    innerUrl: string;
-    /** The `id_` replay URL that serves the capture's original bytes verbatim. */
-    idUrl: string;
-}
-
-const WAYBACK_URL_RE = /^https:\/\/web\.archive\.org\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i;
-
-/**
- * Parse a Wayback replay URL into its capture timestamp and inner URL, and
- * rewrite it to the `id_` form that serves the original bytes with no link
- * rewriting. Returns null when `url` is not a Wayback replay URL.
- *
- * The `id_` modifier is the identity route: unlike the `im_`/`cs_`/`js_` (and
- * bare) routes, which Wayback rewrites for replay, `id_` returns the archived
- * bytes exactly as captured -- the only route from which a byte-for-byte
- * faithful copy can be recovered. Forcing every URL through `id_` (rather than
- * only the bare page route) is deliberate: images are not rewritten (so `im_`
- * already equals `id_`), but `cs_`/`js_` carry a Wayback footer and URL
- * rewriting that only `id_` removes.
- */
-function parseWaybackUrl(url: string): WaybackTarget | null {
-    const m = WAYBACK_URL_RE.exec(url);
-    if (!m) return null;
-    const ts14 = m[1].slice(0, 14);
-    let innerUrl: string;
-    try {
-        innerUrl = decodeURIComponent(m[3]);
-    } catch {
-        innerUrl = m[3];
-    }
-    // The scheme separator is sometimes percent-encoded (`http%3A//`).
-    innerUrl = innerUrl.replace(/%3a/gi, ':');
-    return {
-        ts14,
-        innerUrl,
-        idUrl: `https://web.archive.org/web/${ts14}id_/${innerUrl}`,
-    };
-}
-
-/** Wayback replay headers that must never leak into a faithfully restored
- * record: the replay frontend's own framing and policy headers. */
-const WAYBACK_DROP_HEADERS = new Set([
-    'x-dns-prefetch-control', 'content-security-policy', 'permissions-policy',
-    'referrer-policy', 'server-timing', 'memento-datetime', 'link',
-    'x-app-server', 'x-archive-guessed-charset', 'x-archive-guessed-content-type',
-    'x-archive-redirect-reason', 'x-archive-src', 'x-as', 'x-location', 'x-na',
-    'x-nid', 'x-page-cache', 'x-rl', 'x-sd', 'x-tr', 'x-ts',
-    'connection', 'keep-alive', 'transfer-encoding',
-    'content-length', 'content-encoding',
-]);
-
-const ORIG_HEADER_PREFIX = 'x-archive-orig-';
-
-/**
- * Rebuild an `id_` response's headers as if the era's server had answered
- * directly. Wayback folds the historical headers under `X-Archive-Orig-<Name>`
- * while serving its own modern headers on the same response; reconstruct from
- * those alone when present, otherwise keep the response's own headers minus the
- * replay framing. `content-length` is only kept when it still matches the body;
- * `content-encoding`/`transfer-encoding` are always dropped (the body is stored
- * decoded). `mime` is the fallback `content-type` when nothing declares one.
- */
-function restoreWaybackHeaders(headers: [string, string][], mime: string, body: Buffer): [string, string][] {
-    const result: [string, string][] = [];
-    const seen = new Set<string>();
-    const push = (name: string, value: string) => {
-        const lower = name.toLowerCase();
-        if (seen.has(lower)) return;
-        seen.add(lower);
-        result.push([name, value]);
-    };
-    const isStaleFraming = (name: string) =>
-        name === 'content-encoding' || name === 'transfer-encoding';
-
-    const hasOrig = headers.some(([n]) => n.toLowerCase().startsWith(ORIG_HEADER_PREFIX));
-
-    if (hasOrig) {
-        for (const [name, value] of headers) {
-            const lower = name.toLowerCase();
-            if (!lower.startsWith(ORIG_HEADER_PREFIX)) continue;
-            const real = lower.slice(ORIG_HEADER_PREFIX.length);
-            if (isStaleFraming(real)) continue;
-            if (real === 'content-length') {
-                if (Number(value) === body.length) push(real, value);
-                continue;
-            }
-            push(real, value);
-        }
-    } else {
-        for (const [name, value] of headers) {
-            const lower = name.toLowerCase();
-            if (lower.startsWith(ORIG_HEADER_PREFIX)) continue;
-            if (WAYBACK_DROP_HEADERS.has(lower)) continue;
-            if (isStaleFraming(lower) || lower === 'content-length') continue;
-            push(name, value);
-        }
-    }
-
-    if (!seen.has('content-type')) push('content-type', mime || 'application/octet-stream');
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// Fetching
-// ---------------------------------------------------------------------------
-
-const DEFAULT_USER_AGENT =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0';
-const DEFAULT_ACCEPT =
-    'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8';
-const DEFAULT_ACCEPT_LANGUAGE = 'en-US,en;q=0.9';
-
-/** The `software` value written to both the `warcinfo` record and
- * `datapackage.json`. The `ProductToken/Version` form follows the WARC 1.1
- * spec's own example ("heritrix/1.12.0") and the browser User-Agent
- * convention of a CamelCase product name. */
-const SOFTWARE = 'WaybackArchiver/1.0.0';
-
-/** Client-identity headers sent on every fetch (and recorded in the request
- * record). Each is overridable via `--user-agent` / `--accept` /
- * `--accept-language`; the defaults together read as an Edge 150 browser. */
-function clientHeaders(userAgent: string, accept: string, acceptLanguage: string): http.OutgoingHttpHeaders {
-    return {
-        'User-Agent': userAgent,
-        'Accept': accept,
-        'Accept-Language': acceptLanguage,
-    };
-}
-
 // 429 (Too Many Requests) handling: retry with a fixed delay between attempts.
 const MAX_429_RETRIES = 3;   // extra attempts beyond the first
 const RETRY_DELAY_MS = 500;  // 0.5s between each retried link
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((r) => setTimeout(r, ms));
-}
 
 interface FetchedHop {
     url: string;
@@ -273,16 +136,6 @@ interface FetchResult {
     hops: FetchedHop[];
     /** Shared RFC3339 capture time for the whole chain. */
     dateRfc3339: string;
-}
-
-/** Collect an incoming response's headers as name/value pairs, verbatim. */
-function collectHeaders(h: http.IncomingHttpHeaders): [string, string][] {
-    const out: [string, string][] = [];
-    for (const [k, v] of Object.entries(h)) {
-        if (v === undefined) continue;
-        out.push([k, Array.isArray(v) ? v.join(', ') : v]);
-    }
-    return out;
 }
 
 /**
@@ -374,37 +227,6 @@ function fetchUrl(url: string, userAgent: string, accept: string, acceptLanguage
     });
 }
 
-/**
- * Build the WARC `request` record that accompanies a fetched URL's outcome. It
- * records exactly how the crawler asked for the resource: the request line
- * against the original URL, plus the `Host` Node derived from that URL and the
- * client-identity headers in `clientHeaders(...)`. The request is captured
- * against the URL the crawler was *told* to fetch (redirects are followed
- * transparently and not recorded as separate requests here). On success
- * `concurrentToId` is the first response hop; on failure it is the `metadata`
- * record that documents the error -- `WARC-Concurrent-To` is bidirectional, so
- * the one-sided link from the request suffices in both cases.
- */
-function buildRequestRecord(url: string, concurrentToId: string, dateRfc3339: string, userAgent: string, accept: string, acceptLanguage: string): Buffer {
-    const u = new URL(url);
-    const headers: [string, string][] = [['Host', u.host]];
-    for (const [k, v] of Object.entries(clientHeaders(userAgent, accept, acceptLanguage))) {
-        if (v === undefined) continue;
-        headers.push([k, Array.isArray(v) ? v.join(', ') : String(v)]);
-    }
-    return buildWarcRequestRecord({
-        recordId: `<urn:uuid:${crypto.randomUUID()}>`,
-        targetUri: url,
-        dateRfc3339,
-        concurrentTo: concurrentToId,
-        request: {
-            method: 'GET',
-            path: u.pathname + u.search,
-            headers,
-        },
-    });
-}
-
 // ---------------------------------------------------------------------------
 // Packaging
 // ---------------------------------------------------------------------------
@@ -435,12 +257,6 @@ interface NewRecord {
     requestRecord: Buffer;
     /** Serialized response records, one per redirect hop, in request order. */
     hops: HopRecord[];
-}
-
-/** MIME types that represent a web page (HTML) rather than a subresource. */
-function isHtmlMime(mime: string): boolean {
-    const m = mime.toLowerCase();
-    return m.includes('text/html') || m.includes('application/xhtml+xml');
 }
 
 /** Decode the handful of entities that routinely appear inside `<title>`. */
@@ -481,80 +297,6 @@ function extractTitle(body: Buffer): string | undefined {
     if (!m) return undefined;
     const title = decodeEntities(m[1]).replace(/\s+/g, ' ').trim();
     return title || undefined;
-}
-
-/** Everything we need from an existing WACZ to append to it. */
-interface ExistingArchive {
-    title: string;
-    warcGz: Buffer;
-    indexLines: string[];
-    pagesText: string;
-    datapackage: Record<string, unknown>;
-}
-
-/** Load an existing WACZ for appending, or null when the file is absent. */
-function loadExisting(filePath: string): ExistingArchive | null {
-    if (!fs.existsSync(filePath)) return null;
-    const z = ZipReader.open(filePath);
-    const names = z.names();
-
-    const warcNames = names.filter((n) => n.endsWith('.warc') || n.endsWith('.warc.gz'));
-    if (warcNames.length !== 1) {
-        throw new Error(
-            `${filePath} is not a single-WARC archive (found ${warcNames.length} archive entries); append is unsupported.`,
-        );
-    }
-    const indexName = names.find((n) => n.endsWith('.cdx') && !n.endsWith('.cdx.gz'))
-        || names.find((n) => n.endsWith('.cdx'));
-    if (!indexName) {
-        throw new Error(`${filePath} exists but has no CDX index \u2014 not a WACZ.`);
-    }
-
-    let datapackage: Record<string, unknown> = {};
-    try {
-        datapackage = JSON.parse(z.readEntry('datapackage.json').toString('utf8'));
-    } catch {
-        /* datapackage.json is optional */
-    }
-
-    const warcGz = z.readEntry(warcNames[0]);
-    const indexLines = z.readEntry(indexName).toString('utf8').split(/\r?\n/).filter((l) => l.trim());
-    let pagesText = '';
-    try {
-        pagesText = z.readEntry('pages/pages.jsonl').toString('utf8');
-    } catch {
-        /* pages.jsonl is optional */
-    }
-
-    return {
-        title: typeof datapackage.title === 'string' ? datapackage.title : '',
-        warcGz,
-        indexLines,
-        pagesText,
-        datapackage,
-    };
-}
-
-function resource(name: string, p: string, data: Buffer): Record<string, unknown> {
-    return {
-        name,
-        path: p,
-        hash: 'sha256:' + crypto.createHash('sha256').update(data).digest('hex'),
-        bytes: data.length,
-    };
-}
-
-function indexLine(url: string, ts: string, status: number, mime: string, digest: string, offset: number, length: number): string {
-    const json = {
-        url,
-        digest,
-        mime,
-        offset,
-        length,
-        status,
-        filename: 'data.warc.gz',
-    };
-    return `${surtKey(url)} ${ts} ${JSON.stringify(json)}`;
 }
 
 function writeWacz(opts: {
