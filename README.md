@@ -13,7 +13,7 @@ a browser.
 ## Capture URLs into a WACZ
 
 ```
-npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."] [--accept="..."] [--accept-language="..."]
+npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."] [--accept="..."] [--accept-language="..."] [--wayback]
 ```
 
 `my-urls.txt` holds one URL per line (blank lines and `#` comments are
@@ -36,6 +36,27 @@ archived: the WARC record vocabulary has no standard field for a capture error,
 so (rather than inventing a non-standard extension) nothing is written for the
 URL, matching ArchiveWeb.page. A fresh archive begins with a single `warcinfo`
 record describing the crawl (`software`, `format`, `isPartOf`).
+
+### Capturing Wayback Machine replays as pure originals (`--wayback`)
+
+By default the downloader fetches each URL directly. With `--wayback`, each
+url-list line is instead treated as a **Wayback Machine replay URL**
+(`https://web.archive.org/web/<ts>[mod_]/<url>`), and the downloader fetches the
+`id_` form of it — the identity route that serves the archived bytes **exactly
+as captured**, with no link rewriting, no toolbar, and no injected scripts. The
+result is a WACZ that looks as if the pages were captured directly, in the past:
+the response is stored under the inner `<url>`, its headers are rebuilt from the
+historical `X-Archive-Orig-*` values (so `server: nginx` / CSP never leak in),
+and it is stamped with the *historical* capture timestamp rather than the
+current wall clock.
+
+Every modifier is rewritten to `id_`, not just the bare page route: `im_` images
+already equal `id_` (images are not rewritten), but `cs_`/`js_` carry a Wayback
+footer and URL rewriting that only `id_` removes. This is the byte-for-byte
+faithful capture path — the replayed routes (`im_`/`cs_`/`js_`/bare) lose
+information (relative paths made absolute, tag case and quoting normalized) that
+cannot be recovered afterward, so a faithful archive must fetch `id_` from the
+start. Any line that is not a Wayback replay URL is skipped with a warning.
 
 The download is **incremental**: if `--output-file` already exists, it is
 appended to rather than replaced. URLs already in the archive are skipped (not

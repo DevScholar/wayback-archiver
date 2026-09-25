@@ -21,6 +21,10 @@
  *   --accept-language `Accept-Language` header to fetch with (defaults to
  *                     `en-US,en;q=0.9`). Recorded in the request record.
  *   --concurrency     number of parallel fetches (default 8).
+ *   --wayback         treat each URL as a Wayback Machine replay URL
+ *                     (`https://web.archive.org/web/<ts>[mod_]/<url>`): fetch its
+ *                     `id_` form and store the original bytes under the inner
+ *                     URL, stamped at the historical capture time.
  *
  * Incremental: if `--output-file` already exists it is treated as the existing
  * archive. URLs already captured in it are skipped (not re-fetched), and only
@@ -65,10 +69,11 @@ interface Args {
     accept?: string;
     acceptLanguage?: string;
     concurrency: number;
+    wayback: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-    const args: Args = { urlList: '', outputFile: '', concurrency: 8 };
+    const args: Args = { urlList: '', outputFile: '', concurrency: 8, wayback: false };
     for (const a of argv) {
         const eq = a.indexOf('=');
         const key = eq >= 0 ? a.slice(0, eq) : a;
@@ -80,9 +85,10 @@ function parseArgs(argv: string[]): Args {
         else if (key === '--accept') args.accept = val;
         else if (key === '--accept-language') args.acceptLanguage = val;
         else if (key === '--concurrency') args.concurrency = parseInt(val, 10) || 8;
+        else if (key === '--wayback') args.wayback = true;
     }
     if (!args.urlList) {
-        console.error('Usage: npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."] [--accept="..."] [--accept-language="..."]');
+        console.error('Usage: npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."] [--accept="..."] [--accept-language="..."] [--concurrency 8] [--wayback]');
         process.exit(1);
     }
     if (!args.outputFile) {
@@ -106,6 +112,117 @@ function readUrlList(filePath: string): string[] {
         }
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Wayback replay URLs (--wayback)
+// ---------------------------------------------------------------------------
+
+/** A parsed Wayback replay URL: `https://web.archive.org/web/<ts>[mod_]/<url>`. */
+interface WaybackTarget {
+    /** 14-digit capture timestamp from the URL path. */
+    ts14: string;
+    /** The inner, original URL the capture is of (percent-decoded). */
+    innerUrl: string;
+    /** The `id_` replay URL that serves the capture's original bytes verbatim. */
+    idUrl: string;
+}
+
+const WAYBACK_URL_RE = /^https:\/\/web\.archive\.org\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i;
+
+/**
+ * Parse a Wayback replay URL into its capture timestamp and inner URL, and
+ * rewrite it to the `id_` form that serves the original bytes with no link
+ * rewriting. Returns null when `url` is not a Wayback replay URL.
+ *
+ * The `id_` modifier is the identity route: unlike the `im_`/`cs_`/`js_` (and
+ * bare) routes, which Wayback rewrites for replay, `id_` returns the archived
+ * bytes exactly as captured -- the only route from which a byte-for-byte
+ * faithful copy can be recovered. Forcing every URL through `id_` (rather than
+ * only the bare page route) is deliberate: images are not rewritten (so `im_`
+ * already equals `id_`), but `cs_`/`js_` carry a Wayback footer and URL
+ * rewriting that only `id_` removes.
+ */
+function parseWaybackUrl(url: string): WaybackTarget | null {
+    const m = WAYBACK_URL_RE.exec(url);
+    if (!m) return null;
+    const ts14 = m[1].slice(0, 14);
+    let innerUrl: string;
+    try {
+        innerUrl = decodeURIComponent(m[3]);
+    } catch {
+        innerUrl = m[3];
+    }
+    // The scheme separator is sometimes percent-encoded (`http%3A//`).
+    innerUrl = innerUrl.replace(/%3a/gi, ':');
+    return {
+        ts14,
+        innerUrl,
+        idUrl: `https://web.archive.org/web/${ts14}id_/${innerUrl}`,
+    };
+}
+
+/** Wayback replay headers that must never leak into a faithfully restored
+ * record: the replay frontend's own framing and policy headers. */
+const WAYBACK_DROP_HEADERS = new Set([
+    'x-dns-prefetch-control', 'content-security-policy', 'permissions-policy',
+    'referrer-policy', 'server-timing', 'memento-datetime', 'link',
+    'x-app-server', 'x-archive-guessed-charset', 'x-archive-guessed-content-type',
+    'x-archive-redirect-reason', 'x-archive-src', 'x-as', 'x-location', 'x-na',
+    'x-nid', 'x-page-cache', 'x-rl', 'x-sd', 'x-tr', 'x-ts',
+    'connection', 'keep-alive', 'transfer-encoding',
+    'content-length', 'content-encoding',
+]);
+
+const ORIG_HEADER_PREFIX = 'x-archive-orig-';
+
+/**
+ * Rebuild an `id_` response's headers as if the era's server had answered
+ * directly. Wayback folds the historical headers under `X-Archive-Orig-<Name>`
+ * while serving its own modern headers on the same response; reconstruct from
+ * those alone when present, otherwise keep the response's own headers minus the
+ * replay framing. `content-length` is only kept when it still matches the body;
+ * `content-encoding`/`transfer-encoding` are always dropped (the body is stored
+ * decoded). `mime` is the fallback `content-type` when nothing declares one.
+ */
+function restoreWaybackHeaders(headers: [string, string][], mime: string, body: Buffer): [string, string][] {
+    const result: [string, string][] = [];
+    const seen = new Set<string>();
+    const push = (name: string, value: string) => {
+        const lower = name.toLowerCase();
+        if (seen.has(lower)) return;
+        seen.add(lower);
+        result.push([name, value]);
+    };
+    const isStaleFraming = (name: string) =>
+        name === 'content-encoding' || name === 'transfer-encoding';
+
+    const hasOrig = headers.some(([n]) => n.toLowerCase().startsWith(ORIG_HEADER_PREFIX));
+
+    if (hasOrig) {
+        for (const [name, value] of headers) {
+            const lower = name.toLowerCase();
+            if (!lower.startsWith(ORIG_HEADER_PREFIX)) continue;
+            const real = lower.slice(ORIG_HEADER_PREFIX.length);
+            if (isStaleFraming(real)) continue;
+            if (real === 'content-length') {
+                if (Number(value) === body.length) push(real, value);
+                continue;
+            }
+            push(real, value);
+        }
+    } else {
+        for (const [name, value] of headers) {
+            const lower = name.toLowerCase();
+            if (lower.startsWith(ORIG_HEADER_PREFIX)) continue;
+            if (WAYBACK_DROP_HEADERS.has(lower)) continue;
+            if (isStaleFraming(lower) || lower === 'content-length') continue;
+            push(name, value);
+        }
+    }
+
+    if (!seen.has('content-type')) push('content-type', mime || 'application/octet-stream');
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -568,11 +685,29 @@ async function main(): Promise<void> {
     const outputFile = path.resolve(args.outputFile);
     const basename = path.basename(outputFile).replace(/\.wacz$/i, '');
 
+    // In --wayback mode each url-list line is a Wayback replay URL; parse it to
+    // its inner identity URL and the `id_` form to fetch. The "already archived"
+    // check and the stored record are keyed on the inner URL (a replay URL and
+    // its inner identity are the same capture), so a later incremental run over
+    // the same replay list still dedupes.
+    const waybackByUrl = new Map<string, WaybackTarget>();
+    if (args.wayback) {
+        for (const u of urls) {
+            const t = parseWaybackUrl(u);
+            if (t) waybackByUrl.set(u, t);
+            else console.log(`warn: not a Wayback replay URL, skipping: ${u}`);
+        }
+    }
+
     const existing = loadExisting(outputFile);
     const existingUrls = new Set(
         existing ? parseCdxj(existing.indexLines.join('\n')).map((e) => e.url) : [],
     );
-    const toFetch = urls.filter((u) => !existingUrls.has(u));
+    const toFetch = urls.filter((u) => {
+        if (args.wayback && !waybackByUrl.has(u)) return false;
+        const key = args.wayback ? waybackByUrl.get(u)!.innerUrl : u;
+        return !existingUrls.has(key);
+    });
     const skipped = urls.length - toFetch.length;
     const title = args.title ?? (existing && existing.title ? existing.title : basename);
     const userAgent = args.userAgent || DEFAULT_USER_AGENT;
@@ -586,6 +721,7 @@ async function main(): Promise<void> {
     console.log('User-Agent: ' + userAgent);
     console.log('Accept: ' + accept);
     console.log('Accept-Language: ' + acceptLanguage);
+    if (args.wayback) console.log('Mode:      wayback (id_ identity capture)');
     console.log(`${skipped} already archived, fetching ${toFetch.length} URL(s) (concurrency ${args.concurrency})...\n`);
 
     const newRecords: NewRecord[] = [];
@@ -598,39 +734,61 @@ async function main(): Promise<void> {
             const i = cursor++;
             if (i >= toFetch.length) break;
             const url = toFetch[i];
+
+            // In --wayback mode `url` is a Wayback replay URL: fetch its `id_`
+            // form and store the original bytes under the inner URL, stamped at
+            // the *historical* capture time rather than the wall clock. The
+            // request record documents the `id_` URL that was actually fetched;
+            // the response records carry the inner identity.
+            const target = args.wayback ? waybackByUrl.get(url) : undefined;
+            const fetchTarget = target ? target.idUrl : url;
+            const storeUrl = target ? target.innerUrl : url;
+            const ts = target ? target.ts14 + '000' : nowTs17();
+            const dateRfc3339 = cdxjTsToRfc3339(ts);
+
             try {
-                const resp = await fetchUrl(url, userAgent, accept, acceptLanguage);
+                const resp = await fetchUrl(fetchTarget, userAgent, accept, acceptLanguage);
                 // One response record per hop, keyed to its own URL. Generate the
                 // IDs up front so the request record can reference the first hop.
                 const ids = resp.hops.map(() => `<urn:uuid:${crypto.randomUUID()}>`);
-                const requestRecord = buildRequestRecord(url, ids[0], resp.dateRfc3339, userAgent, accept, acceptLanguage);
+                const requestRecord = buildRequestRecord(fetchTarget, ids[0], dateRfc3339, userAgent, accept, acceptLanguage);
                 const hops: HopRecord[] = resp.hops.map((hop, j) => {
+                    const rawCtype = (hop.headers.find(([n]) => n.toLowerCase() === 'content-type')?.[1] || '').split(';')[0].trim();
+                    // In --wayback mode the hop URL is a Wayback replay URL we
+                    // unwrap back to the inner identity, and its headers are
+                    // rebuilt from the historical `X-Archive-Orig-*` values.
+                    let hopUrl = hop.url;
+                    let headers = hop.headers;
+                    if (target) {
+                        hopUrl = parseWaybackUrl(hop.url)?.innerUrl ?? storeUrl;
+                        headers = restoreWaybackHeaders(hop.headers, rawCtype || 'application/octet-stream', hop.body);
+                    }
+                    const ctype = (headers.find(([n]) => n.toLowerCase() === 'content-type')?.[1] || rawCtype || 'application/octet-stream').split(';')[0].trim();
+                    const mime = ctype || 'application/octet-stream';
                     const responseRecord = buildWarcRecord({
                         recordId: ids[j],
-                        targetUri: hop.url,
-                        dateRfc3339: resp.dateRfc3339,
+                        targetUri: hopUrl,
+                        dateRfc3339,
                         response: {
                             status: hop.status,
                             statusText: hop.statusText,
-                            headers: hop.headers,
+                            headers,
                             body: hop.body,
                         },
                     });
-                    const ctype = (hop.headers.find(([n]) => n.toLowerCase() === 'content-type')?.[1] || '').split(';')[0].trim();
-                    const mime = ctype || 'application/octet-stream';
-                    return { url: hop.url, status: hop.status, mime, digest: payloadDigest(hop.body), responseRecord };
+                    return { url: hopUrl, status: hop.status, mime, digest: payloadDigest(hop.body), responseRecord };
                 });
                 const finalHop = resp.hops[resp.hops.length - 1];
                 const finalMime = hops[hops.length - 1].mime;
                 newRecords.push({
-                    url,
-                    ts: nowTs17(),
+                    url: storeUrl,
+                    ts,
                     title: isHtmlMime(finalMime) ? extractTitle(finalHop.body) : undefined,
                     requestRecord,
                     hops,
                 });
                 ok++;
-                console.log(`[${id}] OK ${finalHop.status} ${url}`);
+                console.log(`[${id}] OK ${finalHop.status} ${storeUrl}`);
             } catch (e) {
                 failed++;
                 // A failed fetch is not archived: the WARC record vocabulary has
