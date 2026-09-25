@@ -36,7 +36,7 @@ renames files as `<prefix>~<n><ext>`.
 
 - `urls.csv` — header `File Name,Timestamp,Original URLs`, one row per exported
   file, sorted by file name. Timestamps are RFC3339 (`WARC-Date`).
-- `index.html` — a pre-generated index page listing the same rows, so the flat
+- `wayback-index.html` — a pre-generated index page listing the same rows, so the flat
   folder is browsable without the server.
 
 ## Link rewriting

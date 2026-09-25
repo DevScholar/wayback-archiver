@@ -61,7 +61,7 @@ export class PluginPipeline {
 // ---------------------------------------------------------------------------
 
 /** File name the flat exporter writes for its "not saved" page. */
-export const FLAT_NOT_FOUND_FILE = '404.html';
+export const FLAT_NOT_FOUND_FILE = 'unarchived-message.html';
 
 /** Build a flat-mode link to the local "not saved" page for an unsaved URL.
  * The original URL is passed (percent-encoded) so the page can show it. */

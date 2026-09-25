@@ -16,8 +16,8 @@
  * Two metadata files are written to the output root:
  *   urls.csv   -- "File Name,Timestamp,Original URLs" mapping, timestamps in
  *                WACZ-compatible RFC3339 form.
- *   index.html -- a pre-generated index page (the replay server also generates
- *                this on demand).
+ *   wayback-index.html -- a pre-generated index page (the replay server also
+ *                generates this on demand).
  *
  * The per-page screenshots (`urn:thumbnail:` and `urn:view:` records) are
  * large -- a PNG per page -- and are only used for the index-page preview, so
@@ -424,7 +424,7 @@ function main(): void {
     }
     fs.writeFileSync(path.join(outDir, 'urls.csv'), csvLines.join('\n') + '\n');
 
-    // index.html (pre-generated) -- lists the archive's *pages*, linking to the
+    // wayback-index.html (pre-generated) -- lists the archive's *pages*, linking to the
     // flat file name each page was exported to. The preview column is only
     // built when thumbnails were exported (`--with=thumbnail`), otherwise the
     // screenshot files don't exist and the column would point at nothing.
@@ -439,12 +439,12 @@ function main(): void {
             : undefined,
     );
     fs.writeFileSync(
-        path.join(outDir, 'index.html'),
+        path.join(outDir, 'wayback-index.html'),
         renderIndexPage(wacz.title, pageRows, ['Page', 'Timestamp', 'Original URL']),
     );
 
-    // 404.html -- the captive "not saved" page. Every unsaved URL reference is
-    // rewritten to `404.html?url=<original>`; a tiny inline script reads the
+    // unarchived-message.html -- the captive "not saved" page. Every unsaved URL reference is
+    // rewritten to `unarchived-message.html?url=<original>`; a tiny inline script reads the
     // original URL back out and displays it.
     fs.writeFileSync(path.join(outDir, FLAT_NOT_FOUND_FILE), renderNotFoundPage());
 
@@ -453,8 +453,8 @@ function main(): void {
     console.log(`  Files written: ${written}`);
     console.log(`  Skipped:       ${skipped}`);
     console.log('  urls.csv:      ' + path.join(outDir, 'urls.csv'));
-    console.log('  index.html:    ' + path.join(outDir, 'index.html'));
-    console.log('  404.html:      ' + path.join(outDir, FLAT_NOT_FOUND_FILE));
+    console.log('  wayback-index.html:    ' + path.join(outDir, 'wayback-index.html'));
+    console.log('  unarchived-message.html: ' + path.join(outDir, FLAT_NOT_FOUND_FILE));
 }
 
 main();

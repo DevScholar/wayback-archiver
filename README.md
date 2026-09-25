@@ -126,12 +126,12 @@ output root:
 
 - `urls.csv` — `File Name,Timestamp,Original URLs` mapping, timestamps in
   WACZ-compatible RFC3339 form.
-- `index.html` — a pre-generated index page.
+- `wayback-index.html` — a pre-generated index page.
 
 The per-page screenshots (`urn:thumbnail:` and `urn:view:` records) are large
 and are only used for the index-page preview, so they are **not exported by
 default**. Pass `--with=thumbnail` and/or `--with=view` to include them
-(`--with=thumbnail` also restores the preview column on `index.html`).
+(`--with=thumbnail` also restores the preview column on `wayback-index.html`).
 
 If `--out` is omitted, output defaults to `<archive>-html/` next to the archive.
 
