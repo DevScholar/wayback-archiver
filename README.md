@@ -69,34 +69,48 @@ in the request record).
 ## Restore a Wayback Machine capture
 
 ```
-npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>]
+npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3]
 ```
 
 When ArchiveWeb.page crawls `https://web.archive.org/web/<ts>/http://host/...`,
 it archives the replayed page *wrapped in Wayback's own chrome* (top toolbar,
-donation banner, `wombat.js`, `bundle-playback.js`, analytics) side by side with
-the real, third-party content, every URL rewritten to a `/web/<ts>[mod_]/<url>`
-route. This tool inverts those transforms to produce a WACZ that looks as if the
-pages were captured directly, in the past:
+donation banner, `wombat.js`, `bundle-playback.js`, analytics), every URL
+rewritten to a `/web/<ts>[mod_]/<url>` route. That replayed copy is *lossy*:
+wombat.js reserializes the DOM (tag case and quoting normalize, CRLF becomes LF,
+relative URLs become absolute), so the era's original bytes can never be
+recovered from it afterward.
 
-- drops every record hosted on `*.archive.org` (the Wayback chrome), keeping only
-  the real third-party content;
-- unwraps `/web/<ts>[mod_]/<url>` (and the absolute
-  `https://web.archive.org/web/<ts>[mod_]/<url>` form) back to the inner `<url>`;
-- strips the injected `<head>` scripts, the toolbar, and the trailing
-  "FILE ARCHIVED ON ..." footer from HTML;
-- follows 302 redirect chains and WARC `revisit` references to the final record,
-  then stamps it with the *actual* capture time (the final URL's timestamp or
-  `x-archive-orig-date`), not the requested replay time — including converting
-  Wayback's "redirect notice" interstitials back into real 3xx records;
+This tool therefore does not try to un-rewrite the replayed bytes. It reads the
+*list* of Wayback replay URLs the input WACZ captured, and for each one fetches a
+fresh copy of its `id_` identity route — the route that serves the archived
+bytes exactly as captured, with no rewriting and no chrome. The result is a WACZ
+that looks as if the pages were captured directly, in the past:
+
+- unwraps each `/web/<ts>[mod_]/<url>` to its `id_` form, fetches it, and stores
+  the original bytes under the inner `<url>`;
 - restores the historical HTTP headers from `X-Archive-Orig-*`, so a modern
   replay artifact (`server: nginx`, CSP, `cache-control`) never leaks into the
-  restored record.
+  restored record;
+- stamps each record with its *historical* capture time, not the wall clock;
+- follows 302 redirect chains hop by hop, archiving each hop under its own URL.
 
-Every record Wayback actually served is kept verbatim, including empty bodies,
-error pages, and tiny stubs. If `--output-file` is omitted, output defaults to
-`<archive>-restored.wacz` next to the input; the title defaults to
-`<original-title> (restored)`.
+Binary media are the one exception that never hit the network: Wayback only
+rewrites HTML/CSS/JavaScript bodies, so an `im_` (image), `oe_` (embedded
+object — `.dcr`, `.exe`, `.wav`, plugin data), or `id_` capture already in the
+input WACZ is byte-for-byte the identity, and the restorer reuses it locally
+rather than re-fetching it. Only pages (`cs_`/`js_`/bare) need a fresh `id_`
+request. A reused record whose own content type turns out to be text (an HTML
+error page served for a missing image, say) is re-fetched instead, since that
+body *was* rewritten.
+
+A resource that cannot be re-fetched is skipped: a network error writes nothing,
+and a rate limit (429) is moved onto a separate slow queue and retried at
+`--rate-limit-delay` with backoff before also being skipped. The **download is
+incremental**: if `--output-file` already exists, URLs it already holds are
+skipped, so re-running resumes where a previous run left off. Fetches use a
+normal browser `User-Agent` (the same Edge 150 string as the downloader) so
+Wayback does not serve a bot response. If `--output-file` is omitted, output
+defaults to `<archive>-restored.wacz` next to the input.
 
 ## Export to standalone HTML
 
