@@ -11,7 +11,7 @@
  *      url-fixer-shim.ts) -- mirroring how the Wayback Machine injects
  *      wombat.js rather than inlining it.
  *
- * The injection is wrapped in `<!-- BEGIN/END URL FIXER INSERT -->` comment
+ * The injection is wrapped in `<!-- BEGIN/END WAYBACK ARCHIVER INSERT -->` comment
  * markers and puts each tag on its own line, the same way Wayback bounds its
  * own toolbar insertion. The shim must run before any page script so its
  * URL-producing-API patches are in place before the page makes its first
@@ -47,10 +47,10 @@ export function createUrlFixerPlugin(): ResponsePlugin {
             // One tag per line, bounded by comment markers, mirroring Wayback's
             // toolbar-insert convention.
             const injection = [
-                '<!-- BEGIN URL FIXER INSERT -->',
+                '<!-- BEGIN WAYBACK ARCHIVER INSERT -->',
                 `<script>window.__urlFixerConfig=${JSON.stringify(config)};</script>`,
                 `<script src="${URL_FIXER_SCRIPT_ROUTE}"></script>`,
-                '<!-- END URL FIXER INSERT -->',
+                '<!-- END WAYBACK ARCHIVER INSERT -->',
             ].join('\n');
 
             const html = ctx.body.toString('latin1');
