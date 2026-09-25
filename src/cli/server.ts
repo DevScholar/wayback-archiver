@@ -147,6 +147,53 @@ function shouldRewrite(mime: string, status: number, identity: boolean): boolean
     return detectContentKind(mime) !== null;
 }
 
+/** An inclusive byte range `[start, end]`, resolved and clamped against a
+ * known total length. */
+interface ByteRange {
+    start: number;
+    end: number;
+}
+
+/**
+ * Parse a single `Range: bytes=...` header against a body of `total` bytes.
+ *
+ * Returns:
+ *   - a clamped, inclusive `{ start, end }` when the range is satisfiable;
+ *   - `null` when there is no range header (serve the whole body);
+ *   - `'invalid'` when the range is malformed or unsatisfiable (416).
+ *
+ * Only a single range is handled (`bytes=0-`, `bytes=500-999`, `bytes=-2048`).
+ * A multi-range request (`bytes=0-99,200-299`) is treated as invalid rather
+ * than answered with a multipart/byteranges body, which browsers never send
+ * for `<video>` seeking anyway.
+ */
+function parseByteRange(header: string | undefined, total: number): ByteRange | null | 'invalid' {
+    if (!header) return null;
+    const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+    if (!m) return 'invalid';
+    const startStr = m[1];
+    const endStr = m[2];
+
+    if (startStr === '') {
+        // Suffix range: the final N bytes (`bytes=-N`).
+        if (endStr === '' || total === 0) return 'invalid';
+        const suffixLen = parseInt(endStr, 10);
+        if (suffixLen <= 0) return 'invalid';
+        return { start: Math.max(0, total - suffixLen), end: total - 1 };
+    }
+
+    const start = parseInt(startStr, 10);
+    if (endStr === '') {
+        // Open-ended range: from `start` to the end (`bytes=N-`).
+        if (start >= total) return 'invalid';
+        return { start, end: total - 1 };
+    }
+
+    const end = parseInt(endStr, 10);
+    if (start > end || start >= total) return 'invalid';
+    return { start, end: Math.min(end, total - 1) };
+}
+
 /**
  * Rebuild a replay's response headers, keeping every archived HTTP header
  * except the ones that *must* change:
@@ -214,7 +261,12 @@ function buildReplayHeaders(
     // Bodyless responses (204/304/1xx) must not carry a Content-Length
     // (RFC 7230 section 3.3.2); we end those without a body below.
     const bodyless = status === 204 || status === 304 || (status >= 100 && status < 200);
-    if (!bodyless) headers['content-length'] = String(body.length);
+    if (!bodyless) {
+        headers['content-length'] = String(body.length);
+        // Advertise range support so the browser may seek into a replay body
+        // (most usefully an archived video) with byte-range requests.
+        headers['accept-ranges'] = 'bytes';
+    }
     return headers;
 }
 
@@ -436,6 +488,36 @@ function main(): void {
                     return;
                 }
                 replayCache.set(reqUrl, rendered);
+            }
+
+            // Byte-range support (RFC 7233). A replay body is fully materialized
+            // in `rendered.body` before it is written, so a range request can be
+            // satisfied by slicing that buffer at zero cost. This is what lets a
+            // browser drag a `<video>` scrubber on an archived video: the media
+            // element probes with `Range: bytes=0-` first, then re-requests the
+            // exact byte spans it needs as the user seeks. The full body stays in
+            // `rendered.headers['content-length']`; a partial answer overrides it
+            // and adds `content-range`.
+            if (rendered.status === 200) {
+                const range = parseByteRange(req.headers.range, rendered.body.length);
+                if (range === 'invalid') {
+                    res.writeHead(416, {
+                        'Content-Range': `bytes */${rendered.body.length}`,
+                        'Content-Type': 'text/plain',
+                    });
+                    res.end('416 Range Not Satisfiable');
+                    return;
+                }
+                if (range) {
+                    const chunk = rendered.body.subarray(range.start, range.end + 1);
+                    const headers: Record<string, string> = { ...rendered.headers };
+                    delete headers['content-length'];
+                    headers['content-range'] = `bytes ${range.start}-${range.end}/${rendered.body.length}`;
+                    headers['content-length'] = String(chunk.length);
+                    res.writeHead(206, headers);
+                    res.end(chunk);
+                    return;
+                }
             }
 
             res.writeHead(rendered.status, rendered.statusText || undefined, rendered.headers);
