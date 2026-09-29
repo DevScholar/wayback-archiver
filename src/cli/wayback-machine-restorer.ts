@@ -551,27 +551,39 @@ async function main(): Promise<void> {
     const targetByInner = new Map<string, WaybackTarget>();
     const modifiersByInner = new Map<string, Set<string>>();
     const replayUrlByInner = new Map<string, string>();
+    const entryByInner = new Map<string, CdxjEntry>();
     const carried: CarriedRecord[] = [];
+
+    // Build a carried-over record from a CDXJ entry by copying its original
+    // gzip member bytes verbatim. Used for non-replay records directly, and as
+    // the fallback when a replay target cannot be re-fetched: rather than
+    // dropping the resource, its original replayed bytes are left untouched in
+    // the output so a later run can retry the restore against a complete archive.
+    const carryFromEntry = (e: CdxjEntry): CarriedRecord | null => {
+        const zipName = warcEntries.get(e.filename) || e.filename;
+        let raw: Buffer;
+        try {
+            raw = zip.storedRange(zipName, e.offset, e.length);
+        } catch {
+            return null;
+        }
+        return {
+            url: e.url,
+            key: e.key,
+            ts: e.timestamp,
+            json: e.json,
+            rawMember: raw,
+            isHtml: isHtmlMime(e.mime),
+            title: titleByUrl.get(e.url),
+        };
+    };
+
     for (const e of entries) {
         const wb = parseWaybackUrl(e.url);
         if (!wb) {
             // Leave as-is: copy the original member bytes and index entry.
-            const zipName = warcEntries.get(e.filename) || e.filename;
-            let raw: Buffer;
-            try {
-                raw = zip.storedRange(zipName, e.offset, e.length);
-            } catch {
-                continue; // unreadable member → nothing to carry over
-            }
-            carried.push({
-                url: e.url,
-                key: e.key,
-                ts: e.timestamp,
-                json: e.json,
-                rawMember: raw,
-                isHtml: isHtmlMime(e.mime),
-                title: titleByUrl.get(e.url),
-            });
+            const c = carryFromEntry(e);
+            if (c) carried.push(c);
             continue;
         }
         if (isArchiveOrgHost(hostOf(wb.innerUrl))) continue;
@@ -584,6 +596,7 @@ async function main(): Promise<void> {
         if (!prev || wb.ts14 < prev.ts14) {
             targetByInner.set(wb.innerUrl, wb);
             replayUrlByInner.set(wb.innerUrl, e.url);
+            entryByInner.set(wb.innerUrl, e);
         }
     }
 
@@ -596,10 +609,6 @@ async function main(): Promise<void> {
         .filter((t) => !existingUrls.has(t.innerUrl))
         .sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
 
-    // Carried (non-replay) records are also deduped against the output: a URL
-    // already present is left untouched rather than written a second time.
-    const carriedToWrite = carried.filter((c) => !existingUrls.has(c.url));
-
     // Split: a URL reached only via `im_`/`id_` has its identity bytes already
     // captured locally; every other URL must be re-fetched over the network.
     const reuseLocally: WaybackTarget[] = [];
@@ -610,6 +619,17 @@ async function main(): Promise<void> {
         if (onlyReusable) reuseLocally.push(t);
         else targets.push(t);
     }
+
+    // When a replay target cannot be restored -- a failed `id_` fetch, an
+    // exhausted rate limit, or a local body that could not be resolved -- leave
+    // the original record untouched in the output instead of dropping it, so a
+    // later run can retry the restore against a still-complete archive.
+    const carryOnFailure = (t: WaybackTarget): void => {
+        const entry = entryByInner.get(t.innerUrl);
+        if (!entry) return;
+        const c = carryFromEntry(entry);
+        if (c) carried.push(c);
+    };
 
     const basename = path.basename(args.outputFile).replace(/\.wacz$/i, '');
     const title = args.title ?? (existing && existing.title ? existing.title : basename);
@@ -622,7 +642,7 @@ async function main(): Promise<void> {
     console.log('Output:    ' + args.outputFile + (existing ? ' (appending)' : ' (new)'));
     console.log('Title:     ' + title);
     console.log('User-Agent: ' + userAgent);
-    console.log(`${existingUrls.size} already restored, reusing ${reuseLocally.length} locally (im_), fetching ${targets.length} URL(s), carrying over ${carriedToWrite.length} (concurrency ${args.concurrency})...\n`);
+    console.log(`${existingUrls.size} already restored, reusing ${reuseLocally.length} locally (im_), fetching ${targets.length} URL(s), carrying over ${carried.length} (concurrency ${args.concurrency})...\n`);
 
     const kept: KeptRecord[] = [];
     const keptPages: Record<string, unknown>[] = [];
@@ -644,7 +664,8 @@ async function main(): Promise<void> {
         const rec = resolved.record ?? byReplayUrl.get(start);
         if (!rec || rec.body.length === 0) {
             failed++;
-            console.log(`REUSE SKIP (no local body) ${t.innerUrl}`);
+            carryOnFailure(t);
+            console.log(`REUSE SKIP (no local body) ${t.innerUrl} (left as-is)`);
             continue;
         }
         const rawCtype = (rec.httpHeaders.get('content-type') || '').split(';')[0].trim();
@@ -723,7 +744,8 @@ async function main(): Promise<void> {
             }
             if (outcome.kind === 'error') {
                 failed++;
-                console.log(`[${id}] FAIL ${outcome.message} | ${t.innerUrl}`);
+                carryOnFailure(t);
+                console.log(`[${id}] FAIL ${outcome.message} | ${t.innerUrl} (left as-is)`);
                 continue;
             }
             recordOk(t, outcome.hops);
@@ -753,13 +775,15 @@ async function main(): Promise<void> {
                 await sleep(args.rateLimitDelay * item.retries);
             } else {
                 failed++;
-                console.log(`FAIL gave up after ${args.max429Retries} rate-limit retries | ${item.target.innerUrl}`);
+                carryOnFailure(item.target);
+                console.log(`FAIL gave up after ${args.max429Retries} rate-limit retries | ${item.target.innerUrl} (left as-is)`);
             }
             continue;
         }
         if (outcome.kind === 'error') {
             failed++;
-            console.log(`SLOW FAIL ${outcome.message} | ${item.target.innerUrl}`);
+            carryOnFailure(item.target);
+            console.log(`SLOW FAIL ${outcome.message} | ${item.target.innerUrl} (left as-is)`);
             continue;
         }
         recordOk(item.target, outcome.hops);
@@ -770,6 +794,18 @@ async function main(): Promise<void> {
     }
 
     kept.sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
+
+    // Carried records are deduped against the output: a URL already present is
+    // left untouched rather than written a second time. This also collapses a
+    // carried-over replay record back out when the same URL was also carried by
+    // a successful restore (both flows can push the same URL into `carried`).
+    const seenCarried = new Set<string>();
+    const carriedToWrite = carried.filter((c) => {
+        if (existingUrls.has(c.url)) return false;
+        if (seenCarried.has(c.url)) return false;
+        seenCarried.add(c.url);
+        return true;
+    });
     carriedToWrite.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
     console.log(`\n${ok} restored, ${failed} skipped, ${carriedToWrite.length} carried over`);
