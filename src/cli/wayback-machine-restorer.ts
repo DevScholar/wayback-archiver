@@ -42,7 +42,7 @@
  * drained one at a time at `--rate-limit-delay` with backoff.
  *
  * Usage:
- *   npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3]
+ *   npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline]
  */
 
 import * as path from 'path';
@@ -76,15 +76,40 @@ interface Args {
     rateLimitDelay: number;
     /** Extra attempts beyond the first for a URL that keeps answering 429. */
     max429Retries: number;
+    /** Fail every fetch immediately without opening a socket (for offline runs). */
+    offline: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-    const args: Args = { input: '', outputFile: '', concurrency: 8, rateLimitDelay: 3000, max429Retries: 3 };
+    const args: Args = { input: '', outputFile: '', concurrency: 8, rateLimitDelay: 3000, max429Retries: 3, offline: false };
     const positional: string[] = [];
-    for (const a of argv) {
+
+    // `--flag value` (space-separated) and `--flag=value` are both accepted.
+    // For a space-separated flag that expects a value, the next argv token is
+    // its value unless it looks like another flag.
+    const VALUE_FLAGS = new Set([
+        '--output-file', '--title', '--concurrency', '--user-agent',
+        '--accept', '--accept-language', '--rate-limit-delay', '--max-429-retries',
+    ]);
+    const takeValue = (i: number): { val: string; next: number } => {
+        const eq = argv[i].indexOf('=');
+        if (eq >= 0) return { val: argv[i].slice(eq + 1), next: i };
+        const nxt = argv[i + 1];
+        if (nxt !== undefined && !nxt.startsWith('--')) return { val: nxt, next: i + 1 };
+        return { val: '', next: i };
+    };
+
+    for (let i = 0; i < argv.length; i++) {
+        const a = argv[i];
         const eq = a.indexOf('=');
         const key = eq >= 0 ? a.slice(0, eq) : a;
-        const val = eq >= 0 ? a.slice(eq + 1) : '';
+        let val = eq >= 0 ? a.slice(eq + 1) : '';
+        if (eq < 0 && VALUE_FLAGS.has(key)) {
+            const r = takeValue(i);
+            val = r.val;
+            i = r.next;
+        }
+
         if (key === '--output-file') args.outputFile = val;
         else if (key === '--title') args.title = val;
         else if (key === '--concurrency') args.concurrency = parseInt(val, 10) || 8;
@@ -93,11 +118,12 @@ function parseArgs(argv: string[]): Args {
         else if (key === '--accept-language') args.acceptLanguage = val;
         else if (key === '--rate-limit-delay') args.rateLimitDelay = parseInt(val, 10) || 3000;
         else if (key === '--max-429-retries') args.max429Retries = parseInt(val, 10) || 3;
+        else if (key === '--offline') args.offline = true;
         else if (!a.startsWith('--')) positional.push(a);
     }
     if (positional.length > 0) args.input = path.resolve(positional[0]);
     if (!args.input) {
-        console.error('Usage: npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3]');
+        console.error('Usage: npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline]');
         process.exit(1);
     }
     if (!args.outputFile) {
@@ -133,7 +159,12 @@ type FetchOutcome =
  * queue. Bodies are decompressed transparently so the stored record carries the
  * decoded payload.
  */
-function fetchOnce(url: string, userAgent: string, accept: string, acceptLanguage: string): Promise<FetchOutcome> {
+function fetchOnce(url: string, userAgent: string, accept: string, acceptLanguage: string, offline = false): Promise<FetchOutcome> {
+    // `--offline` short-circuits the fetch: no socket is opened, so archive.org
+    // can be "unreachable" without waiting out a real connection timeout. Every
+    // target then fails instantly and is carried over as-is, leaving the archive
+    // unchanged.
+    if (offline) return Promise.resolve({ kind: 'error', message: 'offline (no network access)' });
     return new Promise((resolve) => {
         const hops: FetchedHop[] = [];
         const attempt = (current: string, redirects: number): void => {
@@ -551,7 +582,11 @@ async function main(): Promise<void> {
     const targetByInner = new Map<string, WaybackTarget>();
     const modifiersByInner = new Map<string, Set<string>>();
     const replayUrlByInner = new Map<string, string>();
-    const entryByInner = new Map<string, CdxjEntry>();
+    // Every CDXJ entry per inner URL, not just the earliest: a replay URL may
+    // have been captured several times, and a failed restore must carry ALL of
+    // its original entries over verbatim (not collapse them to one), to keep the
+    // archive lossless.
+    const entriesByInner = new Map<string, CdxjEntry[]>();
     const carried: CarriedRecord[] = [];
 
     // Build a carried-over record from a CDXJ entry by copying its original
@@ -596,8 +631,10 @@ async function main(): Promise<void> {
         if (!prev || wb.ts14 < prev.ts14) {
             targetByInner.set(wb.innerUrl, wb);
             replayUrlByInner.set(wb.innerUrl, e.url);
-            entryByInner.set(wb.innerUrl, e);
         }
+        const list = entriesByInner.get(wb.innerUrl) ?? [];
+        list.push(e);
+        entriesByInner.set(wb.innerUrl, list);
     }
 
     // Incremental: skip inner URLs the output already holds.
@@ -613,6 +650,8 @@ async function main(): Promise<void> {
 
     // Split: a URL reached only via `im_`/`id_` has its identity bytes already
     // captured locally; every other URL must be re-fetched over the network.
+    // Local reuse needs no network, so it still succeeds under `--offline`; only
+    // the network fetch path is short-circuited to an instant failure.
     const reuseLocally: WaybackTarget[] = [];
     const targets: WaybackTarget[] = [];
     for (const t of pending) {
@@ -627,10 +666,12 @@ async function main(): Promise<void> {
     // the original record untouched in the output instead of dropping it, so a
     // later run can retry the restore against a still-complete archive.
     const carryOnFailure = (t: WaybackTarget): void => {
-        const entry = entryByInner.get(t.innerUrl);
-        if (!entry) return;
-        const c = carryFromEntry(entry);
-        if (c) carried.push(c);
+        // Carry ALL original entries for the failed inner URL, not just the
+        // earliest, so a duplicate capture is preserved losslessly.
+        for (const entry of entriesByInner.get(t.innerUrl) ?? []) {
+            const c = carryFromEntry(entry);
+            if (c) carried.push(c);
+        }
     };
 
     const basename = path.basename(args.outputFile).replace(/\.wacz$/i, '');
@@ -738,7 +779,7 @@ async function main(): Promise<void> {
             const i = cursor++;
             if (i >= targets.length) break;
             const t = targets[i];
-            const outcome = await fetchOnce(t.idUrl, userAgent, accept, acceptLanguage);
+            const outcome = await fetchOnce(t.idUrl, userAgent, accept, acceptLanguage, args.offline);
             if (outcome.kind === 'rate-limited') {
                 slowQueue.push({ target: t, retries: 0 });
                 console.log(`[${id}] RATE-LIMITED ${t.innerUrl}`);
@@ -768,7 +809,7 @@ async function main(): Promise<void> {
     }
     while (slowQueue.length > 0) {
         const item = slowQueue.shift()!;
-        const outcome = await fetchOnce(item.target.idUrl, userAgent, accept, acceptLanguage);
+        const outcome = await fetchOnce(item.target.idUrl, userAgent, accept, acceptLanguage, args.offline);
         if (outcome.kind === 'rate-limited') {
             if (item.retries < args.max429Retries) {
                 item.retries++;
