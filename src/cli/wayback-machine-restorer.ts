@@ -602,9 +602,11 @@ async function main(): Promise<void> {
 
     // Incremental: skip inner URLs the output already holds.
     const existing = loadExisting(args.outputFile);
-    const existingUrls = new Set(
-        existing ? parseCdxj(existing.indexLines.join('\n')).map((e) => e.url) : [],
-    );
+    const existingEntries = existing ? parseCdxj(existing.indexLines.join('\n')) : [];
+    const existingUrls = new Set(existingEntries.map((e) => e.url));
+    // Carried records are identified by URL *and* timestamp (a URL may have
+    // been captured several times), so dedupe against the output by that pair.
+    const existingCarriedKeys = new Set(existingEntries.map((e) => `${e.url}\t${e.timestamp}`));
     const pending = [...targetByInner.values()]
         .filter((t) => !existingUrls.has(t.innerUrl))
         .sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
@@ -795,15 +797,17 @@ async function main(): Promise<void> {
 
     kept.sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
 
-    // Carried records are deduped against the output: a URL already present is
-    // left untouched rather than written a second time. This also collapses a
-    // carried-over replay record back out when the same URL was also carried by
-    // a successful restore (both flows can push the same URL into `carried`).
+    // Carried records are deduped by URL + timestamp: a URL captured several
+    // times keeps every capture. The set guards both against the output (so a
+    // re-run appends only new captures) and against a URL that appears twice in
+    // `carried` (a replay record carried on failure can coincide with the
+    // successful-restore flow).
     const seenCarried = new Set<string>();
     const carriedToWrite = carried.filter((c) => {
-        if (existingUrls.has(c.url)) return false;
-        if (seenCarried.has(c.url)) return false;
-        seenCarried.add(c.url);
+        const key = `${c.url}\t${c.ts}`;
+        if (existingCarriedKeys.has(key)) return false;
+        if (seenCarried.has(key)) return false;
+        seenCarried.add(key);
         return true;
     });
     carriedToWrite.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
