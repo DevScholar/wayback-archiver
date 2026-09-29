@@ -54,9 +54,9 @@ import { ZipReader } from '../archive/zip.js';
 import { writeZipFile } from '../archive/zip-writer.js';
 import { buildWarcRecord, buildWarcinfoRecord, payloadDigest } from '../archive/warc-writer.js';
 import { parseWarcRecord, WarcRecord } from '../archive/warc.js';
-import { parseCdxj } from '../archive/cdxj.js';
+import { parseCdxj, type CdxjEntry } from '../archive/cdxj.js';
 import { cdxjTsToRfc3339 } from '../lib/time.js';
-import { parseWaybackUrl, restoreWaybackHeaders, type WaybackTarget, URN_SCREENSHOT_RE, hostOf, isArchiveOrgHost } from '../lib/wayback.js';
+import { parseWaybackUrl, restoreWaybackHeaders, type WaybackTarget, hostOf, isArchiveOrgHost } from '../lib/wayback.js';
 import { DEFAULT_USER_AGENT, DEFAULT_ACCEPT, DEFAULT_ACCEPT_LANGUAGE, clientHeaders, collectHeaders, sleep, buildRequestRecord } from '../lib/http.js';
 import { SOFTWARE, isHtmlMime, loadExisting, resource, indexLine, type ExistingArchive } from '../archive/wacz-append.js';
 
@@ -306,6 +306,29 @@ interface KeptRecord {
     requestRecord?: Buffer;
 }
 
+/**
+ * A non-replay record carried over verbatim. Rather than being re-fetched or
+ * re-serialized, the original gzip member bytes are copied unchanged into the
+ * output stream and re-indexed at their new offset, preserving every original
+ * CDXJ field except offset/length.
+ */
+interface CarriedRecord {
+    /** The record's URL, unchanged. */
+    url: string;
+    /** The original SURT sort key from the CDXJ line. */
+    key: string;
+    /** The original 17-digit CDXJ timestamp. */
+    ts: string;
+    /** The original CDXJ JSON object (offset/length updated at write time). */
+    json: Record<string, unknown>;
+    /** The original gzip member bytes, verbatim. */
+    rawMember: Buffer;
+    /** Whether the CDXJ mime is HTML, deciding whether it is listed as a page. */
+    isHtml: boolean;
+    /** Page title from the input pages.jsonl, when present. */
+    title?: string;
+}
+
 /** True when Wayback would have rewritten a body of this content type. These
  * are the text formats that go through the rewriter (HTML, CSS, JavaScript, and
  * the XML/SVG text types); every other type is served verbatim. Used to guard
@@ -330,13 +353,15 @@ function writeOutput(opts: {
     existing: ExistingArchive | null;
     kept: KeptRecord[];
     pages: Record<string, unknown>[];
+    carried: CarriedRecord[];
 }): void {
-    const { outputFile, title, existing, kept, pages } = opts;
+    const { outputFile, title, existing, kept, pages, carried } = opts;
 
     const nowIso = new Date().toISOString();
     const warcParts: Buffer[] = existing ? [existing.warcGz] : [];
     let offset = existing ? existing.warcGz.length : 0;
     const newIndexLines: string[] = [];
+    const carriedPages: Record<string, unknown>[] = [];
 
     // A fresh archive begins with a `warcinfo` record describing the restore,
     // mirroring the downloader. On append the existing stream (and its own
@@ -380,21 +405,41 @@ function writeOutput(opts: {
         newIndexLines.push(indexLine(r.innerUrl, r.ts17, r.status, r.mime, payloadDigest(r.body), offset, member.length));
         offset += member.length;
     }
+
+    // Non-replay records carried over verbatim: the original gzip member bytes
+    // are copied unchanged and re-indexed at their new offset, preserving every
+    // other CDXJ field (including any non-standard ones the source tool wrote).
+    for (const c of carried) {
+        const member = c.rawMember;
+        warcParts.push(member);
+        const json = { ...c.json, offset, length: member.length };
+        newIndexLines.push(`${c.key} ${c.ts} ${JSON.stringify(json)}`);
+        offset += member.length;
+
+        if (c.isHtml) {
+            carriedPages.push({
+                url: c.url,
+                ts: cdxjTsToRfc3339(c.ts),
+                title: c.title || c.url,
+            });
+        }
+    }
     const warcGz = Buffer.concat(warcParts);
 
     const allIndexLines = [...(existing ? existing.indexLines : []), ...newIndexLines].sort();
     const cdx = Buffer.from(allIndexLines.join('\n') + '\n', 'utf-8');
 
+    const allPages = [...pages, ...carriedPages];
     let pagesText: string;
     if (existing && existing.pagesText) {
         pagesText =
             existing.pagesText.replace(/\s+$/, '') +
             '\n' +
-            pages.map((o) => JSON.stringify(o)).join('\n') +
+            allPages.map((o) => JSON.stringify(o)).join('\n') +
             '\n';
     } else {
         pagesText =
-            [{ format: 'json-pages-1.0', id: 'pages', title: 'All Pages' }, ...pages]
+            [{ format: 'json-pages-1.0', id: 'pages', title: 'All Pages' }, ...allPages]
                 .map((o) => JSON.stringify(o))
                 .join('\n') + '\n';
     }
@@ -448,10 +493,11 @@ async function main(): Promise<void> {
 
     const entries = parseCdxj(zip.readEntry(indexName).toString('utf8'));
 
-    // Original page titles, keyed by inner URL, for carrying over to the
-    // restored index. The input pages.jsonl lists each *Wayback* URL as its
-    // entry point; unwrap it back to the inner URL it will be restored under.
+    // Original page titles from pages.jsonl, keyed two ways: by the URL itself
+    // (for non-replay records carried over as-is) and by the inner URL of a
+    // Wayback replay entry (for restored pages).
     const titleByInnerUrl = new Map<string, string>();
+    const titleByUrl = new Map<string, string>();
     try {
         const origPages = zip.readEntry('pages/pages.jsonl').toString('utf8');
         for (const line of origPages.split(/\r?\n/)) {
@@ -463,6 +509,7 @@ async function main(): Promise<void> {
                 continue;
             }
             if (typeof obj.url !== 'string' || typeof obj.title !== 'string') continue;
+            titleByUrl.set(obj.url, obj.title);
             const wb = parseWaybackUrl(obj.url);
             if (wb) titleByInnerUrl.set(wb.innerUrl, obj.title);
         }
@@ -497,15 +544,34 @@ async function main(): Promise<void> {
     // routes each inner URL appeared under. A URL reached only via `im_` (or
     // `id_`) can be reused from the local capture; one also reached as a page
     // or `cs_`/`js_` must be re-fetched, since that route's bytes are rewritten.
-    // Screenshot URNs have no `id_` form and are dropped.
+    //
+    // Anything that is NOT a Wayback replay URL is carried over verbatim:
+    // screenshots (`urn:thumbnail`/`urn:view`), Wayback queries (site/CDX
+    // searches), other archive.org content, and resources from other sites.
     const targetByInner = new Map<string, WaybackTarget>();
     const modifiersByInner = new Map<string, Set<string>>();
     const replayUrlByInner = new Map<string, string>();
+    const carried: CarriedRecord[] = [];
     for (const e of entries) {
         const wb = parseWaybackUrl(e.url);
         if (!wb) {
-            if (URN_SCREENSHOT_RE.test(e.url)) continue;
-            if (isArchiveOrgHost(hostOf(e.url))) continue;
+            // Leave as-is: copy the original member bytes and index entry.
+            const zipName = warcEntries.get(e.filename) || e.filename;
+            let raw: Buffer;
+            try {
+                raw = zip.storedRange(zipName, e.offset, e.length);
+            } catch {
+                continue; // unreadable member → nothing to carry over
+            }
+            carried.push({
+                url: e.url,
+                key: e.key,
+                ts: e.timestamp,
+                json: e.json,
+                rawMember: raw,
+                isHtml: isHtmlMime(e.mime),
+                title: titleByUrl.get(e.url),
+            });
             continue;
         }
         if (isArchiveOrgHost(hostOf(wb.innerUrl))) continue;
@@ -530,6 +596,10 @@ async function main(): Promise<void> {
         .filter((t) => !existingUrls.has(t.innerUrl))
         .sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
 
+    // Carried (non-replay) records are also deduped against the output: a URL
+    // already present is left untouched rather than written a second time.
+    const carriedToWrite = carried.filter((c) => !existingUrls.has(c.url));
+
     // Split: a URL reached only via `im_`/`id_` has its identity bytes already
     // captured locally; every other URL must be re-fetched over the network.
     const reuseLocally: WaybackTarget[] = [];
@@ -552,7 +622,7 @@ async function main(): Promise<void> {
     console.log('Output:    ' + args.outputFile + (existing ? ' (appending)' : ' (new)'));
     console.log('Title:     ' + title);
     console.log('User-Agent: ' + userAgent);
-    console.log(`${existingUrls.size} already restored, reusing ${reuseLocally.length} locally (im_), fetching ${targets.length} URL(s) (concurrency ${args.concurrency})...\n`);
+    console.log(`${existingUrls.size} already restored, reusing ${reuseLocally.length} locally (im_), fetching ${targets.length} URL(s), carrying over ${carriedToWrite.length} (concurrency ${args.concurrency})...\n`);
 
     const kept: KeptRecord[] = [];
     const keptPages: Record<string, unknown>[] = [];
@@ -700,10 +770,11 @@ async function main(): Promise<void> {
     }
 
     kept.sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
+    carriedToWrite.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
-    console.log(`\n${ok} restored, ${failed} skipped`);
+    console.log(`\n${ok} restored, ${failed} skipped, ${carriedToWrite.length} carried over`);
 
-    if (kept.length === 0 && (!existing || args.title === undefined)) {
+    if (kept.length === 0 && carriedToWrite.length === 0 && (!existing || args.title === undefined)) {
         if (existing) {
             console.log('All URLs already restored and no title change — nothing to do.');
             return;
@@ -712,7 +783,7 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
-    writeOutput({ outputFile: args.outputFile, title, existing, kept, pages: keptPages });
+    writeOutput({ outputFile: args.outputFile, title, existing, kept, pages: keptPages, carried: carriedToWrite });
 
     console.log('\n=== Done ===');
     console.log('Wrote ' + args.outputFile);
