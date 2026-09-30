@@ -377,6 +377,79 @@ function isRewritableMime(mime: string): boolean {
     );
 }
 
+/**
+ * Rebuild an existing archive's WARC/index/pages with a set of carried Wayback
+ * records removed: those whose snapshot was just successfully restored, so the
+ * stale replayed copy no longer coexists with its restored inner-URL form (B2).
+ * Members are spliced out of `existing.warcGz` by their byte ranges; the
+ * un-indexed warcinfo/request members are untouched. Returns the cleaned
+ * `warcGz`, index lines (with remapped offsets), and pages text.
+ */
+export function dropStaleCarried(
+    existing: ExistingArchive,
+    restoredSnapKeys: Set<string>,
+): { warcGz: Buffer; indexLines: string[]; pagesText: string } {
+    const entries = parseCdxj(existing.indexLines.join('\n'));
+
+    // A carried Wayback replay URL whose snapshot was restored this run is stale.
+    const isStale = (e: CdxjEntry): boolean => {
+        const wb = parseWaybackUrl(e.url);
+        if (!wb) return false;
+        return restoredSnapKeys.has(wb.innerUrl + '\t' + wb.ts14);
+    };
+
+    const dropped = entries.filter(isStale).sort((a, b) => a.offset - b.offset);
+    if (dropped.length === 0) {
+        return { warcGz: existing.warcGz, indexLines: existing.indexLines, pagesText: existing.pagesText };
+    }
+
+    // Splice dropped byte ranges out of the stored WARC, and remap every kept
+    // entry's offset by the total length removed before it.
+    const kept = entries.filter((e) => !isStale(e));
+    const parts: Buffer[] = [];
+    let cursor = 0;
+    for (const d of dropped) {
+        if (d.offset > cursor) parts.push(existing.warcGz.subarray(cursor, d.offset));
+        cursor = d.offset + d.length;
+    }
+    if (cursor < existing.warcGz.length) parts.push(existing.warcGz.subarray(cursor));
+    const warcGz = Buffer.concat(parts);
+
+    const droppedRanges = dropped.map((d) => ({ start: d.offset, len: d.length }));
+
+    const newIndexLines: string[] = [];
+    for (const e of kept) {
+        let rem = 0;
+        for (const r of droppedRanges) {
+            if (r.start + r.len <= e.offset) rem += r.len;
+        }
+        const newOffset = e.offset - rem;
+        newIndexLines.push(`${e.key} ${e.timestamp} ${JSON.stringify({ ...e.json, offset: newOffset, length: e.length })}`);
+    }
+    newIndexLines.sort();
+
+    // Drop stale page entries (HTML carried records listed under their wayback
+    // URL) whose snapshot was restored.
+    let pagesText = existing.pagesText;
+    const stalePages = dropped.filter((e) => isHtmlMime(e.mime));
+    if (stalePages.length > 0 && pagesText) {
+        const staleUrls = new Set(stalePages.map((e) => e.url));
+        const lines = pagesText.split(/\r?\n/).filter((line) => {
+            const t = line.trim();
+            if (!t) return false;
+            try {
+                const o = JSON.parse(t);
+                return typeof o.url !== 'string' || !staleUrls.has(o.url);
+            } catch {
+                return true;
+            }
+        });
+        pagesText = lines.join('\n') + '\n';
+    }
+
+    return { warcGz, indexLines: newIndexLines, pagesText };
+}
+
 /** Write (or append to) the output WACZ. */
 function writeOutput(opts: {
     outputFile: string;
@@ -385,12 +458,20 @@ function writeOutput(opts: {
     kept: KeptRecord[];
     pages: Record<string, unknown>[];
     carried: CarriedRecord[];
+    restoredSnapKeys: Set<string>;
 }): void {
-    const { outputFile, title, existing, kept, pages, carried } = opts;
+    const { outputFile, title, existing, kept, pages, carried, restoredSnapKeys } = opts;
 
     const nowIso = new Date().toISOString();
-    const warcParts: Buffer[] = existing ? [existing.warcGz] : [];
-    let offset = existing ? existing.warcGz.length : 0;
+    let cleaned: { warcGz: Buffer; indexLines: string[]; pagesText: string } | null = null;
+    if (existing) {
+        cleaned = dropStaleCarried(existing, restoredSnapKeys);
+    }
+    const baseWarcGz = cleaned ? cleaned.warcGz : null;
+    const baseIndexLines = cleaned ? cleaned.indexLines : [];
+
+    const warcParts: Buffer[] = baseWarcGz ? [baseWarcGz] : [];
+    let offset = baseWarcGz ? baseWarcGz.length : 0;
     const newIndexLines: string[] = [];
     const carriedPages: Record<string, unknown>[] = [];
 
@@ -457,14 +538,14 @@ function writeOutput(opts: {
     }
     const warcGz = Buffer.concat(warcParts);
 
-    const allIndexLines = [...(existing ? existing.indexLines : []), ...newIndexLines].sort();
+    const allIndexLines = [...baseIndexLines, ...newIndexLines].sort();
     const cdx = Buffer.from(allIndexLines.join('\n') + '\n', 'utf-8');
 
     const allPages = [...pages, ...carriedPages];
     let pagesText: string;
-    if (existing && existing.pagesText) {
+    if (cleaned && cleaned.pagesText) {
         pagesText =
-            existing.pagesText.replace(/\s+$/, '') +
+            cleaned.pagesText.replace(/\s+$/, '') +
             '\n' +
             allPages.map((o) => JSON.stringify(o)).join('\n') +
             '\n';
@@ -570,23 +651,27 @@ async function main(): Promise<void> {
         }
     }
 
-    // Build the unique set of inner URLs to restore, keyed by inner URL and
-    // keeping the earliest capture time, while also recording which modifier
-    // routes each inner URL appeared under. A URL reached only via `im_` (or
-    // `id_`) can be reused from the local capture; one also reached as a page
-    // or `cs_`/`js_` must be re-fetched, since that route's bytes are rewritten.
+    // Restore targets are keyed by *snapshot* -- the inner URL together with its
+    // historical capture time. A single URL captured at several points in the
+    // past (e.g. `web/1998/...` and `web/1999/...`) is several distinct
+    // resources and each is restored (or carried on failure) independently,
+    // rather than collapsing them to the earliest capture.
+    //
+    // Within one snapshot, the same URL may appear under several modifier
+    // routes (bare, `im_`, `cs_`, ...); those are aggregated and restored once.
     //
     // Anything that is NOT a Wayback replay URL is carried over verbatim:
     // screenshots (`urn:thumbnail`/`urn:view`), Wayback queries (site/CDX
     // searches), other archive.org content, and resources from other sites.
-    const targetByInner = new Map<string, WaybackTarget>();
-    const modifiersByInner = new Map<string, Set<string>>();
-    const replayUrlByInner = new Map<string, string>();
-    // Every CDXJ entry per inner URL, not just the earliest: a replay URL may
-    // have been captured several times, and a failed restore must carry ALL of
-    // its original entries over verbatim (not collapse them to one), to keep the
+    const snapKey = (innerUrl: string, ts14: string): string => innerUrl + '\t' + ts14;
+    const targetBySnap = new Map<string, WaybackTarget>();
+    const modifiersBySnap = new Map<string, Set<string>>();
+    const replayUrlBySnap = new Map<string, string>();
+    // Every CDXJ entry per snapshot, not just one: a replay URL may have been
+    // captured several times, and a failed restore must carry ALL of its
+    // original entries over verbatim (not collapse them to one), to keep the
     // archive lossless.
-    const entriesByInner = new Map<string, CdxjEntry[]>();
+    const entriesBySnap = new Map<string, CdxjEntry[]>();
     const carried: CarriedRecord[] = [];
 
     // Build a carried-over record from a CDXJ entry by copying its original
@@ -623,52 +708,63 @@ async function main(): Promise<void> {
         }
         if (isArchiveOrgHost(hostOf(wb.innerUrl))) continue;
 
-        const mods = modifiersByInner.get(wb.innerUrl) ?? new Set<string>();
-        mods.add(wb.modifier);
-        modifiersByInner.set(wb.innerUrl, mods);
+        const sk = snapKey(wb.innerUrl, wb.ts14);
 
-        const prev = targetByInner.get(wb.innerUrl);
-        if (!prev || wb.ts14 < prev.ts14) {
-            targetByInner.set(wb.innerUrl, wb);
-            replayUrlByInner.set(wb.innerUrl, e.url);
+        const mods = modifiersBySnap.get(sk) ?? new Set<string>();
+        mods.add(wb.modifier);
+        modifiersBySnap.set(sk, mods);
+
+        if (!targetBySnap.has(sk)) {
+            targetBySnap.set(sk, wb);
+            replayUrlBySnap.set(sk, e.url);
         }
-        const list = entriesByInner.get(wb.innerUrl) ?? [];
+        const list = entriesBySnap.get(sk) ?? [];
         list.push(e);
-        entriesByInner.set(wb.innerUrl, list);
+        entriesBySnap.set(sk, list);
     }
 
-    // Incremental: skip inner URLs the output already holds.
+    // Incremental: skip snapshots the output already holds. A restored record's
+    // URL is its inner URL and its CDXJ timestamp is the historical capture time
+    // (17 digits), so "already restored" means that inner-URL+time pair exists in
+    // the output. This preserves B1 (no re-restoring an already-restored
+    // snapshot) while letting B3's multiple historical snapshots of one URL each
+    // be restored.
     const existing = loadExisting(args.outputFile);
     const existingEntries = existing ? parseCdxj(existing.indexLines.join('\n')) : [];
-    const existingUrls = new Set(existingEntries.map((e) => e.url));
+    const existingSnapshotKeys = new Set(
+        existingEntries
+            .filter((e) => !parseWaybackUrl(e.url)) // ignore carried wayback URLs
+            .map((e) => snapKey(e.url, e.timestamp.slice(0, 14))),
+    );
     // Carried records are identified by URL *and* timestamp (a URL may have
     // been captured several times), so dedupe against the output by that pair.
     const existingCarriedKeys = new Set(existingEntries.map((e) => `${e.url}\t${e.timestamp}`));
-    const pending = [...targetByInner.values()]
-        .filter((t) => !existingUrls.has(t.innerUrl))
+    const pending = [...targetBySnap.values()]
+        .filter((t) => !existingSnapshotKeys.has(snapKey(t.innerUrl, t.ts14)))
         .sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
 
-    // Split: a URL reached only via `im_`/`id_` has its identity bytes already
-    // captured locally; every other URL must be re-fetched over the network.
-    // Local reuse needs no network, so it still succeeds under `--offline`; only
-    // the network fetch path is short-circuited to an instant failure.
+    // Split: a snapshot reached only via `im_`/`id_` has its identity bytes
+    // already captured locally; every other snapshot must be re-fetched over the
+    // network. Local reuse needs no network, so it still succeeds under
+    // `--offline`; only the network fetch path is short-circuited to an instant
+    // failure.
     const reuseLocally: WaybackTarget[] = [];
     const targets: WaybackTarget[] = [];
     for (const t of pending) {
-        const mods = modifiersByInner.get(t.innerUrl) ?? new Set<string>();
+        const mods = modifiersBySnap.get(snapKey(t.innerUrl, t.ts14)) ?? new Set<string>();
         const onlyReusable = mods.size > 0 && [...mods].every((m) => REUSABLE_MODIFIERS.has(m));
         if (onlyReusable) reuseLocally.push(t);
         else targets.push(t);
     }
 
-    // When a replay target cannot be restored -- a failed `id_` fetch, an
-    // exhausted rate limit, or a local body that could not be resolved -- leave
-    // the original record untouched in the output instead of dropping it, so a
+    // When a snapshot cannot be restored -- a failed `id_` fetch, an exhausted
+    // rate limit, or a local body that could not be resolved -- leave its
+    // original record(s) untouched in the output instead of dropping them, so a
     // later run can retry the restore against a still-complete archive.
     const carryOnFailure = (t: WaybackTarget): void => {
-        // Carry ALL original entries for the failed inner URL, not just the
-        // earliest, so a duplicate capture is preserved losslessly.
-        for (const entry of entriesByInner.get(t.innerUrl) ?? []) {
+        // Carry ALL original entries for the failed snapshot, not just one, so a
+        // duplicate capture is preserved losslessly.
+        for (const entry of entriesBySnap.get(snapKey(t.innerUrl, t.ts14)) ?? []) {
             const c = carryFromEntry(entry);
             if (c) carried.push(c);
         }
@@ -685,7 +781,7 @@ async function main(): Promise<void> {
     console.log('Output:    ' + args.outputFile + (existing ? ' (appending)' : ' (new)'));
     console.log('Title:     ' + title);
     console.log('User-Agent: ' + userAgent);
-    console.log(`${existingUrls.size} already restored, reusing ${reuseLocally.length} locally (im_), fetching ${targets.length} URL(s), carrying over ${carried.length} (concurrency ${args.concurrency})...\n`);
+    console.log(`${existingSnapshotKeys.size} already restored, reusing ${reuseLocally.length} locally (im_), fetching ${targets.length} URL(s), carrying over ${carried.length} (concurrency ${args.concurrency})...\n`);
 
     const kept: KeptRecord[] = [];
     const keptPages: Record<string, unknown>[] = [];
@@ -701,7 +797,7 @@ async function main(): Promise<void> {
     // re-fetching its `id_` form.
     const promoted: WaybackTarget[] = [];
     for (const t of reuseLocally) {
-        const replayUrl = replayUrlByInner.get(t.innerUrl);
+        const replayUrl = replayUrlBySnap.get(snapKey(t.innerUrl, t.ts14));
         const start = replayUrl ?? t.idUrl;
         const resolved = resolveLocalChain(start, byReplayUrl);
         const rec = resolved.record ?? byReplayUrl.get(start);
@@ -864,13 +960,20 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
-    writeOutput({ outputFile: args.outputFile, title, existing, kept, pages: keptPages, carried: carriedToWrite });
+    // Snapshots restored this run, so dropStaleCarried can prune their stale
+    // carried wayback records from the existing output (B2).
+    const restoredSnapKeys = new Set(kept.map((r) => snapKey(r.innerUrl, r.ts17.slice(0, 14))));
+
+    writeOutput({ outputFile: args.outputFile, title, existing, kept, pages: keptPages, carried: carriedToWrite, restoredSnapKeys });
 
     console.log('\n=== Done ===');
     console.log('Wrote ' + args.outputFile);
 }
 
-main().catch((e) => {
-    console.error('Fatal:', e);
-    process.exit(1);
-});
+// Run only when executed directly (not when imported by a test).
+if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
+    main().catch((e) => {
+        console.error('Fatal:', e);
+        process.exit(1);
+    });
+}
