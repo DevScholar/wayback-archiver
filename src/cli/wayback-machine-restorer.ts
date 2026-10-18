@@ -379,6 +379,7 @@ function recordFromLocal(target: WaybackTarget, record: WarcRecord): KeptRecord 
         headers,
         body: record.body,
         recordId: `<urn:uuid:${crypto.randomUUID()}>`,
+        identifiedPayloadType: record.headers.get('warc-identified-payload-type') || undefined,
     };
 }
 
@@ -396,6 +397,11 @@ export interface KeptRecord {
     body: Buffer;
     /** The WARC-Record-ID assigned to this response record. */
     recordId: string;
+    /** The crawler's `WARC-Identified-Payload-Type` (e.g.
+     * `text/html; charset=windows-1250`), carried from the input capture. It is
+     * how a page whose 1990s server declared no charset still replays with the
+     * encoding its stored bytes actually use. */
+    identifiedPayloadType?: string;
     /**
      * The `request` record documenting how this capture was fetched (the `id_`
      * identity route, under which client identity), written immediately before
@@ -451,6 +457,69 @@ function isPlaybackHop(hop: FetchedHop): boolean {
     return location !== undefined && isPlaybackRedirect(location, hop.url);
 }
 
+/** MIME types that carry a character encoding and can use a charset guess. */
+function isTextualType(type: string): boolean {
+    return /^(text\/|application\/(?:xhtml\+xml|xml|javascript|ecmascript|json))/i.test(type);
+}
+
+/**
+ * Wayback's own guess for a response, as a `WARC-Identified-Payload-Type`
+ * value: `X-Archive-Guessed-Content-Type` plus `X-Archive-Guessed-Charset`.
+ * Only textual types get a charset; a charset on an image is meaningless.
+ */
+function guessedTypeFromHeaders(headers: [string, string][]): string | undefined {
+    const get = (name: string): string | undefined =>
+        headers.find(([headerName]) => headerName.toLowerCase() === name)?.[1];
+    const charset = get('x-archive-guessed-charset');
+    if (!charset) return undefined;
+    const type = get('x-archive-guessed-content-type') ?? get('content-type');
+    if (!type || !isTextualType(type)) return undefined;
+    return `${type}; charset=${charset}`;
+}
+
+/**
+ * The charset metadata to carry as `WARC-Identified-Payload-Type`.
+ *
+ * Wayback's official `X-Archive-Guessed-Charset` wins over ArchiveWeb.page's
+ * own `WARC-Identified-Payload-Type`; the latter is only the fallback. This
+ * keeps the replay encoding from depending on the client that made the input
+ * capture.
+ */
+function identifiedTypeFromHeaders(
+    headers: [string, string][],
+    identified?: string,
+): string | undefined {
+    return guessedTypeFromHeaders(headers) ?? identified;
+}
+
+/**
+ * The chosen `WARC-Identified-Payload-Type` per snapshot, from the input
+ * capture. A snapshot can appear under several routes (bare, `im_`, `id_`); a
+ * route with Wayback's guess wins even when another route recorded the
+ * ArchiveWeb.page type first.
+ */
+export function buildIdentifiedTypeMap(
+    entries: CdxjEntry[],
+    recordByUrl: Map<string, WarcRecord>,
+): Map<string, string> {
+    const bySnapshot = new Map<string, string>();
+    for (const e of entries) {
+        const wb = parseWaybackUrl(e.url);
+        if (!wb) continue;
+        const rec = recordByUrl.get(e.url);
+        if (!rec) continue;
+        const key = snapshotKey(wb.innerUrl, wb.ts14);
+        const guess = guessedTypeFromHeaders([...rec.httpHeaders.entries()]);
+        if (guess) {
+            bySnapshot.set(key, guess);
+            continue;
+        }
+        const identified = rec.headers.get('warc-identified-payload-type');
+        if (identified && !bySnapshot.has(key)) bySnapshot.set(key, identified);
+    }
+    return bySnapshot;
+}
+
 /**
  * Turn one successful `id_` fetch (its redirect chain) into output records.
  *
@@ -478,8 +547,11 @@ export function buildRestoredRecords(opts: {
     userAgent: string;
     accept: string;
     acceptLanguage: string;
+    /** The crawler's charset guess per snapshot, from the input capture. */
+    identifiedTypeBySnapshot?: Map<string, string>;
 }): RestoredRecords {
     const { target, hops, storedKeys, titleByInnerUrl, userAgent, accept, acceptLanguage } = opts;
+    const identifiedTypeBySnapshot = opts.identifiedTypeBySnapshot ?? new Map<string, string>();
     const records: KeptRecord[] = [];
     const pages: Record<string, unknown>[] = [];
     let lastStatus = 0;
@@ -516,6 +588,8 @@ export function buildRestoredRecords(opts: {
         const headers = restoreWaybackHeaders(hop.headers, rawCtype || 'application/octet-stream', hop.body);
         const mime = (headers.find(([name]) => name.toLowerCase() === 'content-type')?.[1] || rawCtype || 'application/octet-stream').split(';')[0].trim() || 'application/octet-stream';
         const recordId = `<urn:uuid:${crypto.randomUUID()}>`;
+        const identifiedPayloadType =
+            identifiedTypeFromHeaders(hop.headers) ?? identifiedTypeBySnapshot.get(storeKey);
 
         records.push({
             innerUrl: hopInner,
@@ -526,6 +600,7 @@ export function buildRestoredRecords(opts: {
             headers,
             body: hop.body,
             recordId,
+            identifiedPayloadType,
             requestRecord: records.length === 0
                 ? buildRequestRecord(target.idUrl, recordId, dateRfc3339, userAgent, accept, acceptLanguage)
                 : undefined,
@@ -763,6 +838,7 @@ export function writeOutput(opts: {
                 headers: r.headers,
                 body: r.body,
             },
+            identifiedPayloadType: r.identifiedPayloadType,
         });
         const member = zlib.gzipSync(record);
         warcParts.push(member);
@@ -916,6 +992,13 @@ async function main(): Promise<void> {
             /* leave unread; a missed `im_` falls back to the network path */
         }
     }
+
+    // Wayback's charset guess for each snapshot, or ArchiveWeb.page's identified
+    // type as the fallback. Keeping it as the record's
+    // WARC-Identified-Payload-Type is what lets a page whose 1990s server
+    // declared no charset (the common case) replay with the encoding its stored
+    // bytes actually use.
+    const identifiedTypeBySnapshot = buildIdentifiedTypeMap(entries, byReplayUrl);
 
     // Restore targets are keyed by *snapshot* -- the inner URL together with its
     // historical capture time. A single URL captured at several points in the
@@ -1106,6 +1189,10 @@ async function main(): Promise<void> {
         }
         storedKeys.add(reuseKey);
         const keptRec = recordFromLocal(t, rec);
+        // Wayback's guess (from any route of this snapshot) wins over the
+        // ArchiveWeb.page type the local record itself carries.
+        keptRec.identifiedPayloadType =
+            identifiedTypeBySnapshot.get(reuseKey) ?? keptRec.identifiedPayloadType;
         kept.push(keptRec);
         if (isHtmlMime(keptRec.mime)) {
             const title = titleByInnerUrl.get(t.innerUrl) || t.innerUrl;
@@ -1126,7 +1213,7 @@ async function main(): Promise<void> {
     // records are left as-is for a later run instead of being relabelled with
     // bytes captured at a different time.
     const storeOutcome = (target: WaybackTarget, hops: FetchedHop[]): RestoredRecords => {
-        const batch = buildRestoredRecords({ target, hops, storedKeys, titleByInnerUrl, userAgent, accept, acceptLanguage });
+        const batch = buildRestoredRecords({ target, hops, storedKeys, titleByInnerUrl, userAgent, accept, acceptLanguage, identifiedTypeBySnapshot });
         kept.push(...batch.records);
         keptPages.push(...batch.pages);
         return batch;

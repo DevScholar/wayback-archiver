@@ -91,6 +91,10 @@ that looks as if the pages were captured directly, in the past:
 - restores the historical HTTP headers from `X-Archive-Orig-*`, so a modern
   replay artifact (`server: nginx`, CSP, `cache-control`) never leaks into the
   restored record;
+- keeps a charset hint for replay: Wayback's `X-Archive-Guessed-Charset` wins
+  (written as `WARC-Identified-Payload-Type`), with ArchiveWeb.page's own
+  identified type as the fallback, so a page whose server declared no charset
+  still replays with the encoding of its bytes;
 - stamps each record with its *historical* capture time, not the wall clock;
 - follows a redirect the era's server sent hop by hop, archiving each hop under
   its own URL with its historical status and `Location`, and fetches each hop
@@ -171,6 +175,12 @@ demand from the archive's index, and archived content is served through
 A replay URL with no record returns the same plain "URL not saved" page the flat
 export writes (`unarchived-message.html`), with the missing address shown. It has
 no CSS or styling.
+
+A page whose archived `Content-Type` declares no charset (the normal case for
+1990s servers) is served with the archive's `WARC-Identified-Payload-Type` when
+present, then a `<meta>` charset, then the bytes: valid UTF-8 stays UTF-8, and
+legacy single-byte text is declared `windows-1252`. The stored bytes are never
+transcoded.
 
 Replay routes accept the Wayback `id_` modifier: `/web/<timestamp>id_/<url>`
 serves the capture's *identity* — the original bytes exactly as archived, with

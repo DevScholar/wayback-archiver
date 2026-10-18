@@ -3,10 +3,17 @@ import assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { buildRestoredRecords, resolveRedirectUrl, writeOutput, snapshotKey, type FetchedHop } from '../src/cli/wayback-machine-restorer.js';
+import {
+    buildIdentifiedTypeMap,
+    buildRestoredRecords,
+    resolveRedirectUrl,
+    writeOutput,
+    snapshotKey,
+    type FetchedHop,
+} from '../src/cli/wayback-machine-restorer.js';
 import { ZipReader } from '../src/archive/zip.js';
-import { parseCdxj } from '../src/archive/cdxj.js';
-import { parseWarcRecord } from '../src/archive/warc.js';
+import { parseCdxj, type CdxjEntry } from '../src/archive/cdxj.js';
+import { parseWarcRecord, type WarcRecord } from '../src/archive/warc.js';
 import * as zlib from 'zlib';
 import type { WaybackTarget } from '../src/lib/wayback.js';
 
@@ -36,12 +43,18 @@ function hop(overrides: Partial<FetchedHop> & { url: string }): FetchedHop {
 
 const identity = { userAgent: 'TestAgent/1.0', accept: '*/*', acceptLanguage: 'en' };
 
-function build(targetValue: WaybackTarget, hops: FetchedHop[], storedKeys = new Set<string>()) {
+function build(
+    targetValue: WaybackTarget,
+    hops: FetchedHop[],
+    storedKeys = new Set<string>(),
+    identifiedTypeBySnapshot?: Map<string, string>,
+) {
     return buildRestoredRecords({
         target: targetValue,
         hops,
         storedKeys,
         titleByInnerUrl: new Map(),
+        identifiedTypeBySnapshot,
         ...identity,
     });
 }
@@ -54,6 +67,46 @@ function historicalHeaders(server: string): [string, string][] {
         ['server', 'nginx'],
         ['content-type', 'image/jpeg'],
     ];
+}
+
+function cdxEntry(url: string, ts14: string): CdxjEntry {
+    return {
+        key: '',
+        timestamp: ts14 + '000',
+        url,
+        mime: 'text/html',
+        status: 200,
+        offset: 0,
+        length: 0,
+        digest: null,
+        filename: '',
+        json: {},
+    };
+}
+
+function warcRecord(opts: {
+    identified?: string;
+    guessedType?: string;
+    guessedCharset?: string;
+    contentType?: string;
+}): WarcRecord {
+    const httpHeaders = new Map<string, string>();
+    httpHeaders.set('content-type', opts.contentType ?? 'text/html');
+    if (opts.guessedType) httpHeaders.set('x-archive-guessed-content-type', opts.guessedType);
+    if (opts.guessedCharset) httpHeaders.set('x-archive-guessed-charset', opts.guessedCharset);
+    const headers = new Map<string, string>();
+    if (opts.identified) headers.set('warc-identified-payload-type', opts.identified);
+    return {
+        warcType: 'response',
+        headers,
+        targetUri: null,
+        date: null,
+        contentType: null,
+        httpStatus: 200,
+        httpStatusText: 'OK',
+        httpHeaders,
+        body: Buffer.alloc(0),
+    };
 }
 
 test('two historical snapshots of one URL are both stored', () => {
@@ -391,11 +444,121 @@ test('pages are listed only for HTML captures', () => {
     assert.equal(result.pages[0].url, 'http://a.example/p');
 });
 
+test('the input crawler charset guess becomes WARC-Identified-Payload-Type', () => {
+    const identified = new Map([['http://msn.com/\t19961022175327', 'text/html; charset=windows-1250']]);
+    const result = build(
+        target('http://msn.com/', '19961022175327'),
+        [
+            hop({
+                url: 'https://web.archive.org/web/19961022175327id_/http://msn.com/',
+                headers: [['content-type', 'text/html']],
+            }),
+        ],
+        new Set(),
+        identified,
+    );
+    assert.equal(result.records[0].identifiedPayloadType, 'text/html; charset=windows-1250');
+});
+
+test('Wayback guessed charset is used when the WARC header is absent', () => {
+    const result = build(target('http://a.example/page', '19961022175327'), [
+        hop({
+            url: 'https://web.archive.org/web/19961022175327id_/http://a.example/page',
+            headers: [
+                ['content-type', 'text/html'],
+                ['x-archive-guessed-content-type', 'text/html'],
+                ['x-archive-guessed-charset', 'maccentraleurope'],
+            ],
+        }),
+    ]);
+    assert.equal(result.records[0].identifiedPayloadType, 'text/html; charset=maccentraleurope');
+});
+
+test('a guessed charset on a non-text type is ignored', () => {
+    const result = build(target('http://a.example/pixel.gif', '19961022175327'), [
+        hop({
+            url: 'https://web.archive.org/web/19961022175327id_/http://a.example/pixel.gif',
+            headers: [
+                ['content-type', 'image/gif'],
+                ['x-archive-guessed-content-type', 'image/gif'],
+                ['x-archive-guessed-charset', 'utf-8'],
+            ],
+            body: Buffer.from('GIF89a'),
+        }),
+    ]);
+    assert.equal(result.records[0].identifiedPayloadType, undefined);
+});
+
+test('Wayback guessed charset wins over the ArchiveWeb.page identified type', () => {
+    const bareUrl = 'https://web.archive.org/web/19961022175327/http://a.example/page';
+    const idUrl = 'https://web.archive.org/web/19961022175327id_/http://a.example/page';
+    const records = new Map<string, WarcRecord>([
+        [idUrl, warcRecord({ identified: 'text/html; charset=windows-1250' })],
+        [
+            bareUrl,
+            warcRecord({
+                identified: 'text/html; charset=windows-1250',
+                guessedType: 'text/html',
+                guessedCharset: 'maccentraleurope',
+            }),
+        ],
+    ]);
+    const key = 'http://a.example/page\t19961022175327';
+
+    // The identified-type route comes first, then the route with Wayback's
+    // guess; the guess must still win.
+    const idFirst = buildIdentifiedTypeMap([cdxEntry(idUrl, '19961022175327'), cdxEntry(bareUrl, '19961022175327')], records);
+    assert.equal(idFirst.get(key), 'text/html; charset=maccentraleurope');
+
+    // The same in the opposite route order.
+    const bareFirst = buildIdentifiedTypeMap([cdxEntry(bareUrl, '19961022175327'), cdxEntry(idUrl, '19961022175327')], records);
+    assert.equal(bareFirst.get(key), 'text/html; charset=maccentraleurope');
+});
+
+test('the ArchiveWeb.page identified type is the fallback when Wayback guessed nothing', () => {
+    const url = 'https://web.archive.org/web/19961022175327id_/http://a.example/page';
+    const map = buildIdentifiedTypeMap(
+        [cdxEntry(url, '19961022175327')],
+        new Map([[url, warcRecord({ identified: 'text/html; charset=windows-1250' })]]),
+    );
+    assert.equal(map.get('http://a.example/page\t19961022175327'), 'text/html; charset=windows-1250');
+});
+
+test('a guessed charset on a non-text snapshot is ignored by the map', () => {
+    const url = 'https://web.archive.org/web/19961022175327id_/http://a.example/pixel.gif';
+    const map = buildIdentifiedTypeMap(
+        [cdxEntry(url, '19961022175327')],
+        new Map([[url, warcRecord({ contentType: 'image/gif', guessedType: 'image/gif', guessedCharset: 'utf-8' })]]),
+    );
+    assert.equal(map.get('http://a.example/pixel.gif\t19961022175327'), undefined);
+});
+
+test('the live Wayback guess wins over the input identified type', () => {
+    const identified = new Map([['http://a.example/page\t19961022175327', 'text/html; charset=windows-1250']]);
+    const result = build(
+        target('http://a.example/page', '19961022175327'),
+        [
+            hop({
+                url: 'https://web.archive.org/web/19961022175327id_/http://a.example/page',
+                headers: [
+                    ['content-type', 'text/html'],
+                    ['x-archive-guessed-content-type', 'text/html'],
+                    ['x-archive-guessed-charset', 'utf-8'],
+                ],
+            }),
+        ],
+        new Set(),
+        identified,
+    );
+    assert.equal(result.records[0].identifiedPayloadType, 'text/html; charset=utf-8');
+});
+
 test('the written WACZ indexes both snapshots of one URL', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wacz-restored-'));
     const outputFile = path.join(directory, 'out.wacz');
     try {
         const storedKeys = new Set<string>();
+        const identified = new Map([['http://a.example/x\t19980101000000', 'text/html; charset=windows-1250']]);
         const kept = [];
         const pages = [];
         for (const ts14 of ['19980101000000', '19990101000000']) {
@@ -403,6 +566,7 @@ test('the written WACZ indexes both snapshots of one URL', () => {
                 target('http://a.example/x', ts14),
                 [hop({ url: `https://web.archive.org/web/${ts14}id_/http://a.example/x`, body: Buffer.from(ts14) })],
                 storedKeys,
+                identified,
             );
             kept.push(...result.records);
             pages.push(...result.pages);
@@ -430,6 +594,10 @@ test('the written WACZ indexes both snapshots of one URL', () => {
         for (const entry of entries) {
             const record = parseWarcRecord(zlib.gunzipSync(zip.storedRange('archive/data.warc.gz', entry.offset, entry.length)));
             assert.equal(record.body.toString(), entry.timestamp.slice(0, 14));
+            const expected = entry.timestamp.startsWith('19980101000000')
+                ? 'text/html; charset=windows-1250'
+                : undefined;
+            assert.equal(record.headers.get('warc-identified-payload-type'), expected);
         }
 
         const pageLines = zip.readEntry('pages/pages.jsonl').toString('utf8').trim().split('\n');

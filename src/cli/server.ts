@@ -96,11 +96,31 @@ function getLocalExternalIP(): string {
 
 const TEXT_HTML = /text\/html/i;
 
-function sniffCharset(head: Buffer, mime: string): string | undefined {
+/**
+ * Pick a charset for an HTML body that does not declare one. In order: a UTF-8
+ * BOM, a `<meta>` charset, then the bytes themselves -- valid UTF-8 is served as
+ * UTF-8, and anything else falls back to Windows-1252, the usual encoding of
+ * 1990s Western pages (and a superset of Latin-1). This is a best effort for
+ * archives that did not record `WARC-Identified-Payload-Type`; when they did,
+ * that value wins before this is called.
+ */
+export function sniffCharset(body: Buffer, mime: string): string | undefined {
     if (!TEXT_HTML.test(mime)) return undefined;
-    const s = head.subarray(0, 8192).toString('latin1');
+    if (body.length >= 3 && body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) return 'utf-8';
+    const s = body.subarray(0, 8192).toString('latin1');
     const meta = s.match(/<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9\-_]+)/i);
-    return meta ? meta[1] : undefined;
+    if (meta) return meta[1];
+    return isValidUtf8(body) ? 'utf-8' : 'windows-1252';
+}
+
+/** True when the bytes decode as UTF-8 without a replacement character. */
+function isValidUtf8(buffer: Buffer): boolean {
+    try {
+        new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -256,9 +276,9 @@ function buildReplayHeaders(
     // Resolve the charset to declare. The historical server's own `Content-Type`
     // charset (already in `contentType`) wins; otherwise prefer the crawler's
     // `WARC-Identified-Payload-Type` (matches the stored bytes), then a `<meta>`
-    // charset in the body, and finally a UTF-8 default for HTML. Declaring the
-    // identified charset -- not transcoding -- keeps the stored bytes verbatim
-    // while telling the browser how to decode them.
+    // charset, then the bytes themselves (UTF-8 when valid, else Windows-1252).
+    // Declaring the charset -- not transcoding -- keeps the stored bytes
+    // verbatim while telling the browser how to decode them.
     if (!/charset=/i.test(contentType)) {
         const charset = identifiedCharset(record) ?? sniffCharset(body, contentType);
         if (charset) {
@@ -592,4 +612,7 @@ function main(): void {
     });
 }
 
-main();
+// Run only when executed directly (not when imported by a test).
+if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
+    main();
+}
