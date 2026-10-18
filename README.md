@@ -69,7 +69,7 @@ in the request record).
 ## Restore a Wayback Machine capture
 
 ```
-npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3]
+npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]
 ```
 
 When ArchiveWeb.page crawls `https://web.archive.org/web/<ts>/http://host/...`,
@@ -127,6 +127,12 @@ skipped, so re-running resumes where a previous run left off. Fetches use a
 normal browser `User-Agent` (the same Edge 150 string as the downloader) so
 Wayback does not serve a bot response. If `--output-file` is omitted, output
 defaults to `<archive>-restored.wacz` next to the input.
+
+By default a snapshot that could not be restored is left as-is in the output,
+so a later run can retry it. Pass `--drop-unrestored` to omit those Wayback
+replay records instead: the result then contains only historical records, plus
+non-replay content (screenshots, archive.org pages) carried unchanged. The
+input WACZ remains the lossless source either way.
 
 ## Export to standalone HTML
 

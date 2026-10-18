@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as zlib from 'zlib';
 import { surtKey } from '../src/lib/url.js';
-import { dropStaleCarried } from '../src/cli/wayback-machine-restorer.js';
+import { dropStaleCarried, dropUnrestoredReplay } from '../src/cli/wayback-machine-restorer.js';
 
 // dropStaleCarried removes carried Wayback replay records whose snapshot was
 // just restored, splicing their bytes out of the stored WARC and remapping the
@@ -95,4 +95,40 @@ test('dropStaleCarried is a no-op when nothing is stale', () => {
     assert.deepEqual(out.warcGz, warcGz);
     assert.equal(out.indexLines.length, 3);
     assert.equal(out.pagesText, existing.pagesText);
+});
+
+test('dropUnrestoredReplay removes every replay URL and keeps the rest', () => {
+    const { existing } = build();
+    const out = dropUnrestoredReplay(existing);
+
+    // The inner records survive; the replay member is spliced out.
+    const kept0 = member(Buffer.from('record-A'));
+    const kept2 = member(Buffer.from('record-C'));
+    assert.deepEqual(out.warcGz, Buffer.concat([kept0, kept2]));
+
+    const lines = out.indexLines.map((l) => JSON.parse(l.split(' ').slice(2).join(' ')));
+    assert.deepEqual(lines.map((j) => j.url).sort(), ['http://a.example/x', 'http://c.example/y']);
+    // Offsets are remapped after the removed member.
+    const c = lines.find((j) => j.url === 'http://c.example/y')!;
+    assert.equal(c.offset, kept0.length);
+
+    const pages = out.pagesText
+        .split(/\r?\n/)
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l));
+    assert.ok(!pages.some((p) => typeof p.url === 'string' && p.url.includes('web.archive.org')));
+    assert.ok(pages.some((p) => p.url === 'http://a.example/x'));
+    assert.ok(pages.some((p) => p.url === 'http://c.example/y'));
+});
+
+test('dropUnrestoredReplay is a no-op when no replay record is carried', () => {
+    const { existing } = build();
+    const withoutReplay = {
+        ...existing,
+        indexLines: existing.indexLines.filter((line) => !line.includes('web.archive.org')),
+    };
+    const out = dropUnrestoredReplay(withoutReplay);
+    assert.deepEqual(out.warcGz, withoutReplay.warcGz);
+    assert.equal(out.indexLines.length, 2);
+    assert.equal(out.pagesText, withoutReplay.pagesText);
 });

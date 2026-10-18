@@ -45,6 +45,12 @@
  * number of times before also being skipped -- matching how the downloader
  * treats a failed capture.
  *
+ * By default an unrestored snapshot is left as-is in the output, so a later run
+ * can retry it. `--drop-unrestored` instead omits those Wayback replay records:
+ * the result then contains only historical records plus non-replay content
+ * (screenshots, archive.org pages), carried unchanged. The input WACZ remains
+ * the lossless source either way.
+ *
  * The output is incremental: if `--output-file` already exists, its URLs are
  * skipped and only newly-restored URLs are appended, so re-running the same
  * command resumes where a previous run left off.
@@ -55,7 +61,7 @@
  * drained one at a time at `--rate-limit-delay` with backoff.
  *
  * Usage:
- *   npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline]
+ *   npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]
  */
 
 import * as path from 'path';
@@ -91,10 +97,13 @@ interface Args {
     max429Retries: number;
     /** Fail every fetch immediately without opening a socket (for offline runs). */
     offline: boolean;
+    /** Omit unrestored Wayback replay records from the output, leaving only
+     * historical records and non-replay content. */
+    dropUnrestored: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-    const args: Args = { input: '', outputFile: '', concurrency: 8, rateLimitDelay: 3000, max429Retries: 3, offline: false };
+    const args: Args = { input: '', outputFile: '', concurrency: 8, rateLimitDelay: 3000, max429Retries: 3, offline: false, dropUnrestored: false };
     const positional: string[] = [];
 
     // `--flag value` (space-separated) and `--flag=value` are both accepted.
@@ -132,11 +141,12 @@ function parseArgs(argv: string[]): Args {
         else if (key === '--rate-limit-delay') args.rateLimitDelay = parseInt(val, 10) || 3000;
         else if (key === '--max-429-retries') args.max429Retries = parseInt(val, 10) || 3;
         else if (key === '--offline') args.offline = true;
+        else if (key === '--drop-unrestored') args.dropUnrestored = true;
         else if (!a.startsWith('--')) positional.push(a);
     }
     if (positional.length > 0) args.input = path.resolve(positional[0]);
     if (!args.input) {
-        console.error('Usage: npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline]');
+        console.error('Usage: npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]');
         process.exit(1);
     }
     if (!args.outputFile) {
@@ -583,35 +593,31 @@ function isRewritableMime(mime: string): boolean {
     );
 }
 
+/** An existing archive with some indexed records spliced out. */
+export interface DroppedArchive {
+    warcGz: Buffer;
+    indexLines: string[];
+    pagesText: string;
+}
+
 /**
- * Rebuild an existing archive's WARC/index/pages with a set of carried Wayback
- * records removed: those whose snapshot was just successfully restored, so the
- * stale replayed copy no longer coexists with its restored inner-URL form (B2).
- * Members are spliced out of `existing.warcGz` by their byte ranges; the
- * un-indexed warcinfo/request members are untouched. Returns the cleaned
- * `warcGz`, index lines (with remapped offsets), and pages text.
+ * Splice the given CDXJ entries out of an existing archive: their gzip members
+ * are removed from the WARC stream, every kept entry's offset is remapped, and
+ * their pages.jsonl entries are removed. The un-indexed warcinfo/request
+ * members are untouched, exactly as they were.
  */
-export function dropStaleCarried(
-    existing: ExistingArchive,
-    restoredSnapKeys: Set<string>,
-): { warcGz: Buffer; indexLines: string[]; pagesText: string } {
-    const entries = parseCdxj(existing.indexLines.join('\n'));
-
-    // A carried Wayback replay URL whose snapshot was restored this run is stale.
-    const isStale = (e: CdxjEntry): boolean => {
-        const wb = parseWaybackUrl(e.url);
-        if (!wb) return false;
-        return restoredSnapKeys.has(wb.innerUrl + '\t' + wb.ts14);
-    };
-
-    const dropped = entries.filter(isStale).sort((a, b) => a.offset - b.offset);
+function dropEntries(existing: ExistingArchive, droppedEntries: CdxjEntry[]): DroppedArchive {
+    const dropped = [...droppedEntries].sort((a, b) => a.offset - b.offset);
     if (dropped.length === 0) {
         return { warcGz: existing.warcGz, indexLines: existing.indexLines, pagesText: existing.pagesText };
     }
 
+    const entries = parseCdxj(existing.indexLines.join('\n'));
+    const droppedOffsets = new Set(dropped.map((e) => e.offset));
+    const kept = entries.filter((e) => !droppedOffsets.has(e.offset));
+
     // Splice dropped byte ranges out of the stored WARC, and remap every kept
     // entry's offset by the total length removed before it.
-    const kept = entries.filter((e) => !isStale(e));
     const parts: Buffer[] = [];
     let cursor = 0;
     for (const d of dropped) {
@@ -622,7 +628,6 @@ export function dropStaleCarried(
     const warcGz = Buffer.concat(parts);
 
     const droppedRanges = dropped.map((d) => ({ start: d.offset, len: d.length }));
-
     const newIndexLines: string[] = [];
     for (const e of kept) {
         let rem = 0;
@@ -634,18 +639,17 @@ export function dropStaleCarried(
     }
     newIndexLines.sort();
 
-    // Drop stale page entries (HTML carried records listed under their wayback
-    // URL) whose snapshot was restored.
+    // Remove the page entries of every dropped record. Their CDX mime can be
+    // `warc/revisit`, so match by URL rather than by mime.
     let pagesText = existing.pagesText;
-    const stalePages = dropped.filter((e) => isHtmlMime(e.mime));
-    if (stalePages.length > 0 && pagesText) {
-        const staleUrls = new Set(stalePages.map((e) => e.url));
+    const droppedUrls = new Set(dropped.map((e) => e.url));
+    if (droppedUrls.size > 0 && pagesText) {
         const lines = pagesText.split(/\r?\n/).filter((line) => {
             const t = line.trim();
             if (!t) return false;
             try {
                 const o = JSON.parse(t);
-                return typeof o.url !== 'string' || !staleUrls.has(o.url);
+                return typeof o.url !== 'string' || !droppedUrls.has(o.url);
             } catch {
                 return true;
             }
@@ -654,6 +658,41 @@ export function dropStaleCarried(
     }
 
     return { warcGz, indexLines: newIndexLines, pagesText };
+}
+
+/**
+ * Rebuild an existing archive's WARC/index/pages with a set of carried Wayback
+ * records removed: those whose snapshot was just successfully restored, so the
+ * stale replayed copy no longer coexists with its restored inner-URL form (B2).
+ * Members are spliced out of `existing.warcGz` by their byte ranges; the
+ * un-indexed warcinfo/request members are untouched. Returns the cleaned
+ * `warcGz`, index lines (with remapped offsets), and pages text.
+ */
+export function dropStaleCarried(
+    existing: ExistingArchive,
+    restoredSnapKeys: Set<string>,
+): DroppedArchive {
+    const entries = parseCdxj(existing.indexLines.join('\n'));
+
+    // A carried Wayback replay URL whose snapshot was restored this run is stale.
+    const isStale = (e: CdxjEntry): boolean => {
+        const wb = parseWaybackUrl(e.url);
+        if (!wb) return false;
+        return restoredSnapKeys.has(wb.innerUrl + '\t' + wb.ts14);
+    };
+
+    return dropEntries(existing, entries.filter(isStale));
+}
+
+/**
+ * Remove every carried Wayback replay record, i.e. the unrestored snapshots,
+ * while keeping restored records and all non-replay content. This is the
+ * `--drop-unrestored` output: a historical-only archive with no 2026 replay
+ * URLs left in it.
+ */
+export function dropUnrestoredReplay(existing: ExistingArchive): DroppedArchive {
+    const entries = parseCdxj(existing.indexLines.join('\n'));
+    return dropEntries(existing, entries.filter((e) => parseWaybackUrl(e.url) !== null));
 }
 
 /** Write (or append to) the output WACZ. Exported for the offline write-path
@@ -666,13 +705,19 @@ export function writeOutput(opts: {
     pages: Record<string, unknown>[];
     carried: CarriedRecord[];
     restoredSnapKeys: Set<string>;
+    /** Drop every carried Wayback replay record, including one an existing
+     * output already holds, so only historical records remain. */
+    dropUnrestored?: boolean;
 }): void {
-    const { outputFile, title, existing, kept, pages, carried, restoredSnapKeys } = opts;
+    const { outputFile, title, existing, kept, pages, carried, restoredSnapKeys, dropUnrestored = false } = opts;
 
     const nowIso = new Date().toISOString();
-    let cleaned: { warcGz: Buffer; indexLines: string[]; pagesText: string } | null = null;
+    let cleaned: DroppedArchive | null = null;
     if (existing) {
         cleaned = dropStaleCarried(existing, restoredSnapKeys);
+        if (dropUnrestored) {
+            cleaned = dropUnrestoredReplay({ ...existing, ...cleaned });
+        }
     }
     const baseWarcGz = cleaned ? cleaned.warcGz : null;
     const baseIndexLines = cleaned ? cleaned.indexLines : [];
@@ -1203,9 +1248,18 @@ async function main(): Promise<void> {
     });
     carriedToWrite.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
-    console.log(`\n${ok} restored, ${shifted} shifted to their real capture time, ${failed} skipped, ${carriedToWrite.length} carried over`);
+    // `--drop-unrestored` produces a historical-only archive: unrestored
+    // Wayback replay records are omitted, while non-replay content is still
+    // carried as-is. The input remains the lossless source.
+    const finalCarried = args.dropUnrestored
+        ? carriedToWrite.filter((c) => parseWaybackUrl(c.url) === null)
+        : carriedToWrite;
+    const droppedReplay = carriedToWrite.length - finalCarried.length;
+    const droppedNote = droppedReplay > 0 ? `, ${droppedReplay} unrestored replay record(s) dropped` : '';
 
-    if (kept.length === 0 && carriedToWrite.length === 0 && (!existing || args.title === undefined)) {
+    console.log(`\n${ok} restored, ${shifted} shifted to their real capture time, ${failed} skipped, ${finalCarried.length} carried over${droppedNote}`);
+
+    if (kept.length === 0 && finalCarried.length === 0 && (!existing || (args.title === undefined && !args.dropUnrestored))) {
         if (existing) {
             console.log('Nothing new to add: the output already holds every record these snapshots produced.');
             return;
@@ -1218,7 +1272,16 @@ async function main(): Promise<void> {
     // carried wayback records from the existing output (B2).
     const restoredSnapKeys = new Set(kept.map((r) => snapshotKey(r.innerUrl, r.ts17.slice(0, 14))));
 
-    writeOutput({ outputFile: args.outputFile, title, existing, kept, pages: keptPages, carried: carriedToWrite, restoredSnapKeys });
+    writeOutput({
+        outputFile: args.outputFile,
+        title,
+        existing,
+        kept,
+        pages: keptPages,
+        carried: finalCarried,
+        restoredSnapKeys,
+        dropUnrestored: args.dropUnrestored,
+    });
 
     console.log('\n=== Done ===');
     console.log('Wrote ' + args.outputFile);
