@@ -1028,8 +1028,9 @@ async function main(): Promise<void> {
     // Resolve each through its redirect/revisit chain in the captured records
     // and write the final record out with no network request. A record whose
     // resolved MIME is a text type Wayback would have rewritten (an HTML error
-    // page served for a missing image, say) is NOT safe to reuse -- fall back to
-    // re-fetching its `id_` form.
+    // page served for a missing image, say) is NOT safe to reuse. Neither is a
+    // snapshot with no local body. Both fall back to re-fetching the `id_`
+    // route, which can still serve the capture or shift to the nearest one.
     const promoted: WaybackTarget[] = [];
     for (const t of reuseLocally) {
         const replayUrl = replayUrlBySnap.get(snapshotKey(t.innerUrl, t.ts14));
@@ -1037,9 +1038,12 @@ async function main(): Promise<void> {
         const resolved = resolveLocalChain(start, byReplayUrl);
         const rec = resolved.record ?? byReplayUrl.get(start);
         if (!rec || rec.body.length === 0) {
-            failed++;
-            carryOnFailure(t);
-            console.log(`REUSE SKIP (no local body) ${t.innerUrl} (left as-is)`);
+            // Nothing local to reuse. Try the identity route over the network
+            // instead of giving up: Wayback can still serve the capture (or
+            // shift to the nearest one), while `--offline` fails and leaves the
+            // snapshot as-is exactly as before.
+            promoted.push(t);
+            console.log(`NO LOCAL BODY ${t.innerUrl} (fetching id_)`);
             continue;
         }
         const rawCtype = (rec.httpHeaders.get('content-type') || '').split(';')[0].trim();
@@ -1068,7 +1072,7 @@ async function main(): Promise<void> {
     if (promoted.length > 0) {
         targets.push(...promoted);
         targets.sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
-        console.log(`promoted ${promoted.length} rewritten local body(ies) to network fetch`);
+        console.log(`promoted ${promoted.length} local snapshot(s) to network fetch`);
     }
 
     // Turn one successful fetch into output records. A chain that only shifts

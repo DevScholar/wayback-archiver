@@ -116,7 +116,8 @@ input WACZ is byte-for-byte the identity, and the restorer reuses it locally
 rather than re-fetching it. Only pages (`cs_`/`js_`/bare) need a fresh `id_`
 request. A reused record whose own content type turns out to be text (an HTML
 error page served for a missing image, say) is re-fetched instead, since that
-body *was* rewritten.
+body *was* rewritten. A snapshot with no local body at all is re-fetched too,
+rather than skipped.
 
 A resource that cannot be re-fetched is skipped: a network error writes nothing,
 and a rate limit (429) is moved onto a separate slow queue and retried at
