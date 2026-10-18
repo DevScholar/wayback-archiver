@@ -30,7 +30,18 @@ import { createDefaultPipeline, ReplayContext } from '../replay/plugins.js';
 import { detectContentKind } from '../replay/rewrite.js';
 import { URL_FIXER_SCRIPT_ROUTE } from '../replay/url-fixer.js';
 import { URL_FIXER_SHIM } from '../replay/url-fixer-shim.js';
+import { renderNotFoundPage } from '../replay/not-found.js';
 import { LruCache } from '../lib/lru.js';
+
+/** Decode the inner URL of a `/web/<ts>[mod_]/<url>` path for the "not saved"
+ * page. A malformed escape is shown as the raw text instead of throwing. */
+function replayInnerUrl(raw: string): string {
+    try {
+        return decodeURIComponent(raw);
+    } catch {
+        return raw;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -483,8 +494,11 @@ function main(): void {
             if (!rendered) {
                 rendered = await renderReplay(reqUrl);
                 if (!rendered) {
-                    res.writeHead(404, { 'Content-Type': 'text/plain' });
-                    res.end('404 Not Found');
+                    // No record for this replay route: show the same plain
+                    // "not saved" page the flat export writes, with the
+                    // original address filled in. No CSS, no styling.
+                    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+                    res.end(renderNotFoundPage(replayInnerUrl(m[3])));
                     return;
                 }
                 replayCache.set(reqUrl, rendered);
@@ -529,8 +543,8 @@ function main(): void {
             return;
         }
 
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('404 Not Found');
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderNotFoundPage(reqUrl));
     });
 
     // A request handler that never yields means one slow client can hold a

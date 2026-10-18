@@ -36,6 +36,7 @@ import { lookupKey, lookupVariants, lookupPathKey, lookupKeyCi } from '../lib/ur
 import { renderIndexPage, buildPageRows, IndexRow } from '../replay/index-page.js';
 import { cdxjTsToRfc3339, rfc3339ToTs14 } from '../lib/time.js';
 import { createExportPipeline, ReplayContext, FLAT_NOT_FOUND_FILE } from '../replay/plugins.js';
+import { renderNotFoundPage } from '../replay/not-found.js';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -202,39 +203,6 @@ function csvEscape(field: string): string {
         return '"' + s.replace(/"/g, '""') + '"';
     }
     return s;
-}
-
-/** Minimal, self-contained "not saved" page. The inline script reads the
- * original URL out of the `?url=` query parameter and shows it. It runs fine
- * under file:// (no server, no fetch). No CSS, and written to render on
- * Internet Explorer 6. */
-function renderNotFoundPage(): string {
-    return `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
-<html lang="en">
-<head>
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-<title>URL not saved</title>
-</head>
-<body>
-<h1>This URL was not saved in the archive</h1>
-<p>The following address is not present in this export:</p>
-<p id="url"></p>
-<script type="text/javascript">
-(function () {
-  var m = /[?&]url=([^&]+)/.exec(location.search);
-  var url = '';
-  if (m) {
-    try { url = decodeURIComponent(m[1].replace(/\\+/g, ' ')); } catch (e) { url = m[1]; }
-  }
-  var el = document.getElementById('url');
-  if (el) {
-    el.innerText = url || '(unknown URL)';
-  }
-})();
-</script>
-</body>
-</html>
-`;
 }
 
 // ---------------------------------------------------------------------------

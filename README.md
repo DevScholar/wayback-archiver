@@ -168,6 +168,10 @@ demand from the archive's index, and archived content is served through
 `/web/<timestamp>/<url>` routes with links rewritten to stay local. Pass
 `--expose` to bind `0.0.0.0` and allow LAN access.
 
+A replay URL with no record returns the same plain "URL not saved" page the flat
+export writes (`unarchived-message.html`), with the missing address shown. It has
+no CSS or styling.
+
 Replay routes accept the Wayback `id_` modifier: `/web/<timestamp>id_/<url>`
 serves the capture's *identity* — the original bytes exactly as archived, with
 no link rewriting and no url-fixer shim injected.
