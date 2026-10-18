@@ -93,6 +93,7 @@ test('a second chain for the same URL and timestamp is not stored twice', () => 
     assert.equal(first.records.length, 1);
     assert.equal(second.records.length, 0);
     assert.equal(second.wroteTarget, true); // the snapshot is present, just not written again
+    assert.equal(second.skippedAlreadyStored, 1);
 });
 
 test('a playback redirect is followed but never archived', () => {
@@ -317,6 +318,37 @@ test('a headerless playback redirect is still recognised from its location', () 
 
     assert.equal(result.skippedPlaybackRedirects, 1);
     assert.equal(result.records.length, 0);
+});
+
+test('a redirect to a capture already in the archive counts as a shift', () => {
+    const storedKeys = new Set([snapshotKey('http://a.example/x', '19961026001900')]);
+    const result = build(
+        target('http://a.example/x', '19961022175327'),
+        [
+            hop({
+                url: 'https://web.archive.org/web/19961022175327id_/http://a.example/x',
+                status: 302,
+                statusText: 'Found',
+                headers: [
+                    ['location', 'https://web.archive.org/web/19961026001900id_/http://a.example/x'],
+                    ['x-archive-redirect-reason', 'found capture at 19961026001900'],
+                ],
+                body: Buffer.alloc(0),
+            }),
+            hop({
+                url: 'https://web.archive.org/web/19961026001900id_/http://a.example/x',
+                headers: historicalHeaders('Apache/1.3'),
+                body: Buffer.from('JPEG'),
+            }),
+        ],
+        storedKeys,
+    );
+
+    assert.equal(result.records.length, 0);
+    assert.equal(result.wroteTarget, false);
+    assert.equal(result.skippedPlaybackRedirects, 1);
+    assert.equal(result.skippedAlreadyStored, 1);
+    assert.equal(result.alreadyStoredTs14, '19961026001900');
 });
 
 test('a historical redirect is followed through Wayback, never to the live web', () => {

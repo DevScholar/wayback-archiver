@@ -409,6 +409,11 @@ export interface RestoredRecords {
     skippedPlaybackRedirects: number;
     /** Wayback error pages passed over: the 2026 frontend, never archived. */
     skippedErrorPages: number;
+    /** Hops whose snapshot was already in the output (a redirect to a capture
+     * another chain restored), so this chain wrote nothing new for them. */
+    skippedAlreadyStored: number;
+    /** Capture timestamp of the first already-stored hop, for logging. */
+    alreadyStoredTs14?: string;
 }
 
 /** Key identifying one archived snapshot: inner URL plus capture timestamp. A
@@ -471,6 +476,8 @@ export function buildRestoredRecords(opts: {
     let lastTs14 = target.ts14;
     let skippedPlaybackRedirects = 0;
     let skippedErrorPages = 0;
+    let skippedAlreadyStored = 0;
+    let alreadyStoredTs14: string | undefined;
 
     for (const hop of hops) {
         if (isPlaybackHop(hop)) {
@@ -486,7 +493,11 @@ export function buildRestoredRecords(opts: {
         const hopInner = hopWayback?.innerUrl ?? hop.url;
         const ts14 = hopWayback?.ts14 ?? target.ts14;
         const storeKey = snapshotKey(hopInner, ts14);
-        if (storedKeys.has(storeKey)) continue;
+        if (storedKeys.has(storeKey)) {
+            if (skippedAlreadyStored === 0) alreadyStoredTs14 = ts14;
+            skippedAlreadyStored++;
+            continue;
+        }
         storedKeys.add(storeKey);
 
         const ts17 = (ts14 + '000').slice(0, 17);
@@ -525,6 +536,8 @@ export function buildRestoredRecords(opts: {
         lastTs14,
         skippedPlaybackRedirects,
         skippedErrorPages,
+        skippedAlreadyStored,
+        alreadyStoredTs14,
     };
 }
 
@@ -1103,6 +1116,13 @@ async function main(): Promise<void> {
                 shifted++;
                 carryOnFailure(t);
                 console.log(`[${id}] SHIFT ${batch.lastStatus} ${t.innerUrl} (no capture at ${t.ts14}; nearest capture stored at ${batch.lastTs14}) (left as-is)`);
+            } else if (batch.skippedAlreadyStored > 0) {
+                // The redirect led to a capture another chain had already
+                // stored, so no new record was written, but the bytes are in
+                // the archive at their own time.
+                shifted++;
+                carryOnFailure(t);
+                console.log(`[${id}] SHIFT ${t.innerUrl} (no capture at ${t.ts14}; nearest capture already in the archive at ${batch.alreadyStoredTs14}) (left as-is)`);
             } else {
                 failed++;
                 carryOnFailure(t);
@@ -1150,6 +1170,10 @@ async function main(): Promise<void> {
             shifted++;
             carryOnFailure(item.target);
             console.log(`SLOW SHIFT ${batch.lastStatus} ${item.target.innerUrl} (no capture at ${item.target.ts14}; nearest capture stored at ${batch.lastTs14}) (left as-is)`);
+        } else if (batch.skippedAlreadyStored > 0) {
+            shifted++;
+            carryOnFailure(item.target);
+            console.log(`SLOW SHIFT ${item.target.innerUrl} (no capture at ${item.target.ts14}; nearest capture already in the archive at ${batch.alreadyStoredTs14}) (left as-is)`);
         } else {
             failed++;
             carryOnFailure(item.target);
