@@ -27,6 +27,19 @@
  *   - each record is stamped with its *historical* capture time, not the wall
  *     clock.
  *
+ * A URL captured at several dates is several snapshots, and each is restored
+ * independently: records are de-duplicated by inner URL AND capture timestamp,
+ * so the routes of one capture collapse to one record while distinct historical
+ * captures never overwrite each other.
+ *
+ * A Wayback playback redirect, the timestamp shift Wayback writes when it has
+ * no capture at the requested time, is retrieval scaffolding: the old server
+ * never sent it, and its target is another Wayback URL. It is followed, never
+ * archived, and the capture it reaches keeps that capture's own time. The
+ * requested timestamp is then left as-is for a later run, exactly like a failed
+ * fetch. Wayback's own "not in archive" error page is treated the same way,
+ * since it is the 2026 frontend rather than the resource.
+ *
  * A resource that cannot be re-fetched is skipped: a network error writes
  * nothing, and a rate limit (429) is retried on a separate slow queue a bounded
  * number of times before also being skipped -- matching how the downloader
@@ -55,8 +68,8 @@ import { writeZipFile } from '../archive/zip-writer.js';
 import { buildWarcRecord, buildWarcinfoRecord, payloadDigest } from '../archive/warc-writer.js';
 import { parseWarcRecord, WarcRecord } from '../archive/warc.js';
 import { parseCdxj, type CdxjEntry } from '../archive/cdxj.js';
-import { cdxjTsToRfc3339 } from '../lib/time.js';
-import { parseWaybackUrl, restoreWaybackHeaders, type WaybackTarget, hostOf, isArchiveOrgHost } from '../lib/wayback.js';
+import { cdxjTsToRfc3339, rfc3339ToTs14 } from '../lib/time.js';
+import { parseWaybackUrl, restoreWaybackHeaders, isPlaybackRedirect, isWaybackErrorPage, type WaybackTarget, hostOf, isArchiveOrgHost } from '../lib/wayback.js';
 import { DEFAULT_USER_AGENT, DEFAULT_ACCEPT, DEFAULT_ACCEPT_LANGUAGE, clientHeaders, collectHeaders, sleep, buildRequestRecord } from '../lib/http.js';
 import { SOFTWARE, isHtmlMime, loadExisting, resource, indexLine, type ExistingArchive } from '../archive/wacz-append.js';
 
@@ -137,7 +150,7 @@ function parseArgs(argv: string[]): Args {
 // Wayback URL classification
 // ---------------------------------------------------------------------------
 
-interface FetchedHop {
+export interface FetchedHop {
     url: string;
     status: number;
     statusText: string;
@@ -150,6 +163,55 @@ type FetchOutcome =
     | { kind: 'ok'; hops: FetchedHop[] }
     | { kind: 'rate-limited' }
     | { kind: 'error'; message: string };
+
+/**
+ * Decide which URL to fetch next after a redirect.
+ *
+ * The restorer must never leave the archive: following a historical `Location`
+ * to the live web would archive 2026 content under an old URL. So when the
+ * redirect was served by a Wayback route, a non-Wayback target is fetched
+ * through Wayback at the same capture time (`/web/<ts>id_/<target>`), which
+ * yields that capture's archived copy.
+ *
+ * A playback redirect (the timestamp shift Wayback writes itself, detected by
+ * its `X-Archive-Redirect-Reason` header) names another replay route, either
+ * absolute or relative to the Wayback host, and is followed unchanged. Without
+ * that header an absolute replay URL is recognised from its form; a relative
+ * `/web/...` path is also treated as playback, since it cannot be a location on
+ * the captured site.
+ */
+export function resolveRedirectUrl(location: string, currentUrl: string, playbackRedirect = false): string | null {
+    let resolved: string;
+    const current = parseWaybackUrl(currentUrl);
+
+    if (!current) {
+        try {
+            resolved = new URL(location, currentUrl).href;
+        } catch {
+            return null;
+        }
+        return /^https?:\/\//i.test(resolved) ? resolved : null;
+    }
+
+    if (playbackRedirect || isPlaybackRedirect(location, currentUrl)) {
+        try {
+            resolved = new URL(location, currentUrl).href;
+        } catch {
+            return null;
+        }
+        return /^https?:\/\//i.test(resolved) ? resolved : null;
+    }
+
+    // Resolve a historical Location against the URL the capture is of, not
+    // against the Wayback route that served it.
+    try {
+        resolved = new URL(location, current.innerUrl).href;
+    } catch {
+        return null;
+    }
+    if (!/^https?:\/\//i.test(resolved)) return null;
+    return `https://web.archive.org/web/${current.ts14}id_/${resolved}`;
+}
 
 /**
  * Fetch a URL, following redirects (up to 8 hops) and recording every hop, not
@@ -187,13 +249,9 @@ function fetchOnce(url: string, userAgent: string, accept: string, acceptLanguag
                 if (status >= 300 && status < 400 && loc) {
                     res.resume();
                     hops.push({ url: current, status, statusText, headers: collectHeaders(res.headers), body: Buffer.alloc(0) });
-                    let next: string;
-                    try {
-                        next = new URL(loc, current).href;
-                    } catch {
-                        next = loc;
-                    }
-                    if (!/^https?:\/\//i.test(next)) {
+                    const playbackRedirect = res.headers['x-archive-redirect-reason'] !== undefined;
+                    const next = resolveRedirectUrl(loc, current, playbackRedirect);
+                    if (!next) {
                         resolve({ kind: 'error', message: `bad redirect location: ${loc}` });
                         return;
                     }
@@ -318,7 +376,7 @@ function recordFromLocal(target: WaybackTarget, record: WarcRecord): KeptRecord 
 // Output
 // ---------------------------------------------------------------------------
 
-interface KeptRecord {
+export interface KeptRecord {
     innerUrl: string;
     ts17: string;
     mime: string;
@@ -331,10 +389,143 @@ interface KeptRecord {
     /**
      * The `request` record documenting how this capture was fetched (the `id_`
      * identity route, under which client identity), written immediately before
-     * the response member. Present only on the first hop of a fetch, mirroring
-     * the downloader's one-request-per-URL convention.
+     * the response member. Present only on the first stored hop of a fetch,
+     * mirroring the downloader's one-request-per-URL convention.
      */
     requestRecord?: Buffer;
+}
+
+/** The records one successful `id_` chain contributes to the output. */
+export interface RestoredRecords {
+    records: KeptRecord[];
+    pages: Record<string, unknown>[];
+    /** True when the chain produced a record for the requested snapshot itself. */
+    wroteTarget: boolean;
+    /** Status of the last record written, for progress logging. */
+    lastStatus: number;
+    /** Capture timestamp (14 digits) of the last record written, for logging. */
+    lastTs14: string;
+    /** Playback redirects passed over: retrieval scaffolding, never archived. */
+    skippedPlaybackRedirects: number;
+    /** Wayback error pages passed over: the 2026 frontend, never archived. */
+    skippedErrorPages: number;
+}
+
+/** Key identifying one archived snapshot: inner URL plus capture timestamp. A
+ * URL captured at several times is several resources; two routes of one capture
+ * (bare, `im_`, ...) are one. */
+export function snapshotKey(innerUrl: string, ts14: string): string {
+    return innerUrl + '\t' + ts14;
+}
+
+/** True for a redirect Wayback wrote itself (a timestamp shift to the nearest
+ * capture), which must be followed but never archived: the old server never
+ * sent it, and its `location` is another playback URL.
+ *
+ * A real archived redirect, by contrast, is served with historical
+ * `X-Archive-Orig-*` headers (and its rewritten `location` unwrapped back to
+ * the historical target), so it is always kept. Wayback marks its own redirects
+ * with `X-Archive-Redirect-Reason`; the `location` test is the fallback for a
+ * response whose historical headers and reason header are both absent. */
+function isPlaybackHop(hop: FetchedHop): boolean {
+    if (hop.status < 300 || hop.status >= 400) return false;
+    const names = hop.headers.map(([name]) => name.toLowerCase());
+    if (names.some((name) => name.startsWith('x-archive-orig-'))) return false;
+    if (names.includes('x-archive-redirect-reason')) return true;
+    const location = hop.headers.find(([name]) => name.toLowerCase() === 'location')?.[1];
+    return location !== undefined && isPlaybackRedirect(location, hop.url);
+}
+
+/**
+ * Turn one successful `id_` fetch (its redirect chain) into output records.
+ *
+ * Every kept hop is stored under its own inner URL. Its timestamp is the
+ * capture time the hop's URL names: a followed redirect to a Wayback playback
+ * URL carries the capture timestamp Wayback chose for it, so the bytes keep
+ * their real capture time instead of being relabelled with the timestamp that
+ * redirected to them.
+ *
+ * Two kinds of hop are retrieval scaffolding of the 2026 replay frontend, not
+ * historical material, and are never written:
+ *
+ *   - a playback redirect (a timestamp shift to the nearest capture);
+ *   - Wayback's own error page.
+ *
+ * `storedKeys` de-duplicates by inner URL AND capture timestamp. Sharing it
+ * across a run keeps a redirect target that is also its own target from being
+ * written twice, without merging distinct historical captures of one URL.
+ */
+export function buildRestoredRecords(opts: {
+    target: WaybackTarget;
+    hops: FetchedHop[];
+    storedKeys: Set<string>;
+    titleByInnerUrl: Map<string, string>;
+    userAgent: string;
+    accept: string;
+    acceptLanguage: string;
+}): RestoredRecords {
+    const { target, hops, storedKeys, titleByInnerUrl, userAgent, accept, acceptLanguage } = opts;
+    const records: KeptRecord[] = [];
+    const pages: Record<string, unknown>[] = [];
+    let lastStatus = 0;
+    let lastTs14 = target.ts14;
+    let skippedPlaybackRedirects = 0;
+    let skippedErrorPages = 0;
+
+    for (const hop of hops) {
+        if (isPlaybackHop(hop)) {
+            skippedPlaybackRedirects++;
+            continue;
+        }
+        if (isWaybackErrorPage(hop.status, hop.headers, hop.body)) {
+            skippedErrorPages++;
+            continue;
+        }
+
+        const hopWayback = parseWaybackUrl(hop.url);
+        const hopInner = hopWayback?.innerUrl ?? hop.url;
+        const ts14 = hopWayback?.ts14 ?? target.ts14;
+        const storeKey = snapshotKey(hopInner, ts14);
+        if (storedKeys.has(storeKey)) continue;
+        storedKeys.add(storeKey);
+
+        const ts17 = (ts14 + '000').slice(0, 17);
+        const dateRfc3339 = cdxjTsToRfc3339(ts17);
+        const rawCtype = (hop.headers.find(([name]) => name.toLowerCase() === 'content-type')?.[1] || '').split(';')[0].trim();
+        const headers = restoreWaybackHeaders(hop.headers, rawCtype || 'application/octet-stream', hop.body);
+        const mime = (headers.find(([name]) => name.toLowerCase() === 'content-type')?.[1] || rawCtype || 'application/octet-stream').split(';')[0].trim() || 'application/octet-stream';
+        const recordId = `<urn:uuid:${crypto.randomUUID()}>`;
+
+        records.push({
+            innerUrl: hopInner,
+            ts17,
+            mime,
+            status: hop.status,
+            statusText: hop.statusText,
+            headers,
+            body: hop.body,
+            recordId,
+            requestRecord: records.length === 0
+                ? buildRequestRecord(target.idUrl, recordId, dateRfc3339, userAgent, accept, acceptLanguage)
+                : undefined,
+        });
+        lastStatus = hop.status;
+        lastTs14 = ts14;
+
+        if (isHtmlMime(mime)) {
+            pages.push({ url: hopInner, ts: cdxjTsToRfc3339(ts17), title: titleByInnerUrl.get(hopInner) || hopInner });
+        }
+    }
+
+    return {
+        records,
+        pages,
+        wroteTarget: storedKeys.has(snapshotKey(target.innerUrl, target.ts14)),
+        lastStatus,
+        lastTs14,
+        skippedPlaybackRedirects,
+        skippedErrorPages,
+    };
 }
 
 /**
@@ -343,7 +534,7 @@ interface KeptRecord {
  * output stream and re-indexed at their new offset, preserving every original
  * CDXJ field except offset/length.
  */
-interface CarriedRecord {
+export interface CarriedRecord {
     /** The record's URL, unchanged. */
     url: string;
     /** The original SURT sort key from the CDXJ line. */
@@ -358,6 +549,8 @@ interface CarriedRecord {
     isHtml: boolean;
     /** Page title from the input pages.jsonl, when present. */
     title?: string;
+    /** The input's own pages.jsonl entry for this URL, copied unchanged. */
+    page?: Record<string, unknown>;
 }
 
 /** True when Wayback would have rewritten a body of this content type. These
@@ -450,8 +643,9 @@ export function dropStaleCarried(
     return { warcGz, indexLines: newIndexLines, pagesText };
 }
 
-/** Write (or append to) the output WACZ. */
-function writeOutput(opts: {
+/** Write (or append to) the output WACZ. Exported for the offline write-path
+ * tests, which build records directly instead of fetching them. */
+export function writeOutput(opts: {
     outputFile: string;
     title: string;
     existing: ExistingArchive | null;
@@ -528,7 +722,13 @@ function writeOutput(opts: {
         newIndexLines.push(`${c.key} ${c.ts} ${JSON.stringify(json)}`);
         offset += member.length;
 
-        if (c.isHtml) {
+        if (c.page) {
+            // A carried page keeps the input's own page entry, including its
+            // full text and size, instead of a stripped-down replacement. This
+            // also covers a revisit record whose CDX mime says `warc/revisit`
+            // but which the input still listed as a page.
+            carriedPages.push(c.page);
+        } else if (c.isHtml) {
             carriedPages.push({
                 url: c.url,
                 ts: cdxjTsToRfc3339(c.ts),
@@ -605,9 +805,12 @@ async function main(): Promise<void> {
 
     const entries = parseCdxj(zip.readEntry(indexName).toString('utf8'));
 
-    // Original page titles from pages.jsonl, keyed two ways: by the URL itself
-    // (for non-replay records carried over as-is) and by the inner URL of a
-    // Wayback replay entry (for restored pages).
+    // Original page entries from pages.jsonl, keyed by URL plus capture time
+    // (a URL captured twice has one entry per capture) and by URL alone as a
+    // fallback. Carried records copy their entry unchanged; restored pages need
+    // a new entry under the inner URL.
+    const pageByUrlTs = new Map<string, Record<string, unknown>>();
+    const pageByUrl = new Map<string, Record<string, unknown>>();
     const titleByInnerUrl = new Map<string, string>();
     const titleByUrl = new Map<string, string>();
     try {
@@ -620,7 +823,12 @@ async function main(): Promise<void> {
             } catch {
                 continue;
             }
-            if (typeof obj.url !== 'string' || typeof obj.title !== 'string') continue;
+            if (typeof obj.url !== 'string') continue;
+            if (typeof obj.ts === 'string') {
+                pageByUrlTs.set(obj.url + '\t' + rfc3339ToTs14(obj.ts), obj);
+            }
+            pageByUrl.set(obj.url, obj);
+            if (typeof obj.title !== 'string') continue;
             titleByUrl.set(obj.url, obj.title);
             const wb = parseWaybackUrl(obj.url);
             if (wb) titleByInnerUrl.set(wb.innerUrl, obj.title);
@@ -663,7 +871,6 @@ async function main(): Promise<void> {
     // Anything that is NOT a Wayback replay URL is carried over verbatim:
     // screenshots (`urn:thumbnail`/`urn:view`), Wayback queries (site/CDX
     // searches), other archive.org content, and resources from other sites.
-    const snapKey = (innerUrl: string, ts14: string): string => innerUrl + '\t' + ts14;
     const targetBySnap = new Map<string, WaybackTarget>();
     const modifiersBySnap = new Map<string, Set<string>>();
     const replayUrlBySnap = new Map<string, string>();
@@ -695,6 +902,9 @@ async function main(): Promise<void> {
             rawMember: raw,
             isHtml: isHtmlMime(e.mime),
             title: titleByUrl.get(e.url),
+            page:
+                pageByUrlTs.get(e.url + '\t' + e.timestamp.slice(0, 14)) ??
+                pageByUrl.get(e.url),
         };
     };
 
@@ -706,9 +916,17 @@ async function main(): Promise<void> {
             if (c) carried.push(c);
             continue;
         }
-        if (isArchiveOrgHost(hostOf(wb.innerUrl))) continue;
+        if (isArchiveOrgHost(hostOf(wb.innerUrl))) {
+            // A replay of archive.org's own pages (its CDX queries, calendar
+            // pages, search screens, item pages) is not a capture of the open
+            // web. Leave it exactly as the input captured it: restoring it would
+            // invent history, and dropping it would lose a record.
+            const c = carryFromEntry(e);
+            if (c) carried.push(c);
+            continue;
+        }
 
-        const sk = snapKey(wb.innerUrl, wb.ts14);
+        const sk = snapshotKey(wb.innerUrl, wb.ts14);
 
         const mods = modifiersBySnap.get(sk) ?? new Set<string>();
         mods.add(wb.modifier);
@@ -734,13 +952,13 @@ async function main(): Promise<void> {
     const existingSnapshotKeys = new Set(
         existingEntries
             .filter((e) => !parseWaybackUrl(e.url)) // ignore carried wayback URLs
-            .map((e) => snapKey(e.url, e.timestamp.slice(0, 14))),
+            .map((e) => snapshotKey(e.url, e.timestamp.slice(0, 14))),
     );
     // Carried records are identified by URL *and* timestamp (a URL may have
     // been captured several times), so dedupe against the output by that pair.
     const existingCarriedKeys = new Set(existingEntries.map((e) => `${e.url}\t${e.timestamp}`));
     const pending = [...targetBySnap.values()]
-        .filter((t) => !existingSnapshotKeys.has(snapKey(t.innerUrl, t.ts14)))
+        .filter((t) => !existingSnapshotKeys.has(snapshotKey(t.innerUrl, t.ts14)))
         .sort((a, b) => (a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0));
 
     // Split: a snapshot reached only via `im_`/`id_` has its identity bytes
@@ -751,7 +969,7 @@ async function main(): Promise<void> {
     const reuseLocally: WaybackTarget[] = [];
     const targets: WaybackTarget[] = [];
     for (const t of pending) {
-        const mods = modifiersBySnap.get(snapKey(t.innerUrl, t.ts14)) ?? new Set<string>();
+        const mods = modifiersBySnap.get(snapshotKey(t.innerUrl, t.ts14)) ?? new Set<string>();
         const onlyReusable = mods.size > 0 && [...mods].every((m) => REUSABLE_MODIFIERS.has(m));
         if (onlyReusable) reuseLocally.push(t);
         else targets.push(t);
@@ -764,7 +982,7 @@ async function main(): Promise<void> {
     const carryOnFailure = (t: WaybackTarget): void => {
         // Carry ALL original entries for the failed snapshot, not just one, so a
         // duplicate capture is preserved losslessly.
-        for (const entry of entriesBySnap.get(snapKey(t.innerUrl, t.ts14)) ?? []) {
+        for (const entry of entriesBySnap.get(snapshotKey(t.innerUrl, t.ts14)) ?? []) {
             const c = carryFromEntry(entry);
             if (c) carried.push(c);
         }
@@ -785,8 +1003,12 @@ async function main(): Promise<void> {
 
     const kept: KeptRecord[] = [];
     const keptPages: Record<string, unknown>[] = [];
-    const storedUrls = new Set<string>();
+    // De-duplication is by inner URL AND capture timestamp. Seeding it with the
+    // output's own snapshots also stops a redirect target that the output
+    // already holds from being written a second time.
+    const storedKeys = new Set(existingSnapshotKeys);
     let ok = 0;
+    let shifted = 0;
     let failed = 0;
 
     // Local reuse: `im_`/`oe_`/`id_` bodies are already the identity bytes.
@@ -797,7 +1019,7 @@ async function main(): Promise<void> {
     // re-fetching its `id_` form.
     const promoted: WaybackTarget[] = [];
     for (const t of reuseLocally) {
-        const replayUrl = replayUrlBySnap.get(snapKey(t.innerUrl, t.ts14));
+        const replayUrl = replayUrlBySnap.get(snapshotKey(t.innerUrl, t.ts14));
         const start = replayUrl ?? t.idUrl;
         const resolved = resolveLocalChain(start, byReplayUrl);
         const rec = resolved.record ?? byReplayUrl.get(start);
@@ -812,6 +1034,15 @@ async function main(): Promise<void> {
             promoted.push(t);
             continue;
         }
+        const reuseKey = snapshotKey(t.innerUrl, t.ts14);
+        if (storedKeys.has(reuseKey)) {
+            // A redirect chain this run already stored this snapshot; the bytes
+            // are the same resource, so reuse it without a second record.
+            ok++;
+            console.log(`REUSE OK ${rec.httpStatus ?? 200} ${t.innerUrl} (already stored)`);
+            continue;
+        }
+        storedKeys.add(reuseKey);
         const keptRec = recordFromLocal(t, rec);
         kept.push(keptRec);
         if (isHtmlMime(keptRec.mime)) {
@@ -827,42 +1058,16 @@ async function main(): Promise<void> {
         console.log(`promoted ${promoted.length} rewritten local body(ies) to network fetch`);
     }
 
-    // Record one hop (or a whole redirect chain) as restored records. Each hop
-    // is unwrapped back to its inner URL and stored there; hops already stored
-    // (e.g. a redirect target that is also its own entry) are skipped. The
-    // `id_` fetch is documented by a `request` record on the first hop, so a
-    // restored archive is self-describing like a directly-crawled one.
-    const recordOk = (target: WaybackTarget, hops: FetchedHop[]): void => {
-        for (let h = 0; h < hops.length; h++) {
-            const hop = hops[h];
-            const hopInner = parseWaybackUrl(hop.url)?.innerUrl ?? target.innerUrl;
-            if (storedUrls.has(hopInner)) continue;
-            storedUrls.add(hopInner);
-
-            const rawCtype = (hop.headers.find(([n]) => n.toLowerCase() === 'content-type')?.[1] || '').split(';')[0].trim();
-            const headers = restoreWaybackHeaders(hop.headers, rawCtype || 'application/octet-stream', hop.body);
-            const mime = (headers.find(([n]) => n.toLowerCase() === 'content-type')?.[1] || rawCtype || 'application/octet-stream').split(';')[0].trim() || 'application/octet-stream';
-
-            const recordId = `<urn:uuid:${crypto.randomUUID()}>`;
-            kept.push({
-                innerUrl: hopInner,
-                ts17: (target.ts14 + '000').slice(0, 17),
-                mime,
-                status: hop.status,
-                statusText: hop.statusText,
-                headers,
-                body: hop.body,
-                recordId,
-                requestRecord: h === 0
-                    ? buildRequestRecord(target.idUrl, recordId, cdxjTsToRfc3339((target.ts14 + '000').slice(0, 17)), userAgent, accept, acceptLanguage)
-                    : undefined,
-            });
-
-            if (isHtmlMime(mime)) {
-                const title = titleByInnerUrl.get(hopInner) || hopInner;
-                keptPages.push({ url: hopInner, ts: cdxjTsToRfc3339((target.ts14 + '000').slice(0, 17)), title });
-            }
-        }
+    // Turn one successful fetch into output records. A chain that only shifts
+    // to a real capture elsewhere (Wayback had nothing at the requested
+    // timestamp) does not restore the requested snapshot itself: its input
+    // records are left as-is for a later run instead of being relabelled with
+    // bytes captured at a different time.
+    const storeOutcome = (target: WaybackTarget, hops: FetchedHop[]): RestoredRecords => {
+        const batch = buildRestoredRecords({ target, hops, storedKeys, titleByInnerUrl, userAgent, accept, acceptLanguage });
+        kept.push(...batch.records);
+        keptPages.push(...batch.pages);
+        return batch;
     };
 
     // Normal pool: one attempt per URL, at full concurrency. A 429 is set
@@ -887,10 +1092,22 @@ async function main(): Promise<void> {
                 console.log(`[${id}] FAIL ${outcome.message} | ${t.innerUrl} (left as-is)`);
                 continue;
             }
-            recordOk(t, outcome.hops);
-            ok++;
-            const finalHop = outcome.hops[outcome.hops.length - 1];
-            console.log(`[${id}] OK ${finalHop.status} ${t.innerUrl}`);
+            const batch = storeOutcome(t, outcome.hops);
+            if (batch.wroteTarget) {
+                ok++;
+                console.log(`[${id}] OK ${batch.lastStatus} ${t.innerUrl}`);
+            } else if (batch.records.length > 0) {
+                // Wayback answered with a timestamp shift: the bytes are real,
+                // but they belong to another capture, so they are stored under
+                // that capture's own time and this snapshot is left as-is.
+                shifted++;
+                carryOnFailure(t);
+                console.log(`[${id}] SHIFT ${batch.lastStatus} ${t.innerUrl} (no capture at ${t.ts14}; nearest capture stored at ${batch.lastTs14}) (left as-is)`);
+            } else {
+                failed++;
+                carryOnFailure(t);
+                console.log(`[${id}] SKIP ${t.innerUrl} (no historical capture) (left as-is)`);
+            }
         }
     };
 
@@ -925,10 +1142,19 @@ async function main(): Promise<void> {
             console.log(`SLOW FAIL ${outcome.message} | ${item.target.innerUrl} (left as-is)`);
             continue;
         }
-        recordOk(item.target, outcome.hops);
-        ok++;
-        const finalHop = outcome.hops[outcome.hops.length - 1];
-        console.log(`SLOW OK ${finalHop.status} ${item.target.innerUrl}`);
+        const batch = storeOutcome(item.target, outcome.hops);
+        if (batch.wroteTarget) {
+            ok++;
+            console.log(`SLOW OK ${batch.lastStatus} ${item.target.innerUrl}`);
+        } else if (batch.records.length > 0) {
+            shifted++;
+            carryOnFailure(item.target);
+            console.log(`SLOW SHIFT ${batch.lastStatus} ${item.target.innerUrl} (no capture at ${item.target.ts14}; nearest capture stored at ${batch.lastTs14}) (left as-is)`);
+        } else {
+            failed++;
+            carryOnFailure(item.target);
+            console.log(`SLOW SKIP ${item.target.innerUrl} (no historical capture) (left as-is)`);
+        }
         await sleep(args.rateLimitDelay);
     }
 
@@ -949,11 +1175,11 @@ async function main(): Promise<void> {
     });
     carriedToWrite.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
-    console.log(`\n${ok} restored, ${failed} skipped, ${carriedToWrite.length} carried over`);
+    console.log(`\n${ok} restored, ${shifted} shifted to their real capture time, ${failed} skipped, ${carriedToWrite.length} carried over`);
 
     if (kept.length === 0 && carriedToWrite.length === 0 && (!existing || args.title === undefined)) {
         if (existing) {
-            console.log('All URLs already restored and no title change — nothing to do.');
+            console.log('Nothing new to add: the output already holds every record these snapshots produced.');
             return;
         }
         console.error('Nothing to restore.');
@@ -962,7 +1188,7 @@ async function main(): Promise<void> {
 
     // Snapshots restored this run, so dropStaleCarried can prune their stale
     // carried wayback records from the existing output (B2).
-    const restoredSnapKeys = new Set(kept.map((r) => snapKey(r.innerUrl, r.ts17.slice(0, 14))));
+    const restoredSnapKeys = new Set(kept.map((r) => snapshotKey(r.innerUrl, r.ts17.slice(0, 14))));
 
     writeOutput({ outputFile: args.outputFile, title, existing, kept, pages: keptPages, carried: carriedToWrite, restoredSnapKeys });
 

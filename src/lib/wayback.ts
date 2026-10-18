@@ -54,6 +54,55 @@ export function parseWaybackUrl(url: string): WaybackTarget | null {
     };
 }
 
+/**
+ * True when a redirect's `location` names a Wayback playback URL rather than a
+ * URL the era's server sent.
+ *
+ * Wayback answers a timestamp it has no capture for with a redirect to the
+ * nearest capture, and it writes that redirect itself, in its own
+ * `/web/<ts>[mod_]/<url>` form. That redirect is retrieval scaffolding from the
+ * replay frontend, not historical material: the old server never sent it, and
+ * its target is another Wayback URL. A restorer follows it to reach the bytes,
+ * but must not archive it as if it were a redirect from the past.
+ *
+ * A relative location is resolved against the URL that answered it, since
+ * `/web/...` is relative to `https://web.archive.org/`.
+ */
+export function isPlaybackRedirect(location: string, baseUrl: string): boolean {
+    let resolved: string;
+    try {
+        resolved = new URL(location, baseUrl).href;
+    } catch {
+        resolved = location;
+    }
+    if (parseWaybackUrl(resolved)) return true;
+    try {
+        const parsed = new URL(resolved);
+        return isArchiveOrgHost(parsed.hostname) && parsed.pathname.startsWith('/web/');
+    } catch {
+        return false;
+    }
+}
+
+/** Largest body scanned for Wayback's error-page title. The real page is a few
+ * kilobytes; the cap keeps a huge archived document from being scanned. */
+const WAYBACK_ERROR_PAGE_SCAN_LIMIT = 256 * 1024;
+
+/**
+ * True when a response is Wayback's own error page instead of an archived
+ * capture. Wayback serves that page (title "Wayback Machine") when it has no
+ * capture for a URL, and it comes with Wayback's 2026 headers, not the
+ * historical `X-Archive-Orig-*` ones. Archiving it would put the 2026 replay
+ * frontend into the restored archive under an old URL, so the restorer treats
+ * such a response as a failed fetch and leaves the input record untouched.
+ */
+export function isWaybackErrorPage(status: number, headers: [string, string][], body: Buffer): boolean {
+    if (status < 400) return false;
+    if (body.length === 0 || body.length > WAYBACK_ERROR_PAGE_SCAN_LIMIT) return false;
+    if (headers.some(([name]) => name.toLowerCase().startsWith(ORIG_HEADER_PREFIX))) return false;
+    return /<title>\s*Wayback Machine\s*<\/title>/i.test(body.toString('latin1'));
+}
+
 /** Wayback replay headers that must never leak into a faithfully restored
  * record: the replay frontend's own framing and policy headers. */
 export const WAYBACK_DROP_HEADERS = new Set([
@@ -67,6 +116,18 @@ export const WAYBACK_DROP_HEADERS = new Set([
 ]);
 
 export const ORIG_HEADER_PREFIX = 'x-archive-orig-';
+
+/**
+ * The historical target of an archived redirect. Wayback rewrites a captured
+ * `Location` into a replay route (`/web/<ts>[mod_]/<url>`) but, unlike the
+ * other headers, does not publish the original under `X-Archive-Orig-Location`,
+ * so the target is read back out of the route. A location Wayback left
+ * untouched is returned as-is.
+ */
+export function historicalLocation(location: string): string {
+    const parsed = parseWaybackUrl(location);
+    return parsed ? parsed.innerUrl : location;
+}
 
 /**
  * Rebuild an `id_` response's headers as if the era's server had answered
@@ -102,6 +163,15 @@ export function restoreWaybackHeaders(headers: [string, string][], mime: string,
                 continue;
             }
             push(real, value);
+        }
+
+        // Wayback rewrites a captured redirect's `Location` into its own replay
+        // route and (unlike the other headers) does not publish the original
+        // under `X-Archive-Orig-Location`. Read the historical target back out
+        // of that route instead of dropping the redirect's destination.
+        if (!seen.has('location')) {
+            const rawLocation = headers.find(([name]) => name.toLowerCase() === 'location')?.[1];
+            if (rawLocation) push('location', historicalLocation(rawLocation));
         }
     } else {
         for (const [name, value] of headers) {

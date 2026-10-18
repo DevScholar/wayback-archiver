@@ -92,7 +92,22 @@ that looks as if the pages were captured directly, in the past:
   replay artifact (`server: nginx`, CSP, `cache-control`) never leaks into the
   restored record;
 - stamps each record with its *historical* capture time, not the wall clock;
-- follows 302 redirect chains hop by hop, archiving each hop under its own URL.
+- follows a redirect the era's server sent hop by hop, archiving each hop under
+  its own URL with its historical status and `Location`, and fetches each hop
+  through Wayback at the same capture time so the live web is never contacted;
+- follows but never archives a Wayback playback redirect (the timestamp shift
+  Wayback writes when it has no capture at the requested time). The capture it
+  reaches is stamped with that capture's real time, and the requested timestamp
+  is left as-is for a later run, like a failed fetch.
+
+A URL captured at several dates is several snapshots, and each is restored
+independently. Records are de-duplicated by inner URL *and* capture timestamp,
+so the routes of one capture (bare, `im_`, ...) collapse to one record while
+distinct historical captures never overwrite each other.
+
+Wayback's own error page (the 2026 page titled "Wayback Machine", served when a
+URL is not archived) is never stored as content. The snapshot is left as-is
+instead, so a later run can retry it.
 
 Binary media are the one exception that never hit the network: Wayback only
 rewrites HTML/CSS/JavaScript bodies, so an `im_` (image), `oe_` (embedded
@@ -167,7 +182,11 @@ layer by layer:
 - each resource's `hash` + `bytes` → its stored bytes (covering the whole
   `data.warc.gz`, including the un-indexed `request` and `metadata` records);
 - each indexed response record's `WARC-Block-Digest` and `WARC-Payload-Digest`
-  → re-derived over the exact byte spans they cover.
+  → re-derived over the exact byte spans they cover. A `revisit` record has no
+  payload of its own: its digest is checked against the record named by
+  `WARC-Refers-To`, and reported as unverifiable (not failed) when that record
+  is not in the archive. A non-HTTP record (`resource`, `metadata`) is checked
+  over its whole block, which is its payload.
 
 Exit code is 0 only when every layer passes. This is an **offline audit**, run
 deliberately (after copying an archive to new media, or on a schedule to catch

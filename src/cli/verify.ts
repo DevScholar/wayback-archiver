@@ -168,6 +168,14 @@ function main(): void {
 
     // ---------------------------------------------------------------------
     // Layer 3: per-record WARC digests, over the exact byte spans each covers.
+    //
+    // A `response` record's `WARC-Payload-Digest` covers the HTTP entity body.
+    // A non-HTTP record (`resource`, `metadata`) has no HTTP message: its
+    // payload is the whole block. A `revisit` record carries no payload of its
+    // own: by WARC 1.1 its digest identifies the payload of the record named by
+    // `WARC-Refers-To-Target-URI` / `WARC-Refers-To-Date`, so it is checked
+    // against that record, and reported as unverifiable (not failed) when the
+    // referenced record is not in the archive.
     // ---------------------------------------------------------------------
     console.log('\n=== WARC records ===');
     const recStats = newStats();
@@ -185,6 +193,22 @@ function main(): void {
             entries = [];
             fail(`could not parse index: ${(e as Error).message}`);
         }
+
+        interface LoadedRecord {
+            entry: { url: string };
+            warc: Map<string, string>;
+            block: Buffer;
+            payload: Buffer;
+            blockDigest: string | null;
+            payloadDigest: string | null;
+            targetUri: string;
+            date: string;
+            warcType: string;
+        }
+
+        const loaded: LoadedRecord[] = [];
+        const revisitChecks: LoadedRecord[] = [];
+
         for (const e of entries) {
             recStats.checked++;
             let raw: Buffer;
@@ -202,9 +226,11 @@ function main(): void {
             const payloadDigest = hexOf(warc.get('warc-payload-digest'));
             const contentLen = Number(warc.get('content-length'));
 
-            // The WARC `Content-Length` is the exact HTTP-message length (status
-            // line + HTTP headers + blank line + body), which is what
-            // WARC-Block-Digest hashes. Re-derive that span and the body span.
+            // The WARC `Content-Length` is the exact record-block length. For a
+            // response that block is the whole HTTP message (status line +
+            // headers + blank line + body), which is what WARC-Block-Digest
+            // hashes; the body span is re-derived from it. A non-HTTP record's
+            // payload is the entire block, so no blank line is looked for.
             const sep = findHeaderEnd(raw);
             if (sep.index < 0 || !Number.isFinite(contentLen) || contentLen < 0) {
                 recStats.skipped++;
@@ -212,8 +238,25 @@ function main(): void {
                 continue;
             }
             const block = raw.subarray(sep.index + sep.termLen, sep.index + sep.termLen + contentLen);
-            const httpSep = findHeaderEnd(block);
-            const body = httpSep.index >= 0 ? block.subarray(httpSep.index + httpSep.termLen) : block;
+            const isHttp = block.subarray(0, 5).toString('latin1') === 'HTTP/';
+            let payload = block;
+            if (isHttp) {
+                const httpSep = findHeaderEnd(block);
+                if (httpSep.index >= 0) payload = block.subarray(httpSep.index + httpSep.termLen);
+            }
+
+            const record: LoadedRecord = {
+                entry: { url: e.url },
+                warc,
+                block,
+                payload,
+                blockDigest,
+                payloadDigest,
+                targetUri: warc.get('warc-target-uri') || '',
+                date: warc.get('warc-date') || '',
+                warcType: warc.get('warc-type') || '',
+            };
+            loaded.push(record);
 
             if (blockDigest) {
                 const computed = sha256(block);
@@ -226,13 +269,18 @@ function main(): void {
             } else {
                 recStats.absent++;
             }
+
             if (payloadDigest) {
-                const computed = sha256(body);
-                if (computed === payloadDigest) {
-                    recStats.ok++;
+                if (record.warcType === 'revisit') {
+                    revisitChecks.push(record);
                 } else {
-                    recStats.failed++;
-                    fail(`${e.url}: WARC-Payload-Digest mismatch (stored ${payloadDigest}, computed ${computed})`);
+                    const computed = sha256(payload);
+                    if (computed === payloadDigest) {
+                        recStats.ok++;
+                    } else {
+                        recStats.failed++;
+                        fail(`${e.url}: WARC-Payload-Digest mismatch (stored ${payloadDigest}, computed ${computed})`);
+                    }
                 }
             } else {
                 recStats.absent++;
@@ -241,6 +289,69 @@ function main(): void {
                 recStats.skipped++;
                 console.log(`SKIP  ${e.url}: no WARC digests to check`);
             }
+        }
+
+        // Resolve revisit digests through the record they name. A visit with an
+        // exact (target URI + date) match must match it; when only the target
+        // URI is known and several captures exist, a match against any of them
+        // passes, and no match is reported as unverifiable rather than as
+        // corruption, because the intended capture cannot be identified.
+        const byTarget = new Map<string, LoadedRecord[]>();
+        const byTargetDate = new Map<string, LoadedRecord[]>();
+        for (const record of loaded) {
+            if (!record.targetUri) continue;
+            const list = byTarget.get(record.targetUri) ?? [];
+            list.push(record);
+            byTarget.set(record.targetUri, list);
+            if (record.date) {
+                const key = record.targetUri + '\t' + record.date;
+                const dated = byTargetDate.get(key) ?? [];
+                dated.push(record);
+                byTargetDate.set(key, dated);
+            }
+        }
+
+        let resolvedRevisits = 0;
+        let unverifiableRevisits = 0;
+        for (const revisit of revisitChecks) {
+            const expected = revisit.payloadDigest!;
+            const refersTo = revisit.warc.get('warc-refers-to-target-uri') || '';
+            const refersDate = revisit.warc.get('warc-refers-to-date') || '';
+            const exact = refersTo && refersDate
+                ? byTargetDate.get(refersTo + '\t' + refersDate)
+                : undefined;
+            const candidates = exact ?? (refersTo ? byTarget.get(refersTo) ?? [] : []);
+
+            let matched = false;
+            for (const candidate of candidates) {
+                if (candidate === revisit) continue;
+                if (candidate.warcType === 'revisit') {
+                    if (candidate.payloadDigest === expected) {
+                        matched = true;
+                        break;
+                    }
+                } else if (sha256(candidate.payload) === expected) {
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (matched) {
+                resolvedRevisits++;
+                recStats.ok++;
+            } else if (exact) {
+                recStats.failed++;
+                fail(`${revisit.entry.url}: WARC-Payload-Digest does not match the referenced record (stored ${expected})`);
+            } else {
+                unverifiableRevisits++;
+            }
+        }
+
+        if (revisitChecks.length > 0) {
+            console.log(
+                `revisits: ${resolvedRevisits} payload digest(s) checked through WARC-Refers-To, ` +
+                `${unverifiableRevisits} unverifiable (referenced record not archived)`,
+            );
         }
         console.log(
             `records: ${recStats.ok} digest-checks ok, ${recStats.failed} failed, ` +
