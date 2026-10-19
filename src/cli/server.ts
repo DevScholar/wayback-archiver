@@ -18,29 +18,29 @@
  * worker's event loop, which is exactly what the extra workers absorb.
  */
 
-import * as http from 'http';
-import * as path from 'path';
-import * as os from 'os';
-import cluster from 'cluster';
-import { Wacz } from '../archive/wacz.js';
-import { WarcRecord } from '../archive/warc.js';
-import { renderIndexPage, buildPageRows } from '../replay/index-page.js';
-import { rfc3339ToTs14 } from '../lib/time.js';
-import { createDefaultPipeline, ReplayContext } from '../replay/plugins.js';
-import { detectContentKind } from '../replay/rewrite.js';
-import { URL_FIXER_SCRIPT_ROUTE } from '../replay/url-fixer.js';
-import { URL_FIXER_SHIM } from '../replay/url-fixer-shim.js';
-import { renderNotFoundPage } from '../replay/not-found.js';
-import { LruCache } from '../lib/lru.js';
+import * as http from "http";
+import * as path from "path";
+import * as os from "os";
+import cluster from "cluster";
+import { Wacz } from "../archive/wacz.js";
+import { WarcRecord } from "../archive/warc.js";
+import { renderIndexPage, buildPageRows } from "../replay/index-page.js";
+import { rfc3339ToTs14 } from "../lib/time.js";
+import { createDefaultPipeline, ReplayContext } from "../replay/plugins.js";
+import { detectContentKind } from "../replay/rewrite.js";
+import { URL_FIXER_SCRIPT_ROUTE } from "../replay/url-fixer.js";
+import { URL_FIXER_SHIM } from "../replay/url-fixer-shim.js";
+import { renderNotFoundPage } from "../replay/not-found.js";
+import { LruCache } from "../lib/lru.js";
 
 /** Decode the inner URL of a `/web/<ts>[mod_]/<url>` path for the "not saved"
  * page. A malformed escape is shown as the raw text instead of throwing. */
 function replayInnerUrl(raw: string): string {
-    try {
-        return decodeURIComponent(raw);
-    } catch {
-        return raw;
-    }
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -48,46 +48,62 @@ function replayInnerUrl(raw: string): string {
 // ---------------------------------------------------------------------------
 
 interface Args {
-    wacz: string;
-    port: number;
-    expose: boolean;
-    maxConnections: number;
-    workers: number;
+  wacz: string;
+  port: number;
+  expose: boolean;
+  maxConnections: number;
+  workers: number;
 }
 
 function parseArgs(argv: string[]): Args {
-    const args: Args = { wacz: '', port: 8080, expose: false, maxConnections: 64, workers: 0 };
-    const positional: string[] = [];
-    for (let i = 0; i < argv.length; i++) {
-        const a = argv[i];
-        if (a === '--port') args.port = parseInt(argv[++i] || '8080', 10);
-        else if (a.startsWith('--port=')) args.port = parseInt(a.slice('--port='.length), 10);
-        else if (a === '--expose') args.expose = true;
-        else if (a === '--max-connections') args.maxConnections = parseInt(argv[++i] || '64', 10);
-        else if (a.startsWith('--max-connections=')) args.maxConnections = parseInt(a.slice('--max-connections='.length), 10);
-        else if (a === '--workers') args.workers = parseInt(argv[++i] || '0', 10);
-        else if (a.startsWith('--workers=')) args.workers = parseInt(a.slice('--workers='.length), 10);
-        else if (!a.startsWith('--')) positional.push(a);
-    }
-    if (positional.length > 0) args.wacz = path.resolve(positional[0]);
-    if (!args.wacz) {
-        console.error('Usage: npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose] [--max-connections 64] [--workers N]');
-        process.exit(1);
-    }
-    return args;
+  const args: Args = {
+    wacz: "",
+    port: 8080,
+    expose: false,
+    maxConnections: 64,
+    workers: 0,
+  };
+  const positional: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--port") args.port = parseInt(argv[++i] || "8080", 10);
+    else if (a.startsWith("--port="))
+      args.port = parseInt(a.slice("--port=".length), 10);
+    else if (a === "--expose") args.expose = true;
+    else if (a === "--max-connections")
+      args.maxConnections = parseInt(argv[++i] || "64", 10);
+    else if (a.startsWith("--max-connections="))
+      args.maxConnections = parseInt(a.slice("--max-connections=".length), 10);
+    else if (a === "--workers") args.workers = parseInt(argv[++i] || "0", 10);
+    else if (a.startsWith("--workers="))
+      args.workers = parseInt(a.slice("--workers=".length), 10);
+    else if (!a.startsWith("--")) positional.push(a);
+  }
+  if (positional.length > 0) args.wacz = path.resolve(positional[0]);
+  if (!args.wacz) {
+    console.error(
+      "Usage: npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose] [--max-connections 64] [--workers N]",
+    );
+    process.exit(1);
+  }
+  return args;
 }
 
 function getLocalExternalIP(): string {
-    const interfaces = os.networkInterfaces();
-    for (const dev in interfaces) {
-        const iface = interfaces[dev]!;
-        for (const alias of iface) {
-            if (alias.family === 'IPv4' && alias.address !== '127.0.0.1' && !alias.internal) {
-                return alias.address;
-            }
-        }
+  const interfaces = os.networkInterfaces();
+  for (const dev in interfaces) {
+    const iface = interfaces[dev]!;
+    for (const alias of iface) {
+      if (
+        alias.family === "IPv4" &&
+        alias.address !== "127.0.0.1" &&
+        !alias.internal
+      ) {
+        return alias.address;
+      }
     }
-    return '0.0.0.0';
+  }
+  return "0.0.0.0";
 }
 
 // ---------------------------------------------------------------------------
@@ -105,22 +121,28 @@ const TEXT_HTML = /text\/html/i;
  * that value wins before this is called.
  */
 export function sniffCharset(body: Buffer, mime: string): string | undefined {
-    if (!TEXT_HTML.test(mime)) return undefined;
-    if (body.length >= 3 && body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) return 'utf-8';
-    const s = body.subarray(0, 8192).toString('latin1');
-    const meta = s.match(/<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9\-_]+)/i);
-    if (meta) return meta[1];
-    return isValidUtf8(body) ? 'utf-8' : 'windows-1252';
+  if (!TEXT_HTML.test(mime)) return undefined;
+  if (
+    body.length >= 3 &&
+    body[0] === 0xef &&
+    body[1] === 0xbb &&
+    body[2] === 0xbf
+  )
+    return "utf-8";
+  const s = body.subarray(0, 8192).toString("latin1");
+  const meta = s.match(/<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9\-_]+)/i);
+  if (meta) return meta[1];
+  return isValidUtf8(body) ? "utf-8" : "windows-1252";
 }
 
 /** True when the bytes decode as UTF-8 without a replacement character. */
 function isValidUtf8(buffer: Buffer): boolean {
-    try {
-        new TextDecoder('utf-8', { fatal: true }).decode(buffer);
-        return true;
-    } catch {
-        return false;
-    }
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -133,10 +155,10 @@ function isValidUtf8(buffer: Buffer): boolean {
  * as 0x97) with no encoding metadata at all.
  */
 function identifiedCharset(record: WarcRecord): string | undefined {
-    const ipt = record.headers.get('warc-identified-payload-type');
-    if (!ipt) return undefined;
-    const m = /[;\s]charset\s*=\s*"?([a-zA-Z0-9._-]+)"?/i.exec(ipt);
-    return m ? m[1] : undefined;
+  const ipt = record.headers.get("warc-identified-payload-type");
+  if (!ipt) return undefined;
+  const m = /[;\s]charset\s*=\s*"?([a-zA-Z0-9._-]+)"?/i.exec(ipt);
+  return m ? m[1] : undefined;
 }
 
 /**
@@ -148,21 +170,21 @@ function identifiedCharset(record: WarcRecord): string | undefined {
  * stays inspectable.
  */
 const STRIP_HEADERS: Record<string, string> = {
-    connection: 'Connection',
-    'keep-alive': 'Keep-Alive',
-    'proxy-authenticate': 'Proxy-Authenticate',
-    'proxy-authorization': 'Proxy-Authorization',
-    te: 'TE',
-    trailer: 'Trailer',
-    'transfer-encoding': 'Transfer-Encoding',
-    upgrade: 'Upgrade',
-    'content-length': 'Content-Length',
-    'content-encoding': 'Content-Encoding',
+  connection: "Connection",
+  "keep-alive": "Keep-Alive",
+  "proxy-authenticate": "Proxy-Authenticate",
+  "proxy-authorization": "Proxy-Authorization",
+  te: "TE",
+  trailer: "Trailer",
+  "transfer-encoding": "Transfer-Encoding",
+  upgrade: "Upgrade",
+  "content-length": "Content-Length",
+  "content-encoding": "Content-Encoding",
 };
 
 /** Prefix for the original value of any header we had to change during replay.
  * This is the shared pywb / archiveweb.page convention (`X-Archive-Orig-*`). */
-const ARCHIVE_PREFIX = 'X-Archive-Orig-';
+const ARCHIVE_PREFIX = "X-Archive-Orig-";
 
 /**
  * Whether a replay body needs the plugin pipeline run over it. Text content
@@ -172,17 +194,21 @@ const ARCHIVE_PREFIX = 'X-Archive-Orig-';
  * kept here so the server can decide between streaming (verbatim) and buffered
  * rewrite (transform) without duplicating the mime classification.
  */
-function shouldRewrite(mime: string, status: number, identity: boolean): boolean {
-    if (identity) return false;
-    if (status >= 300 && status < 400) return false;
-    return detectContentKind(mime) !== null;
+function shouldRewrite(
+  mime: string,
+  status: number,
+  identity: boolean,
+): boolean {
+  if (identity) return false;
+  if (status >= 300 && status < 400) return false;
+  return detectContentKind(mime) !== null;
 }
 
 /** An inclusive byte range `[start, end]`, resolved and clamped against a
  * known total length. */
 interface ByteRange {
-    start: number;
-    end: number;
+  start: number;
+  end: number;
 }
 
 /**
@@ -198,31 +224,34 @@ interface ByteRange {
  * than answered with a multipart/byteranges body, which browsers never send
  * for `<video>` seeking anyway.
  */
-function parseByteRange(header: string | undefined, total: number): ByteRange | null | 'invalid' {
-    if (!header) return null;
-    const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
-    if (!m) return 'invalid';
-    const startStr = m[1];
-    const endStr = m[2];
+function parseByteRange(
+  header: string | undefined,
+  total: number,
+): ByteRange | null | "invalid" {
+  if (!header) return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m) return "invalid";
+  const startStr = m[1];
+  const endStr = m[2];
 
-    if (startStr === '') {
-        // Suffix range: the final N bytes (`bytes=-N`).
-        if (endStr === '' || total === 0) return 'invalid';
-        const suffixLen = parseInt(endStr, 10);
-        if (suffixLen <= 0) return 'invalid';
-        return { start: Math.max(0, total - suffixLen), end: total - 1 };
-    }
+  if (startStr === "") {
+    // Suffix range: the final N bytes (`bytes=-N`).
+    if (endStr === "" || total === 0) return "invalid";
+    const suffixLen = parseInt(endStr, 10);
+    if (suffixLen <= 0) return "invalid";
+    return { start: Math.max(0, total - suffixLen), end: total - 1 };
+  }
 
-    const start = parseInt(startStr, 10);
-    if (endStr === '') {
-        // Open-ended range: from `start` to the end (`bytes=N-`).
-        if (start >= total) return 'invalid';
-        return { start, end: total - 1 };
-    }
+  const start = parseInt(startStr, 10);
+  if (endStr === "") {
+    // Open-ended range: from `start` to the end (`bytes=N-`).
+    if (start >= total) return "invalid";
+    return { start, end: total - 1 };
+  }
 
-    const end = parseInt(endStr, 10);
-    if (start > end || start >= total) return 'invalid';
-    return { start, end: Math.min(end, total - 1) };
+  const end = parseInt(endStr, 10);
+  if (start > end || start >= total) return "invalid";
+  return { start, end: Math.min(end, total - 1) };
 }
 
 /**
@@ -242,63 +271,65 @@ function parseByteRange(header: string | undefined, total: number): ByteRange | 
  * one. `content-length` is always recomputed from the rewritten body.
  */
 function buildReplayHeaders(
-    record: WarcRecord,
-    url: string,
-    ts: string,
-    mime: string,
-    body: Buffer,
-    status: number,
+  record: WarcRecord,
+  url: string,
+  ts: string,
+  mime: string,
+  body: Buffer,
+  status: number,
 ): Record<string, string> {
-    const headers: Record<string, string> = {};
-    for (const [name, value] of record.httpHeaders) {
-        const lower = name.toLowerCase();
-        const canonical = STRIP_HEADERS[lower];
-        if (canonical) {
-            headers[ARCHIVE_PREFIX + canonical] = value;
-            continue;
-        }
-        if (lower === 'set-cookie' || lower === 'location') continue;
-        headers[name] = value;
+  const headers: Record<string, string> = {};
+  for (const [name, value] of record.httpHeaders) {
+    const lower = name.toLowerCase();
+    const canonical = STRIP_HEADERS[lower];
+    if (canonical) {
+      headers[ARCHIVE_PREFIX + canonical] = value;
+      continue;
     }
+    if (lower === "set-cookie" || lower === "location") continue;
+    headers[name] = value;
+  }
 
-    const loc = record.httpHeaders.get('location');
-    if (loc) {
-        let target = loc;
-        try {
-            target = new URL(loc, url).href;
-        } catch {
-            /* keep the raw value */
-        }
-        headers['location'] = `/web/${ts}/${target}`;
+  const loc = record.httpHeaders.get("location");
+  if (loc) {
+    let target = loc;
+    try {
+      target = new URL(loc, url).href;
+    } catch {
+      /* keep the raw value */
     }
+    headers["location"] = `/web/${ts}/${target}`;
+  }
 
-    let contentType = headers['content-type'] || mime;
-    // Resolve the charset to declare. The historical server's own `Content-Type`
-    // charset (already in `contentType`) wins; otherwise prefer the crawler's
-    // `WARC-Identified-Payload-Type` (matches the stored bytes), then a `<meta>`
-    // charset, then the bytes themselves (UTF-8 when valid, else Windows-1252).
-    // Declaring the charset -- not transcoding -- keeps the stored bytes
-    // verbatim while telling the browser how to decode them.
-    if (!/charset=/i.test(contentType)) {
-        const charset = identifiedCharset(record) ?? sniffCharset(body, contentType);
-        if (charset) {
-            contentType += `; charset=${charset}`;
-        } else if (TEXT_HTML.test(contentType)) {
-            contentType += '; charset=utf-8';
-        }
+  let contentType = headers["content-type"] || mime;
+  // Resolve the charset to declare. The historical server's own `Content-Type`
+  // charset (already in `contentType`) wins; otherwise prefer the crawler's
+  // `WARC-Identified-Payload-Type` (matches the stored bytes), then a `<meta>`
+  // charset, then the bytes themselves (UTF-8 when valid, else Windows-1252).
+  // Declaring the charset -- not transcoding -- keeps the stored bytes
+  // verbatim while telling the browser how to decode them.
+  if (!/charset=/i.test(contentType)) {
+    const charset =
+      identifiedCharset(record) ?? sniffCharset(body, contentType);
+    if (charset) {
+      contentType += `; charset=${charset}`;
+    } else if (TEXT_HTML.test(contentType)) {
+      contentType += "; charset=utf-8";
     }
-    headers['content-type'] = contentType;
+  }
+  headers["content-type"] = contentType;
 
-    // Bodyless responses (204/304/1xx) must not carry a Content-Length
-    // (RFC 7230 section 3.3.2); we end those without a body below.
-    const bodyless = status === 204 || status === 304 || (status >= 100 && status < 200);
-    if (!bodyless) {
-        headers['content-length'] = String(body.length);
-        // Advertise range support so the browser may seek into a replay body
-        // (most usefully an archived video) with byte-range requests.
-        headers['accept-ranges'] = 'bytes';
-    }
-    return headers;
+  // Bodyless responses (204/304/1xx) must not carry a Content-Length
+  // (RFC 7230 section 3.3.2); we end those without a body below.
+  const bodyless =
+    status === 204 || status === 304 || (status >= 100 && status < 200);
+  if (!bodyless) {
+    headers["content-length"] = String(body.length);
+    // Advertise range support so the browser may seek into a replay body
+    // (most usefully an archived video) with byte-range requests.
+    headers["accept-ranges"] = "bytes";
+  }
+  return headers;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,313 +337,355 @@ function buildReplayHeaders(
 // ---------------------------------------------------------------------------
 
 function main(): void {
-    const args = parseArgs(process.argv.slice(2));
+  const args = parseArgs(process.argv.slice(2));
 
-    // With `--workers N`, run as a cluster: each worker process opens its own
-    // WACZ (the file is read-only, so concurrent processes reading it are
-    // safe) and serves the shared port. A worker blocked decompressing a large
-    // capture stops its own requests, not the others'. This branch runs before
-    // the archive is opened, so the primary never holds a useless descriptor.
-    if (cluster.isPrimary && args.workers > 1) {
-        const n = Math.max(1, Math.min(args.workers, 256));
-        for (let i = 0; i < n; i++) cluster.fork();
-        cluster.on('exit', (worker) => {
-            cluster.fork();
-        });
-        const shutdownAll = (): void => {
-            for (const id of Object.keys(cluster.workers || {})) {
-                cluster.workers?.[id]?.kill();
-            }
-            process.exit(0);
-        };
-        process.on('SIGINT', shutdownAll);
-        process.on('SIGTERM', shutdownAll);
-        return;
+  // With `--workers N`, run as a cluster: each worker process opens its own
+  // WACZ (the file is read-only, so concurrent processes reading it are
+  // safe) and serves the shared port. A worker blocked decompressing a large
+  // capture stops its own requests, not the others'. This branch runs before
+  // the archive is opened, so the primary never holds a useless descriptor.
+  if (cluster.isPrimary && args.workers > 1) {
+    const n = Math.max(1, Math.min(args.workers, 256));
+    for (let i = 0; i < n; i++) cluster.fork();
+    cluster.on("exit", (worker) => {
+      cluster.fork();
+    });
+    const shutdownAll = (): void => {
+      for (const id of Object.keys(cluster.workers || {})) {
+        cluster.workers?.[id]?.kill();
+      }
+      process.exit(0);
+    };
+    process.on("SIGINT", shutdownAll);
+    process.on("SIGTERM", shutdownAll);
+    return;
+  }
+
+  const wacz = new Wacz(args.wacz);
+  const pipeline = createDefaultPipeline();
+
+  const host = args.expose ? "0.0.0.0" : "127.0.0.1";
+
+  // The index page lists the archive's *pages* (from pages.jsonl), not every
+  // captured resource. Each entry points at a /web/<ts>/<url> replay route.
+  const buildIndexPage = (): string => {
+    const rows = buildPageRows(
+      wacz.pages,
+      (url, ts) => `/web/${rfc3339ToTs14(ts)}/${url}`,
+      (url, ts) => {
+        const thumb = wacz.thumbnailFor(url, ts);
+        return thumb
+          ? `/web/${thumb.timestamp.slice(0, 14)}/${thumb.url}`
+          : null;
+      },
+    );
+    return renderIndexPage(wacz.title, rows, [
+      "Page",
+      "Timestamp",
+      "Original URL",
+    ]);
+  };
+
+  /** The fully-computed response for a replay request, ready to write. */
+  interface RenderedResponse {
+    status: number;
+    statusText?: string;
+    headers: Record<string, string>;
+    body: Buffer;
+  }
+
+  /**
+   * The rendered-response cache, keyed by the request path (`/web/<ts>/<url>`).
+   * The archive is immutable while it is being served, and the pipeline is
+   * stateless, so a given path always renders to the same bytes -- caching the
+   * final response (not just the decompressed record) skips the read + gunzip +
+   * link-rewrite + header rebuild for every repeat request of a hot resource.
+   * The index page is deliberately NOT cached: its footer carries the current
+   * time, and it never reads a record, so there is nothing expensive to skip.
+   */
+  const replayCache = new LruCache<RenderedResponse>({
+    maxEntries: 1024,
+    maxBytes: 256 * 1024 * 1024,
+    // A rendered response larger than 8 MiB is served directly, not cached:
+    // caching one big binary would evict the small HTML/CSS/JS responses
+    // that make a page's repeated navigation instant.
+    maxEntryBytes: 8 * 1024 * 1024,
+    sizeOf: (r) => r.body.length,
+  });
+
+  /** Compute the response for a `/web/<ts>/<url>` request, or null for a 404.
+   * Moved out of the request handler so it can be cached whole. */
+  const renderReplay = async (
+    reqUrl: string,
+  ): Promise<RenderedResponse | null> => {
+    const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
+    if (!m) return null;
+
+    const reqTs = m[1];
+    const modifier = m[2] ? m[2].toLowerCase() : "";
+    const identity = modifier === "id_";
+    let rawUrl = m[3];
+    // `urn:` URLs (page thumbnails: `urn:thumbnail:<page-url>`) already
+    // carry a scheme but not the `://` form the check below assumes; a
+    // bare hostname still needs `http://`. Leave `urn:` untouched.
+    if (
+      !/^urn:/i.test(rawUrl) &&
+      !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)
+    ) {
+      rawUrl = "http://" + rawUrl.replace(/^(https?|ftp)\//, "");
     }
 
-    const wacz = new Wacz(args.wacz);
-    const pipeline = createDefaultPipeline();
+    // Resolve the raw (still percent-encoded) URL first. Decoding the
+    // whole URL up front is wrong: a percent-encoded reserved character
+    // in a query value (e.g. `%23` = `#` inside a color parameter)
+    // becomes a literal `#`, which lookupKey then treats as a fragment
+    // separator and strips -- making the lookup miss entries the archive
+    // stores with the encoded form. Only fall back to a decoded form
+    // when the raw URL genuinely misses (e.g. non-ASCII characters the
+    // client percent-encoded).
+    let rec = await wacz.resolveRecordAsync(rawUrl, reqTs);
+    if (!rec) {
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(rawUrl);
+      } catch {
+        decoded = rawUrl;
+      }
+      if (decoded !== rawUrl)
+        rec = await wacz.resolveRecordAsync(decoded, reqTs);
+    }
+    if (!rec) return null;
 
-    const host = args.expose ? '0.0.0.0' : '127.0.0.1';
-
-    // The index page lists the archive's *pages* (from pages.jsonl), not every
-    // captured resource. Each entry points at a /web/<ts>/<url> replay route.
-    const buildIndexPage = (): string => {
-        const rows = buildPageRows(
-            wacz.pages,
-            (url, ts) => `/web/${rfc3339ToTs14(ts)}/${url}`,
-            (url, ts) => {
-                const thumb = wacz.thumbnailFor(url, ts);
-                return thumb ? `/web/${thumb.timestamp.slice(0, 14)}/${thumb.url}` : null;
-            },
-        );
-        return renderIndexPage(wacz.title, rows, ['Page', 'Timestamp', 'Original URL']);
-    };
-
-    /** The fully-computed response for a replay request, ready to write. */
-    interface RenderedResponse {
-        status: number;
-        statusText?: string;
-        headers: Record<string, string>;
-        body: Buffer;
+    // The requested timestamp may not be a real capture: the archive
+    // resolves to the *nearest* capture at or around the requested time.
+    // When that capture's own timestamp differs from what the URL asked
+    // for, redirect to the faithful timestamp -- the same way the Wayback
+    // Machine 302s a time-shifted request to the capture's actual time --
+    // so the address bar never claims one time while serving another.
+    const actualTs = rec.entry.timestamp.slice(0, 14);
+    if (actualTs !== reqTs) {
+      // Preserve the modifier across the time-shift redirect so an
+      // `id_` request stays in identity mode after it lands on the
+      // capture's faithful timestamp.
+      return {
+        status: 302,
+        headers: { Location: `/web/${actualTs}${m[2] || ""}/${rawUrl}` },
+        body: Buffer.from("Redirecting to the capture at " + actualTs),
+      };
     }
 
-    /**
-     * The rendered-response cache, keyed by the request path (`/web/<ts>/<url>`).
-     * The archive is immutable while it is being served, and the pipeline is
-     * stateless, so a given path always renders to the same bytes -- caching the
-     * final response (not just the decompressed record) skips the read + gunzip +
-     * link-rewrite + header rebuild for every repeat request of a hot resource.
-     * The index page is deliberately NOT cached: its footer carries the current
-     * time, and it never reads a record, so there is nothing expensive to skip.
-     */
-    const replayCache = new LruCache<RenderedResponse>({
-        maxEntries: 1024,
-        maxBytes: 256 * 1024 * 1024,
-        // A rendered response larger than 8 MiB is served directly, not cached:
-        // caching one big binary would evict the small HTML/CSS/JS responses
-        // that make a page's repeated navigation instant.
-        maxEntryBytes: 8 * 1024 * 1024,
-        sizeOf: (r) => r.body.length,
-    });
+    const record = rec.record;
+    const mime =
+      record.httpHeaders.get("content-type") ||
+      rec.entry.mime ||
+      "application/octet-stream";
 
-    /** Compute the response for a `/web/<ts>/<url>` request, or null for a 404.
-     * Moved out of the request handler so it can be cached whole. */
-    const renderReplay = async (reqUrl: string): Promise<RenderedResponse | null> => {
-        const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
-        if (!m) return null;
+    // Replay the archived status, modifying only the few headers that
+    // would otherwise corrupt rendering or leak to the live web.
+    const status = record.httpStatus ?? 200;
 
-        const reqTs = m[1];
-        const modifier = m[2] ? m[2].toLowerCase() : '';
-        const identity = modifier === 'id_';
-        let rawUrl = m[3];
-        // `urn:` URLs (page thumbnails: `urn:thumbnail:<page-url>`) already
-        // carry a scheme but not the `://` form the check below assumes; a
-        // bare hostname still needs `http://`. Leave `urn:` untouched.
-        if (!/^urn:/i.test(rawUrl) && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
-            rawUrl = 'http://' + rawUrl.replace(/^(https?|ftp)\//, '');
-        }
-
-        // Resolve the raw (still percent-encoded) URL first. Decoding the
-        // whole URL up front is wrong: a percent-encoded reserved character
-        // in a query value (e.g. `%23` = `#` inside a color parameter)
-        // becomes a literal `#`, which lookupKey then treats as a fragment
-        // separator and strips -- making the lookup miss entries the archive
-        // stores with the encoded form. Only fall back to a decoded form
-        // when the raw URL genuinely misses (e.g. non-ASCII characters the
-        // client percent-encoded).
-        let rec = await wacz.resolveRecordAsync(rawUrl, reqTs);
-        if (!rec) {
-            let decoded: string;
-            try {
-                decoded = decodeURIComponent(rawUrl);
-            } catch {
-                decoded = rawUrl;
-            }
-            if (decoded !== rawUrl) rec = await wacz.resolveRecordAsync(decoded, reqTs);
-        }
-        if (!rec) return null;
-
-        // The requested timestamp may not be a real capture: the archive
-        // resolves to the *nearest* capture at or around the requested time.
-        // When that capture's own timestamp differs from what the URL asked
-        // for, redirect to the faithful timestamp -- the same way the Wayback
-        // Machine 302s a time-shifted request to the capture's actual time --
-        // so the address bar never claims one time while serving another.
-        const actualTs = rec.entry.timestamp.slice(0, 14);
-        if (actualTs !== reqTs) {
-            // Preserve the modifier across the time-shift redirect so an
-            // `id_` request stays in identity mode after it lands on the
-            // capture's faithful timestamp.
-            return {
-                status: 302,
-                headers: { Location: `/web/${actualTs}${m[2] || ''}/${rawUrl}` },
-                body: Buffer.from('Redirecting to the capture at ' + actualTs),
-            };
-        }
-
-        const record = rec.record;
-        const mime = record.httpHeaders.get('content-type') || rec.entry.mime || 'application/octet-stream';
-
-        // Replay the archived status, modifying only the few headers that
-        // would otherwise corrupt rendering or leak to the live web.
-        const status = record.httpStatus ?? 200;
-
-        // Run the response through the plugin pipeline: static rewriting
-        // plus the url-fixer shim injection. Non-text bodies pass through
-        // unchanged because neither plugin matches them. Redirects are
-        // skipped too: a 3xx has no page to rewrite or shim, and injecting
-        // the url-fixer script into its empty body would turn a bare 302
-        // into one that carries a script and a misleading content-length.
-        const ctx: ReplayContext = {
-            url: rec.matchedUrl,
-            ts: rec.entry.timestamp.slice(0, 14),
-            mime,
-            body: record.body,
-            mode: 'server',
-        };
-        // The body is rewritten only when the mime is text (and the request is
-        // not identity mode / a redirect). Everything else is served verbatim,
-        // so a large binary never has to be copied through a rewrite buffer.
-        const rewrite = shouldRewrite(mime, status, identity);
-        const body = rewrite ? pipeline.apply(ctx) : record.body;
-
-        const headers = buildReplayHeaders(record, rec.matchedUrl, ctx.ts, mime, body, status);
-        return { status, statusText: record.httpStatusText || undefined, headers, body };
+    // Run the response through the plugin pipeline: static rewriting
+    // plus the url-fixer shim injection. Non-text bodies pass through
+    // unchanged because neither plugin matches them. Redirects are
+    // skipped too: a 3xx has no page to rewrite or shim, and injecting
+    // the url-fixer script into its empty body would turn a bare 302
+    // into one that carries a script and a misleading content-length.
+    const ctx: ReplayContext = {
+      url: rec.matchedUrl,
+      ts: rec.entry.timestamp.slice(0, 14),
+      mime,
+      body: record.body,
+      mode: "server",
     };
+    // The body is rewritten only when the mime is text (and the request is
+    // not identity mode / a redirect). Everything else is served verbatim,
+    // so a large binary never has to be copied through a rewrite buffer.
+    const rewrite = shouldRewrite(mime, status, identity);
+    const body = rewrite ? pipeline.apply(ctx) : record.body;
 
-    // Bound how many connections are open at once. A slow (or idle, keep-alive)
-    // client holds a socket open without doing useful work, and each open socket
-    // pins a file descriptor plus its buffers. Capping the open-connection count
-    // bounds what a pile of slow clients can pin, and hands everyone beyond the
-    // cap a clean 503 to retry against instead of silently degrading.
-    let activeConnections = 0;
-    const connectionCloseListener = (): void => {
-        activeConnections--;
+    const headers = buildReplayHeaders(
+      record,
+      rec.matchedUrl,
+      ctx.ts,
+      mime,
+      body,
+      status,
+    );
+    return {
+      status,
+      statusText: record.httpStatusText || undefined,
+      headers,
+      body,
     };
+  };
 
-    const server = http.createServer(async (req, res) => {
-        const reqUrl = req.url || '/';
+  // Bound how many connections are open at once. A slow (or idle, keep-alive)
+  // client holds a socket open without doing useful work, and each open socket
+  // pins a file descriptor plus its buffers. Capping the open-connection count
+  // bounds what a pile of slow clients can pin, and hands everyone beyond the
+  // cap a clean 503 to retry against instead of silently degrading.
+  let activeConnections = 0;
+  const connectionCloseListener = (): void => {
+    activeConnections--;
+  };
 
-        if (activeConnections > args.maxConnections) {
-            res.writeHead(503, {
-                'Content-Type': 'text/plain',
-                'Retry-After': '1',
-                'Connection': 'close',
-            });
-            res.end('503 Service Unavailable -- too many concurrent connections.');
-            return;
+  const server = http.createServer(async (req, res) => {
+    const reqUrl = req.url || "/";
+
+    if (activeConnections > args.maxConnections) {
+      res.writeHead(503, {
+        "Content-Type": "text/plain",
+        "Retry-After": "1",
+        Connection: "close",
+      });
+      res.end("503 Service Unavailable -- too many concurrent connections.");
+      return;
+    }
+
+    // The url-fixer runtime shim, served as an external script. Injected
+    // into every HTML page by the url-fixer plugin via a <script src> that
+    // points here; serving it from a stable, cacheable route (rather than
+    // inlining it per page) mirrors how Wayback serves wombat.js.
+    if (reqUrl === URL_FIXER_SCRIPT_ROUTE) {
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-cache",
+      });
+      res.end(URL_FIXER_SHIM);
+      return;
+    }
+
+    // Index page -- generated on demand from the archive.
+    if (reqUrl === "/" || reqUrl === "/index.html") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(buildIndexPage());
+      return;
+    }
+
+    // Replay route: /web/<timestamp>[mod_]/<url>. The response is a pure
+    // function of the request path (the archive is immutable and the
+    // pipeline is stateless), so it is computed once and cached whole --
+    // repeat requests for a hot resource skip the read + gunzip + rewrite.
+    const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
+    if (m) {
+      let rendered: RenderedResponse | null = replayCache.get(reqUrl) ?? null;
+      if (!rendered) {
+        rendered = await renderReplay(reqUrl);
+        if (!rendered) {
+          // No record for this replay route: show the same plain
+          // "not saved" page the flat export writes, with the
+          // original address filled in. No CSS, no styling.
+          res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(renderNotFoundPage(replayInnerUrl(m[3])));
+          return;
         }
+        replayCache.set(reqUrl, rendered);
+      }
 
-        // The url-fixer runtime shim, served as an external script. Injected
-        // into every HTML page by the url-fixer plugin via a <script src> that
-        // points here; serving it from a stable, cacheable route (rather than
-        // inlining it per page) mirrors how Wayback serves wombat.js.
-        if (reqUrl === URL_FIXER_SCRIPT_ROUTE) {
-            res.writeHead(200, {
-                'Content-Type': 'application/javascript; charset=utf-8',
-                'Cache-Control': 'no-cache',
-            });
-            res.end(URL_FIXER_SHIM);
-            return;
+      // Byte-range support (RFC 7233). A replay body is fully materialized
+      // in `rendered.body` before it is written, so a range request can be
+      // satisfied by slicing that buffer at zero cost. This is what lets a
+      // browser drag a `<video>` scrubber on an archived video: the media
+      // element probes with `Range: bytes=0-` first, then re-requests the
+      // exact byte spans it needs as the user seeks. The full body stays in
+      // `rendered.headers['content-length']`; a partial answer overrides it
+      // and adds `content-range`.
+      if (rendered.status === 200) {
+        const range = parseByteRange(req.headers.range, rendered.body.length);
+        if (range === "invalid") {
+          res.writeHead(416, {
+            "Content-Range": `bytes */${rendered.body.length}`,
+            "Content-Type": "text/plain",
+          });
+          res.end("416 Range Not Satisfiable");
+          return;
         }
-
-        // Index page -- generated on demand from the archive.
-        if (reqUrl === '/' || reqUrl === '/index.html') {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(buildIndexPage());
-            return;
+        if (range) {
+          const chunk = rendered.body.subarray(range.start, range.end + 1);
+          const headers: Record<string, string> = { ...rendered.headers };
+          delete headers["content-length"];
+          headers["content-range"] =
+            `bytes ${range.start}-${range.end}/${rendered.body.length}`;
+          headers["content-length"] = String(chunk.length);
+          res.writeHead(206, headers);
+          res.end(chunk);
+          return;
         }
+      }
 
-        // Replay route: /web/<timestamp>[mod_]/<url>. The response is a pure
-        // function of the request path (the archive is immutable and the
-        // pipeline is stateless), so it is computed once and cached whole --
-        // repeat requests for a hot resource skip the read + gunzip + rewrite.
-        const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
-        if (m) {
-            let rendered: RenderedResponse | null = replayCache.get(reqUrl) ?? null;
-            if (!rendered) {
-                rendered = await renderReplay(reqUrl);
-                if (!rendered) {
-                    // No record for this replay route: show the same plain
-                    // "not saved" page the flat export writes, with the
-                    // original address filled in. No CSS, no styling.
-                    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
-                    res.end(renderNotFoundPage(replayInnerUrl(m[3])));
-                    return;
-                }
-                replayCache.set(reqUrl, rendered);
-            }
+      res.writeHead(
+        rendered.status,
+        rendered.statusText || undefined,
+        rendered.headers,
+      );
+      if (
+        rendered.status === 204 ||
+        rendered.status === 304 ||
+        (rendered.status >= 100 && rendered.status < 200)
+      ) {
+        res.end();
+      } else {
+        res.end(rendered.body);
+      }
+      return;
+    }
 
-            // Byte-range support (RFC 7233). A replay body is fully materialized
-            // in `rendered.body` before it is written, so a range request can be
-            // satisfied by slicing that buffer at zero cost. This is what lets a
-            // browser drag a `<video>` scrubber on an archived video: the media
-            // element probes with `Range: bytes=0-` first, then re-requests the
-            // exact byte spans it needs as the user seeks. The full body stays in
-            // `rendered.headers['content-length']`; a partial answer overrides it
-            // and adds `content-range`.
-            if (rendered.status === 200) {
-                const range = parseByteRange(req.headers.range, rendered.body.length);
-                if (range === 'invalid') {
-                    res.writeHead(416, {
-                        'Content-Range': `bytes */${rendered.body.length}`,
-                        'Content-Type': 'text/plain',
-                    });
-                    res.end('416 Range Not Satisfiable');
-                    return;
-                }
-                if (range) {
-                    const chunk = rendered.body.subarray(range.start, range.end + 1);
-                    const headers: Record<string, string> = { ...rendered.headers };
-                    delete headers['content-length'];
-                    headers['content-range'] = `bytes ${range.start}-${range.end}/${rendered.body.length}`;
-                    headers['content-length'] = String(chunk.length);
-                    res.writeHead(206, headers);
-                    res.end(chunk);
-                    return;
-                }
-            }
+    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(renderNotFoundPage(reqUrl));
+  });
 
-            res.writeHead(rendered.status, rendered.statusText || undefined, rendered.headers);
-            if (rendered.status === 204 || rendered.status === 304 || (rendered.status >= 100 && rendered.status < 200)) {
-                res.end();
-            } else {
-                res.end(rendered.body);
-            }
-            return;
-        }
+  // A request handler that never yields means one slow client can hold a
+  // socket open indefinitely. Bound the per-socket windows so a dead or
+  // malicious client can't pin the event loop: the time to receive request
+  // headers, the time to receive the whole request, and the keep-alive idle
+  // window before an idle socket is closed.
+  server.headersTimeout = 60_000;
+  server.requestTimeout = 60_000;
+  server.keepAliveTimeout = 5_000;
 
-        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(renderNotFoundPage(reqUrl));
+  // Count open connections so `--max-connections` can bound them. The
+  // 'connection' event fires once per accepted TCP socket; 'close' fires when
+  // it is fully torn down (including keep-alive idle timeouts), so the counter
+  // tracks exactly the sockets a slow client can pin.
+  server.on("connection", (socket) => {
+    activeConnections++;
+    socket.on("close", connectionCloseListener);
+  });
+
+  // Graceful shutdown: stop accepting connections, let in-flight requests
+  // finish, then release the archive's file descriptor. A hard timer forces
+  // the exit if a client holds a connection open past the drain window.
+  const shutdown = (signal: string): void => {
+    console.log(`\n${signal} received -- shutting down.`);
+    server.close(() => {
+      wacz.close();
+      process.exit(0);
     });
+    setTimeout(() => process.exit(1), 5000).unref();
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-    // A request handler that never yields means one slow client can hold a
-    // socket open indefinitely. Bound the per-socket windows so a dead or
-    // malicious client can't pin the event loop: the time to receive request
-    // headers, the time to receive the whole request, and the keep-alive idle
-    // window before an idle socket is closed.
-    server.headersTimeout = 60_000;
-    server.requestTimeout = 60_000;
-    server.keepAliveTimeout = 5_000;
-
-    // Count open connections so `--max-connections` can bound them. The
-    // 'connection' event fires once per accepted TCP socket; 'close' fires when
-    // it is fully torn down (including keep-alive idle timeouts), so the counter
-    // tracks exactly the sockets a slow client can pin.
-    server.on('connection', (socket) => {
-        activeConnections++;
-        socket.on('close', connectionCloseListener);
-    });
-
-    // Graceful shutdown: stop accepting connections, let in-flight requests
-    // finish, then release the archive's file descriptor. A hard timer forces
-    // the exit if a client holds a connection open past the drain window.
-    const shutdown = (signal: string): void => {
-        console.log(`\n${signal} received -- shutting down.`);
-        server.close(() => {
-            wacz.close();
-            process.exit(0);
-        });
-        setTimeout(() => process.exit(1), 5000).unref();
-    };
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-    server.listen(args.port, host, () => {
-        const workerTag = cluster.isWorker ? ` [worker ${cluster.worker?.id}]` : '';
-        console.log(`\n=== WACZ Replay Server${workerTag} ===`);
-        console.log(`- Local Access: http://localhost:${args.port}`);
-        if (args.expose) {
-            console.log(`- LAN Access:   http://${getLocalExternalIP()}:${args.port}`);
-        }
-        console.log(`- Archive:      ${args.wacz} (${wacz.title})`);
-        console.log(`- Index:        http://localhost:${args.port}/`);
-        console.log('\nReady.');
-    });
+  server.listen(args.port, host, () => {
+    const workerTag = cluster.isWorker ? ` [worker ${cluster.worker?.id}]` : "";
+    console.log(`\n=== WACZ Replay Server${workerTag} ===`);
+    console.log(`- Local Access: http://localhost:${args.port}`);
+    if (args.expose) {
+      console.log(
+        `- LAN Access:   http://${getLocalExternalIP()}:${args.port}`,
+      );
+    }
+    console.log(`- Archive:      ${args.wacz} (${wacz.title})`);
+    console.log(`- Index:        http://localhost:${args.port}/`);
+    console.log("\nReady.");
+  });
 }
 
 // Run only when executed directly (not when imported by a test).
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
-    main();
+if (
+  process.argv[1] &&
+  import.meta.url ===
+    new URL(`file://${process.argv[1].replace(/\\/g, "/")}`).href
+) {
+  main();
 }

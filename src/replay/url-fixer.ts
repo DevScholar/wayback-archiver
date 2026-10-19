@@ -22,47 +22,47 @@
  * shim under file://.
  */
 
-import type { ResponsePlugin } from './plugins.js';
+import type { ResponsePlugin } from "./plugins.js";
 
 /** Route the replay server serves the url-fixer runtime shim from. Kept in one
  * place so the plugin's `<script src>` and the server's route stay in sync. */
-export const URL_FIXER_SCRIPT_ROUTE = '/__url-fixer.js';
+export const URL_FIXER_SCRIPT_ROUTE = "/__url-fixer.js";
 
 export function createUrlFixerPlugin(): ResponsePlugin {
-    return {
-        name: 'url-fixer',
-        matches: (ctx) => /text\/html/i.test(ctx.mime),
-        transform: (ctx) => {
-            const config: Record<string, unknown> = {
-                mode: ctx.mode,
-                pageUrl: ctx.url,
-                ts: ctx.ts,
-            };
-            if (ctx.mode === 'flat' && ctx.flatMap) {
-                const map: Record<string, string> = {};
-                for (const [k, v] of ctx.flatMap) map[k] = v;
-                config.flatMap = map;
-            }
+  return {
+    name: "url-fixer",
+    matches: (ctx) => /text\/html/i.test(ctx.mime),
+    transform: (ctx) => {
+      const config: Record<string, unknown> = {
+        mode: ctx.mode,
+        pageUrl: ctx.url,
+        ts: ctx.ts,
+      };
+      if (ctx.mode === "flat" && ctx.flatMap) {
+        const map: Record<string, string> = {};
+        for (const [k, v] of ctx.flatMap) map[k] = v;
+        config.flatMap = map;
+      }
 
-            // One tag per line, bounded by comment markers, mirroring Wayback's
-            // toolbar-insert convention.
-            const injection = [
-                '<!-- BEGIN WAYBACK ARCHIVER INSERT -->',
-                `<script>window.__urlFixerConfig=${JSON.stringify(config)};</script>`,
-                `<script src="${URL_FIXER_SCRIPT_ROUTE}"></script>`,
-                '<!-- END WAYBACK ARCHIVER INSERT -->',
-            ].join('\n');
+      // One tag per line, bounded by comment markers, mirroring Wayback's
+      // toolbar-insert convention.
+      const injection = [
+        "<!-- BEGIN WAYBACK ARCHIVER INSERT -->",
+        `<script>window.__urlFixerConfig=${JSON.stringify(config)};</script>`,
+        `<script src="${URL_FIXER_SCRIPT_ROUTE}"></script>`,
+        "<!-- END WAYBACK ARCHIVER INSERT -->",
+      ].join("\n");
 
-            const html = ctx.body.toString('latin1');
-            const head = /<head[^>]*>/i.exec(html);
-            let out: string;
-            if (head) {
-                const idx = head.index + head[0].length;
-                out = html.slice(0, idx) + '\n' + injection + html.slice(idx);
-            } else {
-                out = injection + '\n' + html;
-            }
-            return Buffer.from(out, 'latin1');
-        },
-    };
+      const html = ctx.body.toString("latin1");
+      const head = /<head[^>]*>/i.exec(html);
+      let out: string;
+      if (head) {
+        const idx = head.index + head[0].length;
+        out = html.slice(0, idx) + "\n" + injection + html.slice(idx);
+      } else {
+        out = injection + "\n" + html;
+      }
+      return Buffer.from(out, "latin1");
+    },
+  };
 }

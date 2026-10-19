@@ -26,77 +26,87 @@
  * that trailing CRLFCRLF; writing it here keeps our output interoperable.
  */
 
-import * as crypto from 'crypto';
+import * as crypto from "crypto";
 
 export interface HttpResponse {
-    status: number;
-    statusText: string;
-    /** Header name/value pairs, case preserved, as received from the server. */
-    headers: [string, string][];
-    body: Buffer;
+  status: number;
+  statusText: string;
+  /** Header name/value pairs, case preserved, as received from the server. */
+  headers: [string, string][];
+  body: Buffer;
 }
 
 export interface HttpRequest {
-    method: string;
-    /** Request-target: path + query, e.g. `/foo?bar=1`. */
-    path: string;
-    /** Header name/value pairs, case preserved, as actually sent. */
-    headers: [string, string][];
+  method: string;
+  /** Request-target: path + query, e.g. `/foo?bar=1`. */
+  path: string;
+  /** Header name/value pairs, case preserved, as actually sent. */
+  headers: [string, string][];
 }
 
 /** Serialize one response as a full (uncompressed) WARC record. */
 export function buildWarcRecord(opts: {
-    recordId: string;
-    targetUri: string;
-    dateRfc3339: string;
-    response: HttpResponse;
-    /**
-     * The crawler's best guess at the payload's MIME type and charset (the WARC
-     * `WARC-Identified-Payload-Type` header, e.g. `text/html; charset=windows-1252`),
-     * when known. Distinct from the HTTP `Content-Type`: that header records what
-     * the server actually sent, while this one records how the payload bytes
-     * should be decoded -- essential for legacy bodies (e.g. Windows-1252) whose
-     * server never declared a charset. Omit to write no such header.
-     */
-    identifiedPayloadType?: string;
+  recordId: string;
+  targetUri: string;
+  dateRfc3339: string;
+  response: HttpResponse;
+  /**
+   * The crawler's best guess at the payload's MIME type and charset (the WARC
+   * `WARC-Identified-Payload-Type` header, e.g. `text/html; charset=windows-1252`),
+   * when known. Distinct from the HTTP `Content-Type`: that header records what
+   * the server actually sent, while this one records how the payload bytes
+   * should be decoded -- essential for legacy bodies (e.g. Windows-1252) whose
+   * server never declared a charset. Omit to write no such header.
+   */
+  identifiedPayloadType?: string;
 }): Buffer {
-    const { recordId, targetUri, dateRfc3339, response } = opts;
+  const { recordId, targetUri, dateRfc3339, response } = opts;
 
-    const statusLine =
-        `HTTP/1.1 ${response.status}` + (response.statusText ? ` ${response.statusText}` : '');
-    const httpHead =
-        statusLine +
-        '\r\n' +
-        response.headers.map(([n, v]) => `${n}: ${v}\r\n`).join('') +
-        '\r\n';
+  const statusLine =
+    `HTTP/1.1 ${response.status}` +
+    (response.statusText ? ` ${response.statusText}` : "");
+  const httpHead =
+    statusLine +
+    "\r\n" +
+    response.headers.map(([n, v]) => `${n}: ${v}\r\n`).join("") +
+    "\r\n";
 
-    const httpMessage = Buffer.concat([Buffer.from(httpHead, 'latin1'), response.body]);
+  const httpMessage = Buffer.concat([
+    Buffer.from(httpHead, "latin1"),
+    response.body,
+  ]);
 
-    const payloadDigest = crypto.createHash('sha256').update(response.body).digest('hex');
-    const blockDigest = crypto.createHash('sha256').update(httpMessage).digest('hex');
+  const payloadDigest = crypto
+    .createHash("sha256")
+    .update(response.body)
+    .digest("hex");
+  const blockDigest = crypto
+    .createHash("sha256")
+    .update(httpMessage)
+    .digest("hex");
 
-    const identifiedType = opts.identifiedPayloadType
-        ? `WARC-Identified-Payload-Type: ${opts.identifiedPayloadType}\r\n`
-        : '';
+  const identifiedType = opts.identifiedPayloadType
+    ? `WARC-Identified-Payload-Type: ${opts.identifiedPayloadType}\r\n`
+    : "";
 
-    const warcHead =
-        'WARC/1.1\r\n' +
-        `WARC-Record-ID: ${recordId}\r\n` +
-        `WARC-Target-URI: ${targetUri}\r\n` +
-        `WARC-Date: ${dateRfc3339}\r\n` +
-        'WARC-Type: response\r\n' +
-        identifiedType +
-        'Content-Type: application/http; msgtype=response\r\n' +
-        `WARC-Payload-Digest: sha256:${payloadDigest}\r\n` +
-        `WARC-Block-Digest: sha256:${blockDigest}\r\n` +
-        `Content-Length: ${httpMessage.length}\r\n`;
+  const warcHead =
+    "WARC/1.1\r\n" +
+    `WARC-Record-ID: ${recordId}\r\n` +
+    `WARC-Target-URI: ${targetUri}\r\n` +
+    `WARC-Date: ${dateRfc3339}\r\n` +
+    "WARC-Type: response\r\n" +
+    identifiedType +
+    "Content-Type: application/http; msgtype=response\r\n" +
+    `WARC-Payload-Digest: sha256:${payloadDigest}\r\n` +
+    `WARC-Block-Digest: sha256:${blockDigest}\r\n` +
+    `Content-Length: ${httpMessage.length}\r\n`;
 
-    return Buffer.concat([
-        Buffer.from(warcHead, 'latin1'),
-        Buffer.from('\r\n', 'latin1'),
-        httpMessage,
-        Buffer.from('\r\n\r\n', 'latin1'),
-    ]);
+  return Buffer.concat([
+    Buffer.from(warcHead, "latin1"),
+    Buffer.from("\r\n", "latin1"),
+    httpMessage,
+    Buffer.from("\r\n\r\n", "latin1"),
+  ]);
 }
 
 /** Serialize one request as a full (uncompressed) WARC `request` record, paired
@@ -108,40 +118,43 @@ export function buildWarcRecord(opts: {
  * the request line + headers + blank line, and `Content-Length` is that same
  * HTTP message length (no trailing delimiter is part of it). */
 export function buildWarcRequestRecord(opts: {
-    recordId: string;
-    targetUri: string;
-    dateRfc3339: string;
-    /** The `WARC-Record-ID` of the response this request produced. */
-    concurrentTo: string;
-    request: HttpRequest;
+  recordId: string;
+  targetUri: string;
+  dateRfc3339: string;
+  /** The `WARC-Record-ID` of the response this request produced. */
+  concurrentTo: string;
+  request: HttpRequest;
 }): Buffer {
-    const { recordId, targetUri, dateRfc3339, concurrentTo, request } = opts;
+  const { recordId, targetUri, dateRfc3339, concurrentTo, request } = opts;
 
-    const httpHead =
-        `${request.method} ${request.path} HTTP/1.1\r\n` +
-        request.headers.map(([n, v]) => `${n}: ${v}\r\n`).join('') +
-        '\r\n';
+  const httpHead =
+    `${request.method} ${request.path} HTTP/1.1\r\n` +
+    request.headers.map(([n, v]) => `${n}: ${v}\r\n`).join("") +
+    "\r\n";
 
-    const httpMessage = Buffer.from(httpHead, 'latin1');
-    const blockDigest = crypto.createHash('sha256').update(httpMessage).digest('hex');
+  const httpMessage = Buffer.from(httpHead, "latin1");
+  const blockDigest = crypto
+    .createHash("sha256")
+    .update(httpMessage)
+    .digest("hex");
 
-    const warcHead =
-        'WARC/1.1\r\n' +
-        `WARC-Record-ID: ${recordId}\r\n` +
-        `WARC-Target-URI: ${targetUri}\r\n` +
-        `WARC-Date: ${dateRfc3339}\r\n` +
-        'WARC-Type: request\r\n' +
-        'Content-Type: application/http; msgtype=request\r\n' +
-        `WARC-Concurrent-To: ${concurrentTo}\r\n` +
-        `WARC-Block-Digest: sha256:${blockDigest}\r\n` +
-        `Content-Length: ${httpMessage.length}\r\n`;
+  const warcHead =
+    "WARC/1.1\r\n" +
+    `WARC-Record-ID: ${recordId}\r\n` +
+    `WARC-Target-URI: ${targetUri}\r\n` +
+    `WARC-Date: ${dateRfc3339}\r\n` +
+    "WARC-Type: request\r\n" +
+    "Content-Type: application/http; msgtype=request\r\n" +
+    `WARC-Concurrent-To: ${concurrentTo}\r\n` +
+    `WARC-Block-Digest: sha256:${blockDigest}\r\n` +
+    `Content-Length: ${httpMessage.length}\r\n`;
 
-    return Buffer.concat([
-        Buffer.from(warcHead, 'latin1'),
-        Buffer.from('\r\n', 'latin1'),
-        httpMessage,
-        Buffer.from('\r\n\r\n', 'latin1'),
-    ]);
+  return Buffer.concat([
+    Buffer.from(warcHead, "latin1"),
+    Buffer.from("\r\n", "latin1"),
+    httpMessage,
+    Buffer.from("\r\n\r\n", "latin1"),
+  ]);
 }
 
 /** Serialize a WARC `warcinfo` record (WARC 1.1 section 6.2): describes the
@@ -152,43 +165,46 @@ export function buildWarcRequestRecord(opts: {
  * `application/warc-fields` with `software`, `format`, and `isPartOf` fields,
  * matching what ArchiveWeb.page / warcio.js write. */
 export function buildWarcinfoRecord(opts: {
-    recordId: string;
-    dateRfc3339: string;
-    /** e.g. "ms-2026-test.wacz#/archive/data.warc.gz" */
-    warcFilename: string;
-    /** e.g. "WaybackArchiver/1.0.0" */
-    software: string;
-    /** Defaults to "WARC File Format 1.1". */
-    format?: string;
-    /** Archive title (the WACZ `title`), written as `isPartOf`. */
-    isPartOf?: string;
+  recordId: string;
+  dateRfc3339: string;
+  /** e.g. "ms-2026-test.wacz#/archive/data.warc.gz" */
+  warcFilename: string;
+  /** e.g. "WaybackArchiver/1.0.0" */
+  software: string;
+  /** Defaults to "WARC File Format 1.1". */
+  format?: string;
+  /** Archive title (the WACZ `title`), written as `isPartOf`. */
+  isPartOf?: string;
 }): Buffer {
-    const fields: [string, string][] = [
-        ['software', opts.software],
-        ['format', opts.format ?? 'WARC File Format 1.1'],
-    ];
-    if (opts.isPartOf) fields.push(['isPartOf', opts.isPartOf]);
+  const fields: [string, string][] = [
+    ["software", opts.software],
+    ["format", opts.format ?? "WARC File Format 1.1"],
+  ];
+  if (opts.isPartOf) fields.push(["isPartOf", opts.isPartOf]);
 
-    const block = Buffer.from(fields.map(([n, v]) => `${n}: ${v}\r\n`).join(''), 'latin1');
+  const block = Buffer.from(
+    fields.map(([n, v]) => `${n}: ${v}\r\n`).join(""),
+    "latin1",
+  );
 
-    const warcHead =
-        'WARC/1.1\r\n' +
-        `WARC-Record-ID: ${opts.recordId}\r\n` +
-        `WARC-Filename: ${opts.warcFilename}\r\n` +
-        `WARC-Date: ${opts.dateRfc3339}\r\n` +
-        'WARC-Type: warcinfo\r\n' +
-        'Content-Type: application/warc-fields\r\n' +
-        `Content-Length: ${block.length}\r\n`;
+  const warcHead =
+    "WARC/1.1\r\n" +
+    `WARC-Record-ID: ${opts.recordId}\r\n` +
+    `WARC-Filename: ${opts.warcFilename}\r\n` +
+    `WARC-Date: ${opts.dateRfc3339}\r\n` +
+    "WARC-Type: warcinfo\r\n" +
+    "Content-Type: application/warc-fields\r\n" +
+    `Content-Length: ${block.length}\r\n`;
 
-    return Buffer.concat([
-        Buffer.from(warcHead, 'latin1'),
-        Buffer.from('\r\n', 'latin1'),
-        block,
-        Buffer.from('\r\n\r\n', 'latin1'),
-    ]);
+  return Buffer.concat([
+    Buffer.from(warcHead, "latin1"),
+    Buffer.from("\r\n", "latin1"),
+    block,
+    Buffer.from("\r\n\r\n", "latin1"),
+  ]);
 }
 
 /** CDXJ `digest` field: `sha-256:<hex of the HTTP payload>` (note the dash). */
 export function payloadDigest(body: Buffer): string {
-    return 'sha-256:' + crypto.createHash('sha256').update(body).digest('hex');
+  return "sha-256:" + crypto.createHash("sha256").update(body).digest("hex");
 }

@@ -9,46 +9,46 @@
  */
 
 export interface ParsedUrl {
-    protocol: string; // "http" | "https" | "ftp" | ...
-    hostname: string; // lowercased
-    port: string; // "" when absent
-    pathname: string; // includes leading "/"
-    search: string; // includes leading "?" when present
+  protocol: string; // "http" | "https" | "ftp" | ...
+  hostname: string; // lowercased
+  port: string; // "" when absent
+  pathname: string; // includes leading "/"
+  search: string; // includes leading "?" when present
 }
 
 export function parseUrl(raw: string): ParsedUrl | null {
-    try {
-        const u = new URL(raw);
-        return {
-            protocol: u.protocol.replace(':', ''),
-            hostname: u.hostname,
-            port: u.port,
-            pathname: u.pathname,
-            search: u.search,
-        };
-    } catch {
-        return null;
-    }
+  try {
+    const u = new URL(raw);
+    return {
+      protocol: u.protocol.replace(":", ""),
+      hostname: u.hostname,
+      port: u.port,
+      pathname: u.pathname,
+      search: u.search,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** Reassemble a canonical URL string from components. */
 export function assembleUrl(p: ParsedUrl): string {
-    let s = p.protocol + '://' + p.hostname;
-    if (p.port) s += ':' + p.port;
-    s += p.pathname || '/';
-    if (p.search) s += p.search;
-    return s;
+  let s = p.protocol + "://" + p.hostname;
+  if (p.port) s += ":" + p.port;
+  s += p.pathname || "/";
+  if (p.search) s += p.search;
+  return s;
 }
 
 /** Lowercase + drop fragment; a light normalization for building lookup keys. */
 export function lookupKey(raw: string): string {
-    let s = raw;
-    const hash = s.indexOf('#');
-    if (hash >= 0) s = s.slice(0, hash);
-    // Scheme and host are case-insensitive; path/query stay as-is.
-    const p = parseUrl(s);
-    if (!p) return s;
-    return assembleUrl(p);
+  let s = raw;
+  const hash = s.indexOf("#");
+  if (hash >= 0) s = s.slice(0, hash);
+  // Scheme and host are case-insensitive; path/query stay as-is.
+  const p = parseUrl(s);
+  if (!p) return s;
+  return assembleUrl(p);
 }
 
 /**
@@ -63,16 +63,16 @@ export function lookupKey(raw: string): string {
  * hostname as `:port` before reversal (e.g. `net,noscript:8080)`).
  */
 export function surtKey(raw: string): string {
-    const p = parseUrl(raw);
-    if (!p) return raw;
-    const reversed = p.hostname.split('.').reverse().join(',');
-    // The port is appended to the *last* reversed label (the hostname's
-    // original first label), per the SURT convention: `example.org:8080`
-    // becomes `org,example:8080)`, not `org:8080,example)`.
-    const hostPart = p.port ? reversed + ':' + p.port : reversed;
-    let path = p.pathname;
-    if (path === '') path = '/';
-    return hostPart + ')' + path + p.search;
+  const p = parseUrl(raw);
+  if (!p) return raw;
+  const reversed = p.hostname.split(".").reverse().join(",");
+  // The port is appended to the *last* reversed label (the hostname's
+  // original first label), per the SURT convention: `example.org:8080`
+  // becomes `org,example:8080)`, not `org:8080,example)`.
+  const hostPart = p.port ? reversed + ":" + p.port : reversed;
+  let path = p.pathname;
+  if (path === "") path = "/";
+  return hostPart + ")" + path + p.search;
 }
 
 /** Lookup key ignoring the query string and fragment: `scheme://host:port/path`.
@@ -80,9 +80,15 @@ export function surtKey(raw: string): string {
  * same resource under a different query variant (e.g. an image requested at
  * `?w=400` archived only at `?w=1200&dpr=on,2`). */
 export function lookupPathKey(raw: string): string {
-    const p = parseUrl(raw);
-    if (!p) return raw;
-    return p.protocol + '://' + p.hostname + (p.port ? ':' + p.port : '') + (p.pathname || '/');
+  const p = parseUrl(raw);
+  if (!p) return raw;
+  return (
+    p.protocol +
+    "://" +
+    p.hostname +
+    (p.port ? ":" + p.port : "") +
+    (p.pathname || "/")
+  );
 }
 
 /**
@@ -96,12 +102,16 @@ export function lookupPathKey(raw: string): string {
  * fallback-only key.
  */
 export function lookupKeyCi(raw: string): string {
-    const p = parseUrl(raw);
-    if (!p) return raw.toLowerCase();
-    return (
-        p.protocol.toLowerCase() + '://' + p.hostname.toLowerCase() +
-        (p.port ? ':' + p.port : '') + (p.pathname || '/').toLowerCase() + p.search
-    );
+  const p = parseUrl(raw);
+  if (!p) return raw.toLowerCase();
+  return (
+    p.protocol.toLowerCase() +
+    "://" +
+    p.hostname.toLowerCase() +
+    (p.port ? ":" + p.port : "") +
+    (p.pathname || "/").toLowerCase() +
+    p.search
+  );
 }
 
 /**
@@ -110,59 +120,72 @@ export function lookupKeyCi(raw: string): string {
  * precise than an exact match.
  */
 export function lookupVariants(url: string): string[] {
-    const out: string[] = [];
-    const seen = new Set<string>();
-    const add = (u: string) => {
-        if (!seen.has(u)) {
-            seen.add(u);
-            out.push(u);
-        }
-    };
-
-    add(url);
-
-    const p = parseUrl(url);
-    if (!p) return out;
-
-    const altHost = p.hostname.startsWith('www.')
-        ? p.hostname.slice(4)
-        : 'www.' + p.hostname;
-
-    const altProto = p.protocol === 'http' ? 'https' : p.protocol === 'https' ? 'http' : p.protocol;
-
-    add(assembleUrl({ ...p, hostname: altHost }));
-    if (altProto !== p.protocol) {
-        add(assembleUrl({ ...p, protocol: altProto }));
-        add(assembleUrl({ ...p, protocol: altProto, hostname: altHost }));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (u: string) => {
+    if (!seen.has(u)) {
+      seen.add(u);
+      out.push(u);
     }
+  };
 
-    // A leading `&` in the query (`?&x=y`) is an empty parameter and is
-    // semantically identical to `?x=y`. Crawlers sometimes record the former
-    // while pages reference the latter, so add the toggled form as a variant.
-    for (const u of out.slice()) {
-        add(toggleLeadingQueryAmp(u));
-    }
-    return out;
+  add(url);
+
+  const p = parseUrl(url);
+  if (!p) return out;
+
+  const altHost = p.hostname.startsWith("www.")
+    ? p.hostname.slice(4)
+    : "www." + p.hostname;
+
+  const altProto =
+    p.protocol === "http"
+      ? "https"
+      : p.protocol === "https"
+        ? "http"
+        : p.protocol;
+
+  add(assembleUrl({ ...p, hostname: altHost }));
+  if (altProto !== p.protocol) {
+    add(assembleUrl({ ...p, protocol: altProto }));
+    add(assembleUrl({ ...p, protocol: altProto, hostname: altHost }));
+  }
+
+  // A leading `&` in the query (`?&x=y`) is an empty parameter and is
+  // semantically identical to `?x=y`. Crawlers sometimes record the former
+  // while pages reference the latter, so add the toggled form as a variant.
+  for (const u of out.slice()) {
+    add(toggleLeadingQueryAmp(u));
+  }
+  return out;
 }
 
 /** Toggle a leading `&` in the query string: `?&x=y` <-> `?x=y`. */
 function toggleLeadingQueryAmp(url: string): string {
-    const p = parseUrl(url);
-    if (!p) return url;
-    if (p.search.startsWith('?&')) {
-        return assembleUrl({ ...p, search: '?' + p.search.slice(2) });
-    }
-    if (p.search.startsWith('?')) {
-        return assembleUrl({ ...p, search: '?&' + p.search.slice(1) });
-    }
-    return url;
+  const p = parseUrl(url);
+  if (!p) return url;
+  if (p.search.startsWith("?&")) {
+    return assembleUrl({ ...p, search: "?" + p.search.slice(2) });
+  }
+  if (p.search.startsWith("?")) {
+    return assembleUrl({ ...p, search: "?&" + p.search.slice(1) });
+  }
+  return url;
 }
 
 /** Directory default documents to try when a path ends in "/". */
 export const DEFAULT_DOCS = [
-    'index.html', 'index.htm', 'default.asp', 'default.aspx',
-    'default.htm', 'default.html', 'default.shtml', 'index.shtml',
-    'home.asp', 'home.html', 'main.html',
+  "index.html",
+  "index.htm",
+  "default.asp",
+  "default.aspx",
+  "default.htm",
+  "default.html",
+  "default.shtml",
+  "index.shtml",
+  "home.asp",
+  "home.html",
+  "main.html",
 ];
 
 /**
@@ -170,35 +193,35 @@ export const DEFAULT_DOCS = [
  * directory-index and no-extension conventions replay uses.
  */
 export function candidateUrls(url: string): string[] {
-    const variants = lookupVariants(url);
-    const out: string[] = [];
-    const seen = new Set<string>();
-    const push = (u: string) => {
-        if (!seen.has(u)) {
-            seen.add(u);
-            out.push(u);
-        }
-    };
-
-    for (const v of variants) {
-        push(v);
-        const p = parseUrl(v);
-        if (!p) continue;
-
-        const path = p.pathname;
-        const clean = path.replace(/\/$/, '');
-
-        if (path.endsWith('/') || path === '' || path === '/') {
-            for (const doc of DEFAULT_DOCS) {
-                push(assembleUrl({ ...p, pathname: clean + '/' + doc }));
-            }
-        }
-
-        // A path with no extension is often stored as ".html"/".htm".
-        if (!/\.[a-zA-Z0-9]{1,10}$/.test(path) && path !== '' && path !== '/') {
-            push(assembleUrl({ ...p, pathname: path + '.html' }));
-            push(assembleUrl({ ...p, pathname: path + '.htm' }));
-        }
+  const variants = lookupVariants(url);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (u: string) => {
+    if (!seen.has(u)) {
+      seen.add(u);
+      out.push(u);
     }
-    return out;
+  };
+
+  for (const v of variants) {
+    push(v);
+    const p = parseUrl(v);
+    if (!p) continue;
+
+    const path = p.pathname;
+    const clean = path.replace(/\/$/, "");
+
+    if (path.endsWith("/") || path === "" || path === "/") {
+      for (const doc of DEFAULT_DOCS) {
+        push(assembleUrl({ ...p, pathname: clean + "/" + doc }));
+      }
+    }
+
+    // A path with no extension is often stored as ".html"/".htm".
+    if (!/\.[a-zA-Z0-9]{1,10}$/.test(path) && path !== "" && path !== "/") {
+      push(assembleUrl({ ...p, pathname: path + ".html" }));
+      push(assembleUrl({ ...p, pathname: path + ".htm" }));
+    }
+  }
+  return out;
 }

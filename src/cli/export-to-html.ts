@@ -28,54 +28,76 @@
  *   npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>] [--with=thumbnail,view]
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
-import { Wacz, ResolvedRecord } from '../archive/wacz.js';
-import { CdxjEntry } from '../archive/cdxj.js';
-import { lookupKey, lookupVariants, lookupPathKey, lookupKeyCi } from '../lib/url.js';
-import { renderIndexPage, buildPageRows, IndexRow } from '../replay/index-page.js';
-import { cdxjTsToRfc3339, rfc3339ToTs14 } from '../lib/time.js';
-import { createExportPipeline, ReplayContext, FLAT_NOT_FOUND_FILE } from '../replay/plugins.js';
-import { renderNotFoundPage } from '../replay/not-found.js';
+import * as fs from "fs";
+import * as path from "path";
+import { Wacz, ResolvedRecord } from "../archive/wacz.js";
+import { CdxjEntry } from "../archive/cdxj.js";
+import {
+  lookupKey,
+  lookupVariants,
+  lookupPathKey,
+  lookupKeyCi,
+} from "../lib/url.js";
+import {
+  renderIndexPage,
+  buildPageRows,
+  IndexRow,
+} from "../replay/index-page.js";
+import { cdxjTsToRfc3339, rfc3339ToTs14 } from "../lib/time.js";
+import {
+  createExportPipeline,
+  ReplayContext,
+  FLAT_NOT_FOUND_FILE,
+} from "../replay/plugins.js";
+import { renderNotFoundPage } from "../replay/not-found.js";
 
 // ---------------------------------------------------------------------------
 // Arguments
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv: string[]): { wacz: string; out: string; withTypes: Set<string> } {
-    let wacz = '';
-    let out = '';
-    const withTypes = new Set<string>();
-    const positional: string[] = [];
-    const collectWith = (raw: string): void => {
-        for (const t of raw.split(',')) {
-            const tt = t.trim().toLowerCase();
-            if (tt) withTypes.add(tt);
-        }
-    };
-    for (let i = 0; i < argv.length; i++) {
-        const a = argv[i];
-        if (a === '--out') {
-            out = argv[++i] || '';
-        } else if (a.startsWith('--out=')) {
-            out = a.slice('--out='.length);
-        } else if (a === '--with') {
-            collectWith(argv[++i] || '');
-        } else if (a.startsWith('--with=')) {
-            collectWith(a.slice('--with='.length));
-        } else if (!a.startsWith('--')) {
-            positional.push(a);
-        }
+function parseArgs(argv: string[]): {
+  wacz: string;
+  out: string;
+  withTypes: Set<string>;
+} {
+  let wacz = "";
+  let out = "";
+  const withTypes = new Set<string>();
+  const positional: string[] = [];
+  const collectWith = (raw: string): void => {
+    for (const t of raw.split(",")) {
+      const tt = t.trim().toLowerCase();
+      if (tt) withTypes.add(tt);
     }
-    if (positional.length > 0) wacz = positional[0];
-    if (!wacz) {
-        console.error('Usage: npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>] [--with=thumbnail,view]');
-        process.exit(1);
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--out") {
+      out = argv[++i] || "";
+    } else if (a.startsWith("--out=")) {
+      out = a.slice("--out=".length);
+    } else if (a === "--with") {
+      collectWith(argv[++i] || "");
+    } else if (a.startsWith("--with=")) {
+      collectWith(a.slice("--with=".length));
+    } else if (!a.startsWith("--")) {
+      positional.push(a);
     }
-    if (!out) {
-        out = path.join(path.dirname(path.resolve(wacz)), path.basename(wacz, '.wacz') + '-html');
-    }
-    return { wacz: path.resolve(wacz), out: path.resolve(out), withTypes };
+  }
+  if (positional.length > 0) wacz = positional[0];
+  if (!wacz) {
+    console.error(
+      "Usage: npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>] [--with=thumbnail,view]",
+    );
+    process.exit(1);
+  }
+  if (!out) {
+    out = path.join(
+      path.dirname(path.resolve(wacz)),
+      path.basename(wacz, ".wacz") + "-html",
+    );
+  }
+  return { wacz: path.resolve(wacz), out: path.resolve(out), withTypes };
 }
 
 // ---------------------------------------------------------------------------
@@ -84,24 +106,25 @@ function parseArgs(argv: string[]): { wacz: string; out: string; withTypes: Set<
 
 /** Map a content-type (or CDXJ mime) to a file extension, or '' if unknown. */
 function extFromMime(mime: string): string {
-    const m = mime.toLowerCase();
-    if (m.includes('text/html')) return '.html';
-    if (m.includes('image/jpeg')) return '.jpg';
-    if (m.includes('image/png')) return '.png';
-    if (m.includes('image/gif')) return '.gif';
-    if (m.includes('image/svg')) return '.svg';
-    if (m.includes('text/css')) return '.css';
-    if (m.includes('javascript')) return '.js';
-    if (m.includes('application/json')) return '.json';
-    if (m.includes('text/plain')) return '.txt';
-    if (m.includes('image/bmp')) return '.bmp';
-    if (m.includes('image/x-icon') || m.includes('image/vnd.microsoft.icon')) return '.ico';
-    return '';
+  const m = mime.toLowerCase();
+  if (m.includes("text/html")) return ".html";
+  if (m.includes("image/jpeg")) return ".jpg";
+  if (m.includes("image/png")) return ".png";
+  if (m.includes("image/gif")) return ".gif";
+  if (m.includes("image/svg")) return ".svg";
+  if (m.includes("text/css")) return ".css";
+  if (m.includes("javascript")) return ".js";
+  if (m.includes("application/json")) return ".json";
+  if (m.includes("text/plain")) return ".txt";
+  if (m.includes("image/bmp")) return ".bmp";
+  if (m.includes("image/x-icon") || m.includes("image/vnd.microsoft.icon"))
+    return ".ico";
+  return "";
 }
 
 /** Strip characters that are illegal in filenames on Windows/Linux. */
 function sanitizeName(s: string): string {
-    return s.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+  return s.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
 }
 
 /**
@@ -112,7 +135,15 @@ function sanitizeName(s: string): string {
  * download it) instead of displaying the page. When such a resource is
  * actually HTML, its flat file is renamed to `.html`.
  */
-const HTML_SCRIPT_EXTS = new Set(['.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp', '.shtml']);
+const HTML_SCRIPT_EXTS = new Set([
+  ".asp",
+  ".aspx",
+  ".php",
+  ".cfm",
+  ".cgi",
+  ".jsp",
+  ".shtml",
+]);
 
 /**
  * Top-level domains that show up as the tail of a bare hostname when a URL is
@@ -124,12 +155,63 @@ const HTML_SCRIPT_EXTS = new Set(['.asp', '.aspx', '.php', '.cfm', '.cgi', '.jsp
  * an HTML resource is rewritten to `.html`.
  */
 const DOMAIN_TLDS = new Set([
-    '.com', '.org', '.net', '.edu', '.gov', '.mil', '.int',
-    '.io', '.co', '.tv', '.me', '.cc', '.info', '.biz', '.name', '.mobi', '.asia',
-    '.uk', '.us', '.ca', '.au', '.nz', '.de', '.fr', '.it', '.es', '.nl', '.se',
-    '.no', '.dk', '.fi', '.at', '.be', '.ch', '.pl', '.cz', '.sk', '.hu', '.gr',
-    '.pt', '.ru', '.cn', '.jp', '.kr', '.tw', '.hk', '.sg', '.in', '.br', '.mx',
-    '.za', '.ar', '.cl', '.tr', '.il', '.ie', '.is',
+  ".com",
+  ".org",
+  ".net",
+  ".edu",
+  ".gov",
+  ".mil",
+  ".int",
+  ".io",
+  ".co",
+  ".tv",
+  ".me",
+  ".cc",
+  ".info",
+  ".biz",
+  ".name",
+  ".mobi",
+  ".asia",
+  ".uk",
+  ".us",
+  ".ca",
+  ".au",
+  ".nz",
+  ".de",
+  ".fr",
+  ".it",
+  ".es",
+  ".nl",
+  ".se",
+  ".no",
+  ".dk",
+  ".fi",
+  ".at",
+  ".be",
+  ".ch",
+  ".pl",
+  ".cz",
+  ".sk",
+  ".hu",
+  ".gr",
+  ".pt",
+  ".ru",
+  ".cn",
+  ".jp",
+  ".kr",
+  ".tw",
+  ".hk",
+  ".sg",
+  ".in",
+  ".br",
+  ".mx",
+  ".za",
+  ".ar",
+  ".cl",
+  ".tr",
+  ".il",
+  ".ie",
+  ".is",
 ]);
 
 /** Rewrite extensions that are not real file types, but only when the resource
@@ -144,42 +226,42 @@ const DOMAIN_TLDS = new Set([
  *     become `.html`; the same suffix on a JSON or image response keeps its own
  *     identity. */
 function normalizeExt(ext: string, mime: string): string {
-    const fromMime = extFromMime(mime);
-    if (DOMAIN_TLDS.has(ext)) return fromMime || ext;
-    if (HTML_SCRIPT_EXTS.has(ext) && fromMime === '.html') return '.html';
-    return ext;
+  const fromMime = extFromMime(mime);
+  if (DOMAIN_TLDS.has(ext)) return fromMime || ext;
+  if (HTML_SCRIPT_EXTS.has(ext) && fromMime === ".html") return ".html";
+  return ext;
 }
 
 interface NameParts {
-    stem: string;
-    urlExt: string;
+  stem: string;
+  urlExt: string;
 }
 
 function urlBasename(url: string): string {
-    let pathname: string;
-    try {
-        pathname = new URL(url).pathname;
-    } catch {
-        pathname = '';
-    }
-    let base = pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
-    base = base.slice(base.lastIndexOf('/') + 1);
-    if (base === '') base = 'index';
-    try {
-        base = decodeURIComponent(base);
-    } catch {
-        /* keep raw */
-    }
-    return sanitizeName(base);
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    pathname = "";
+  }
+  let base = pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+  base = base.slice(base.lastIndexOf("/") + 1);
+  if (base === "") base = "index";
+  try {
+    base = decodeURIComponent(base);
+  } catch {
+    /* keep raw */
+  }
+  return sanitizeName(base);
 }
 
 function splitName(url: string): NameParts {
-    const base = urlBasename(url);
-    const dot = base.lastIndexOf('.');
-    if (dot > 0) {
-        return { stem: base.slice(0, dot), urlExt: base.slice(dot).toLowerCase() };
-    }
-    return { stem: base, urlExt: '' };
+  const base = urlBasename(url);
+  const dot = base.lastIndexOf(".");
+  if (dot > 0) {
+    return { stem: base.slice(0, dot), urlExt: base.slice(dot).toLowerCase() };
+  }
+  return { stem: base, urlExt: "" };
 }
 
 /**
@@ -190,7 +272,7 @@ function splitName(url: string): NameParts {
  * the restorer stamps whole seconds, so it uniquely identifies a capture.
  */
 function captureKey(url: string, ts14: string): string {
-    return lookupKey(url) + ' ' + ts14;
+  return lookupKey(url) + " " + ts14;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,11 +280,11 @@ function captureKey(url: string, ts14: string): string {
 // ---------------------------------------------------------------------------
 
 function csvEscape(field: string): string {
-    const s = String(field);
-    if (/[",\n\r]/.test(s)) {
-        return '"' + s.replace(/"/g, '""') + '"';
-    }
-    return s;
+  const s = String(field);
+  if (/[",\n\r]/.test(s)) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,219 +292,240 @@ function csvEscape(field: string): string {
 // ---------------------------------------------------------------------------
 
 function main(): void {
-    const { wacz: waczPath, out: outDir, withTypes } = parseArgs(process.argv.slice(2));
+  const {
+    wacz: waczPath,
+    out: outDir,
+    withTypes,
+  } = parseArgs(process.argv.slice(2));
 
-    console.log('=== WACZ Export to HTML ===');
-    console.log('Archive:  ' + waczPath);
-    console.log('Output:   ' + outDir);
+  console.log("=== WACZ Export to HTML ===");
+  console.log("Archive:  " + waczPath);
+  console.log("Output:   " + outDir);
 
-    const wacz = new Wacz(waczPath);
+  const wacz = new Wacz(waczPath);
 
-    // Deduplicate entries by capture (normalized URL + timestamp), keeping the
-    // first occurrence of a true duplicate. Distinct timestamps of the same URL
-    // are distinct captures and must each be exported -- a multi-capture archive
-    // (e.g. the same Microsoft homepage in 1996 and 1998) lists every version.
-    const seen = new Set<string>();
-    const unique: CdxjEntry[] = [];
-    for (const e of wacz.entries) {
-        const k = captureKey(e.url, e.timestamp.slice(0, 14));
-        if (seen.has(k)) continue;
-        seen.add(k);
-        unique.push(e);
+  // Deduplicate entries by capture (normalized URL + timestamp), keeping the
+  // first occurrence of a true duplicate. Distinct timestamps of the same URL
+  // are distinct captures and must each be exported -- a multi-capture archive
+  // (e.g. the same Microsoft homepage in 1996 and 1998) lists every version.
+  const seen = new Set<string>();
+  const unique: CdxjEntry[] = [];
+  for (const e of wacz.entries) {
+    const k = captureKey(e.url, e.timestamp.slice(0, 14));
+    if (seen.has(k)) continue;
+    seen.add(k);
+    unique.push(e);
+  }
+  unique.sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+  console.log(`  ${unique.length} unique captures in index`);
+
+  // Assign flat names to the entries we will actually export (200 responses,
+  // skipping warc/revisit records, and skipping the per-page screenshot
+  // records -- `urn:thumbnail:` / `urn:view:` -- unless their type was
+  // requested via `--with`).
+  const SCREENSHOT_URN_RE = /^urn:(thumbnail|view):/i;
+  const exported = unique.filter((e) => {
+    if (e.mime === "warc/revisit") return false;
+    if (e.status != null && e.status !== 200) return false;
+    const urn = SCREENSHOT_URN_RE.exec(e.url);
+    if (urn && !withTypes.has(urn[1].toLowerCase())) return false;
+    return true;
+  });
+
+  const counters = new Map<string, number>();
+  const flatName = new Map<string, string>(); // captureKey(url, ts14) -> flat name
+
+  for (const e of exported) {
+    const { stem, urlExt } = splitName(e.url);
+    // Lowercase the prefix *after* slicing: some non-ASCII letters change
+    // byte length when lowercased (U+00DF, U+0130), so slicing first keeps the prefix
+    // a true "first five characters, lowercased". Lowercasing also makes the
+    // stem consistent with the already-lowercased extension, and prevents
+    // case-collisions (FOO.png vs foo.png) on case-insensitive filesystems.
+    const prefix = sanitizeName(stem.slice(0, 5)).toLowerCase();
+    const ext = normalizeExt(urlExt || extFromMime(e.mime), e.mime);
+    const groupKey = prefix + "|" + ext;
+    const n = (counters.get(groupKey) || 0) + 1;
+    counters.set(groupKey, n);
+    const name = `${prefix}~${n}${ext}`;
+    flatName.set(captureKey(e.url, e.timestamp.slice(0, 14)), name);
+  }
+
+  // URL -> flat name, including www/protocol variants for link rewriting.
+  const flatByKey = new Map<string, string>();
+  // scheme/host/port/path -> flat name, any query: the fallback that makes a
+  // cache-busted reference (theme.css?v=2) resolve to the stored variant.
+  const flatPathByKey = new Map<string, string>();
+  // lookupKeyCi(url) -> flat name: case-insensitive path fallback, tried last
+  // so a differently-cased reference still resolves on legacy servers (old
+  // IIS) where the page and the capture disagree on path case.
+  const flatByKeyCi = new Map<string, string>();
+  for (const e of exported) {
+    const name = flatName.get(captureKey(e.url, e.timestamp.slice(0, 14)));
+    if (!name) continue;
+    for (const v of lookupVariants(e.url)) {
+      const k = lookupKey(v);
+      if (!flatByKey.has(k)) flatByKey.set(k, name);
     }
-    unique.sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
-    console.log(`  ${unique.length} unique captures in index`);
+    const pk = lookupPathKey(e.url);
+    if (!flatPathByKey.has(pk)) flatPathByKey.set(pk, name);
+    const ck = lookupKeyCi(e.url);
+    if (!flatByKeyCi.has(ck)) flatByKeyCi.set(ck, name);
+  }
 
-    // Assign flat names to the entries we will actually export (200 responses,
-    // skipping warc/revisit records, and skipping the per-page screenshot
-    // records -- `urn:thumbnail:` / `urn:view:` -- unless their type was
-    // requested via `--with`).
-    const SCREENSHOT_URN_RE = /^urn:(thumbnail|view):/i;
-    const exported = unique.filter((e) => {
-        if (e.mime === 'warc/revisit') return false;
-        if (e.status != null && e.status !== 200) return false;
-        const urn = SCREENSHOT_URN_RE.exec(e.url);
-        if (urn && !withTypes.has(urn[1].toLowerCase())) return false;
-        return true;
-    });
+  // Redirects (301/302/...): the crawler stored a redirect record with a
+  // `Location` header, not the final bytes. Map each redirect source URL to
+  // the flat file of its final 200 target, following chains, so a link to
+  // the source resolves locally instead of 404ing. The source itself is not
+  // written as a file -- the browser would have followed it to the target.
+  const redirectByKey = new Map<string, string>(); // lookupKey(src) -> abs target (one hop)
+  for (const e of unique) {
+    const s = e.status;
+    if (typeof s !== "number" || s < 300 || s >= 400) continue;
+    let rec: ResolvedRecord;
+    try {
+      rec = wacz.resolveRecord(e.url)!;
+    } catch {
+      continue;
+    }
+    const loc = rec.record.httpHeaders.get("location");
+    if (!loc) continue;
+    let target: string;
+    try {
+      target = new URL(loc, e.url).href;
+    } catch {
+      continue;
+    }
+    redirectByKey.set(lookupKey(e.url), target);
+  }
+  const resolveRedirectChain = (url: string): string => {
+    let cur = url;
+    for (let i = 0; i < 8; i++) {
+      const next = redirectByKey.get(lookupKey(cur));
+      if (!next) break;
+      cur = next;
+    }
+    return cur;
+  };
+  for (const e of unique) {
+    const s = e.status;
+    if (typeof s !== "number" || s < 300 || s >= 400) continue;
+    const final = resolveRedirectChain(e.url);
+    const name = flatByKey.get(lookupKey(final));
+    if (!name) continue;
+    for (const v of lookupVariants(e.url)) {
+      const k = lookupKey(v);
+      if (!flatByKey.has(k)) flatByKey.set(k, name);
+    }
+    const pk = lookupPathKey(e.url);
+    if (!flatPathByKey.has(pk)) flatPathByKey.set(pk, name);
+  }
 
-    const counters = new Map<string, number>();
-    const flatName = new Map<string, string>(); // captureKey(url, ts14) -> flat name
+  // `flatByKey` is the lookupKey(url) -> file name map used by the static
+  // rewriter to turn plain URL references into flat file names.
+  const pipeline = createExportPipeline();
 
-    for (const e of exported) {
-        const { stem, urlExt } = splitName(e.url);
-        // Lowercase the prefix *after* slicing: some non-ASCII letters change
-        // byte length when lowercased (U+00DF, U+0130), so slicing first keeps the prefix
-        // a true "first five characters, lowercased". Lowercasing also makes the
-        // stem consistent with the already-lowercased extension, and prevents
-        // case-collisions (FOO.png vs foo.png) on case-insensitive filesystems.
-        const prefix = sanitizeName(stem.slice(0, 5)).toLowerCase();
-        const ext = normalizeExt(urlExt || extFromMime(e.mime), e.mime);
-        const groupKey = prefix + '|' + ext;
-        const n = (counters.get(groupKey) || 0) + 1;
-        counters.set(groupKey, n);
-        const name = `${prefix}~${n}${ext}`;
-        flatName.set(captureKey(e.url, e.timestamp.slice(0, 14)), name);
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const rows: IndexRow[] = [];
+  let written = 0;
+  let skipped = 0;
+
+  for (const e of exported) {
+    const name = flatName.get(captureKey(e.url, e.timestamp.slice(0, 14)));
+    if (!name) continue;
+
+    let rec: ResolvedRecord;
+    try {
+      // Resolve at this capture's own timestamp: a multi-capture URL has
+      // several records, and the default (earliest) would export the wrong
+      // version for every later capture.
+      rec = wacz.resolveRecord(e.url, e.timestamp)!;
+    } catch (err) {
+      console.error("  ERROR reading " + e.url + ": " + (err as Error).message);
+      skipped++;
+      continue;
     }
 
-    // URL -> flat name, including www/protocol variants for link rewriting.
-    const flatByKey = new Map<string, string>();
-    // scheme/host/port/path -> flat name, any query: the fallback that makes a
-    // cache-busted reference (theme.css?v=2) resolve to the stored variant.
-    const flatPathByKey = new Map<string, string>();
-    // lookupKeyCi(url) -> flat name: case-insensitive path fallback, tried last
-    // so a differently-cased reference still resolves on legacy servers (old
-    // IIS) where the page and the capture disagree on path case.
-    const flatByKeyCi = new Map<string, string>();
-    for (const e of exported) {
-        const name = flatName.get(captureKey(e.url, e.timestamp.slice(0, 14)));
-        if (!name) continue;
-        for (const v of lookupVariants(e.url)) {
-            const k = lookupKey(v);
-            if (!flatByKey.has(k)) flatByKey.set(k, name);
-        }
-        const pk = lookupPathKey(e.url);
-        if (!flatPathByKey.has(pk)) flatPathByKey.set(pk, name);
-        const ck = lookupKeyCi(e.url);
-        if (!flatByKeyCi.has(ck)) flatByKeyCi.set(ck, name);
-    }
+    const ts = rec.record.date || cdxjTsToRfc3339(e.timestamp);
 
-    // Redirects (301/302/...): the crawler stored a redirect record with a
-    // `Location` header, not the final bytes. Map each redirect source URL to
-    // the flat file of its final 200 target, following chains, so a link to
-    // the source resolves locally instead of 404ing. The source itself is not
-    // written as a file -- the browser would have followed it to the target.
-    const redirectByKey = new Map<string, string>(); // lookupKey(src) -> abs target (one hop)
-    for (const e of unique) {
-        const s = e.status;
-        if (typeof s !== 'number' || s < 300 || s >= 400) continue;
-        let rec: ResolvedRecord;
-        try {
-            rec = wacz.resolveRecord(e.url)!;
-        } catch {
-            continue;
-        }
-        const loc = rec.record.httpHeaders.get('location');
-        if (!loc) continue;
-        let target: string;
-        try {
-            target = new URL(loc, e.url).href;
-        } catch {
-            continue;
-        }
-        redirectByKey.set(lookupKey(e.url), target);
-    }
-    const resolveRedirectChain = (url: string): string => {
-        let cur = url;
-        for (let i = 0; i < 8; i++) {
-            const next = redirectByKey.get(lookupKey(cur));
-            if (!next) break;
-            cur = next;
-        }
-        return cur;
+    // Run the body through the static-rewrite-only pipeline: plain URL
+    // references (href/src/srcset, JS import, CSS @import) become flat
+    // file names. No client shim is injected under file://. Non-text
+    // files pass through unchanged.
+    const ctx: ReplayContext = {
+      url: e.url,
+      ts: e.timestamp.slice(0, 14),
+      mime: e.mime,
+      body: rec.record.body,
+      mode: "flat",
+      flatMap: flatByKey,
+      flatPathMap: flatPathByKey,
+      flatCiMap: flatByKeyCi,
     };
-    for (const e of unique) {
-        const s = e.status;
-        if (typeof s !== 'number' || s < 300 || s >= 400) continue;
-        const final = resolveRedirectChain(e.url);
-        const name = flatByKey.get(lookupKey(final));
-        if (!name) continue;
-        for (const v of lookupVariants(e.url)) {
-            const k = lookupKey(v);
-            if (!flatByKey.has(k)) flatByKey.set(k, name);
-        }
-        const pk = lookupPathKey(e.url);
-        if (!flatPathByKey.has(pk)) flatPathByKey.set(pk, name);
-    }
+    const body = pipeline.apply(ctx);
 
-    // `flatByKey` is the lookupKey(url) -> file name map used by the static
-    // rewriter to turn plain URL references into flat file names.
-    const pipeline = createExportPipeline();
+    fs.writeFileSync(path.join(outDir, name), body);
+    rows.push({ href: name, name, timestamp: ts, url: e.url });
+    written++;
+  }
 
-    fs.mkdirSync(outDir, { recursive: true });
-
-    const rows: IndexRow[] = [];
-    let written = 0;
-    let skipped = 0;
-
-    for (const e of exported) {
-        const name = flatName.get(captureKey(e.url, e.timestamp.slice(0, 14)));
-        if (!name) continue;
-
-        let rec: ResolvedRecord;
-        try {
-            // Resolve at this capture's own timestamp: a multi-capture URL has
-            // several records, and the default (earliest) would export the wrong
-            // version for every later capture.
-            rec = wacz.resolveRecord(e.url, e.timestamp)!;
-        } catch (err) {
-            console.error('  ERROR reading ' + e.url + ': ' + (err as Error).message);
-            skipped++;
-            continue;
-        }
-
-        const ts = rec.record.date || cdxjTsToRfc3339(e.timestamp);
-
-        // Run the body through the static-rewrite-only pipeline: plain URL
-        // references (href/src/srcset, JS import, CSS @import) become flat
-        // file names. No client shim is injected under file://. Non-text
-        // files pass through unchanged.
-        const ctx: ReplayContext = {
-            url: e.url,
-            ts: e.timestamp.slice(0, 14),
-            mime: e.mime,
-            body: rec.record.body,
-            mode: 'flat',
-            flatMap: flatByKey,
-            flatPathMap: flatPathByKey,
-            flatCiMap: flatByKeyCi,
-        };
-        const body = pipeline.apply(ctx);
-
-        fs.writeFileSync(path.join(outDir, name), body);
-        rows.push({ href: name, name, timestamp: ts, url: e.url });
-        written++;
-    }
-
-    // urls.csv
-    rows.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    const csvLines = ['File Name,Timestamp,Original URLs'];
-    for (const r of rows) {
-        csvLines.push(`${csvEscape(r.name)},${csvEscape(r.timestamp)},${csvEscape(r.url)}`);
-    }
-    fs.writeFileSync(path.join(outDir, 'urls.csv'), csvLines.join('\n') + '\n');
-
-    // wayback-index.html (pre-generated) -- lists the archive's *pages*, linking to the
-    // flat file name each page was exported to. The preview column is only
-    // built when thumbnails were exported (`--with=thumbnail`), otherwise the
-    // screenshot files don't exist and the column would point at nothing.
-    const pageRows = buildPageRows(
-        wacz.pages,
-        (url, ts) => flatName.get(captureKey(url, rfc3339ToTs14(ts))) ?? null,
-        withTypes.has('thumbnail')
-            ? (url, ts) => {
-                  const thumb = wacz.thumbnailFor(url, ts);
-                  return thumb ? flatName.get(captureKey(thumb.url, thumb.timestamp.slice(0, 14))) ?? null : null;
-              }
-            : undefined,
+  // urls.csv
+  rows.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const csvLines = ["File Name,Timestamp,Original URLs"];
+  for (const r of rows) {
+    csvLines.push(
+      `${csvEscape(r.name)},${csvEscape(r.timestamp)},${csvEscape(r.url)}`,
     );
-    fs.writeFileSync(
-        path.join(outDir, 'wayback-index.html'),
-        renderIndexPage(wacz.title, pageRows, ['Page', 'Timestamp', 'Original URL']),
-    );
+  }
+  fs.writeFileSync(path.join(outDir, "urls.csv"), csvLines.join("\n") + "\n");
 
-    // unarchived-message.html -- the captive "not saved" page. Every unsaved URL reference is
-    // rewritten to `unarchived-message.html?url=<original>`; a tiny inline script reads the
-    // original URL back out and displays it.
-    fs.writeFileSync(path.join(outDir, FLAT_NOT_FOUND_FILE), renderNotFoundPage());
+  // wayback-index.html (pre-generated) -- lists the archive's *pages*, linking to the
+  // flat file name each page was exported to. The preview column is only
+  // built when thumbnails were exported (`--with=thumbnail`), otherwise the
+  // screenshot files don't exist and the column would point at nothing.
+  const pageRows = buildPageRows(
+    wacz.pages,
+    (url, ts) => flatName.get(captureKey(url, rfc3339ToTs14(ts))) ?? null,
+    withTypes.has("thumbnail")
+      ? (url, ts) => {
+          const thumb = wacz.thumbnailFor(url, ts);
+          return thumb
+            ? (flatName.get(
+                captureKey(thumb.url, thumb.timestamp.slice(0, 14)),
+              ) ?? null)
+            : null;
+        }
+      : undefined,
+  );
+  fs.writeFileSync(
+    path.join(outDir, "wayback-index.html"),
+    renderIndexPage(wacz.title, pageRows, [
+      "Page",
+      "Timestamp",
+      "Original URL",
+    ]),
+  );
 
-    console.log('');
-    console.log('=== Export Complete ===');
-    console.log(`  Files written: ${written}`);
-    console.log(`  Skipped:       ${skipped}`);
-    console.log('  urls.csv:      ' + path.join(outDir, 'urls.csv'));
-    console.log('  wayback-index.html:    ' + path.join(outDir, 'wayback-index.html'));
-    console.log('  unarchived-message.html: ' + path.join(outDir, FLAT_NOT_FOUND_FILE));
+  // unarchived-message.html -- the captive "not saved" page. Every unsaved URL reference is
+  // rewritten to `unarchived-message.html?url=<original>`; a tiny inline script reads the
+  // original URL back out and displays it.
+  fs.writeFileSync(
+    path.join(outDir, FLAT_NOT_FOUND_FILE),
+    renderNotFoundPage(),
+  );
+
+  console.log("");
+  console.log("=== Export Complete ===");
+  console.log(`  Files written: ${written}`);
+  console.log(`  Skipped:       ${skipped}`);
+  console.log("  urls.csv:      " + path.join(outDir, "urls.csv"));
+  console.log(
+    "  wayback-index.html:    " + path.join(outDir, "wayback-index.html"),
+  );
+  console.log(
+    "  unarchived-message.html: " + path.join(outDir, FLAT_NOT_FOUND_FILE),
+  );
 }
 
 main();

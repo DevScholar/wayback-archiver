@@ -23,14 +23,14 @@ renames files as `<prefix>~<n><ext>`.
 
 ## Examples
 
-| URL                                | MIME        | Flat name     |
-| ---------------------------------- | ----------- | ------------- |
-| `/about.html`                      | text/html   | `about~1.html`|
-| `/information.asp`                 | text/html   | `infor~1.html`|
-| `/information-archive.asp`         | text/html   | `infor~2.html`|
-| `/cdx`                             | text/plain  | `cdx~1`       |
-| `/` (homepage)                     | text/html   | `index~1.html`|
-| `/pages/year2000/`                 | text/html   | `year2~1.html`|
+| URL                        | MIME       | Flat name      |
+| -------------------------- | ---------- | -------------- |
+| `/about.html`              | text/html  | `about~1.html` |
+| `/information.asp`         | text/html  | `infor~1.html` |
+| `/information-archive.asp` | text/html  | `infor~2.html` |
+| `/cdx`                     | text/plain | `cdx~1`        |
+| `/` (homepage)             | text/html  | `index~1.html` |
+| `/pages/year2000/`         | text/html  | `year2~1.html` |
 
 ## Metadata
 

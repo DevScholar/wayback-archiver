@@ -6,62 +6,69 @@
  */
 
 export interface IndexRow {
-    /** Where the name cell links to (may be a file name or a replay route). */
-    href: string;
-    /** Text shown in the "File Name" column. */
-    name: string;
-    /** Text shown in the "Timestamp" column. */
-    timestamp: string;
-    /** Text shown in the "Original URL" column. */
-    url: string;
-    /** Optional preview image URL (relative), rendered in a leading column. */
-    thumbnail?: string;
+  /** Where the name cell links to (may be a file name or a replay route). */
+  href: string;
+  /** Text shown in the "File Name" column. */
+  name: string;
+  /** Text shown in the "Timestamp" column. */
+  timestamp: string;
+  /** Text shown in the "Original URL" column. */
+  url: string;
+  /** Optional preview image URL (relative), rendered in a leading column. */
+  thumbnail?: string;
 }
 
 function escapeHtml(str: string): string {
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-const DEFAULT_HEADERS: [string, string, string] = ['File Name', 'Timestamp', 'Original URL'];
+const DEFAULT_HEADERS: [string, string, string] = [
+  "File Name",
+  "Timestamp",
+  "Original URL",
+];
 
 export function renderIndexPage(
-    title: string,
-    rows: IndexRow[],
-    headers: [string, string, string] = DEFAULT_HEADERS,
+  title: string,
+  rows: IndexRow[],
+  headers: [string, string, string] = DEFAULT_HEADERS,
 ): string {
-    // A "Preview" column is added only when at least one row carries a
-    // thumbnail, so archives without screenshots keep the classic 3-column
-    // layout. The fixed-width timestamp column shifts right by one in that case.
-    const hasThumbs = rows.some((r) => r.thumbnail);
-    const tsIndex = hasThumbs ? 2 : 1;
-    const headerRow = (hasThumbs ? ['Preview', ...headers] : [...headers])
-        .map((h, i) => `<th${i === tsIndex ? ' width="180"' : ''}>${escapeHtml(h)}</th>`)
-        .join('\n        ');
+  // A "Preview" column is added only when at least one row carries a
+  // thumbnail, so archives without screenshots keep the classic 3-column
+  // layout. The fixed-width timestamp column shifts right by one in that case.
+  const hasThumbs = rows.some((r) => r.thumbnail);
+  const tsIndex = hasThumbs ? 2 : 1;
+  const headerRow = (hasThumbs ? ["Preview", ...headers] : [...headers])
+    .map(
+      (h, i) =>
+        `<th${i === tsIndex ? ' width="180"' : ""}>${escapeHtml(h)}</th>`,
+    )
+    .join("\n        ");
 
-    const body = rows
-        .map(
-            (r, i) => {
-                const cls = i % 2 === 0 ? 'row-norm' : 'row-alt';
-                const thumbCell = hasThumbs
-                    ? `<td>${r.thumbnail
-                        ? `<a href="${escapeHtml(r.href)}"><img src="${escapeHtml(r.thumbnail)}" width="160" alt="" border="0"></a>`
-                        : '&nbsp;'}</td>\n        `
-                    : '';
-                return `    <tr class="${cls}">
+  const body = rows
+    .map((r, i) => {
+      const cls = i % 2 === 0 ? "row-norm" : "row-alt";
+      const thumbCell = hasThumbs
+        ? `<td>${
+            r.thumbnail
+              ? `<a href="${escapeHtml(r.href)}"><img src="${escapeHtml(r.thumbnail)}" width="160" alt="" border="0"></a>`
+              : "&nbsp;"
+          }</td>\n        `
+        : "";
+      return `    <tr class="${cls}">
         ${thumbCell}<td><a href="${escapeHtml(r.href)}">${escapeHtml(r.name)}</a></td>
         <td class="sml">${escapeHtml(r.timestamp)}</td>
         <td class="sml">${escapeHtml(r.url)}</td>
     </tr>`;
-            },
-        )
-        .join('\n');
+    })
+    .join("\n");
 
-    return `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+  return `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
 <html>
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
@@ -104,22 +111,22 @@ ${body}
  * file for).
  */
 export function buildPageRows(
-    pages: { url: string; ts: string; title?: string }[],
-    hrefFor: (url: string, ts: string) => string | null,
-    thumbFor?: (url: string, ts: string) => string | null,
+  pages: { url: string; ts: string; title?: string }[],
+  hrefFor: (url: string, ts: string) => string | null,
+  thumbFor?: (url: string, ts: string) => string | null,
 ): IndexRow[] {
-    const rows: IndexRow[] = [];
-    for (const p of pages) {
-        const href = hrefFor(p.url, p.ts);
-        if (href === null) continue;
-        const thumbnail = thumbFor ? thumbFor(p.url, p.ts) : null;
-        rows.push({
-            href,
-            name: p.title || p.url,
-            timestamp: p.ts,
-            url: p.url,
-            thumbnail: thumbnail ?? undefined,
-        });
-    }
-    return rows;
+  const rows: IndexRow[] = [];
+  for (const p of pages) {
+    const href = hrefFor(p.url, p.ts);
+    if (href === null) continue;
+    const thumbnail = thumbFor ? thumbFor(p.url, p.ts) : null;
+    rows.push({
+      href,
+      name: p.title || p.url,
+      timestamp: p.ts,
+      url: p.url,
+      thumbnail: thumbnail ?? undefined,
+    });
+  }
+  return rows;
 }

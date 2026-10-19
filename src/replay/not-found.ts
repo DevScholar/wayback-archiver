@@ -17,22 +17,22 @@
 
 /** Escape text for a UTF-8 HTML document (text content and attribute value). */
 function escapeHtml(value: string): string {
-    return value
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 /** Render the "not saved" page. Pass the missing URL to fill it in directly
  * (the server); omit it for the flat export's `?url=` script. */
 export function renderNotFoundPage(url?: string): string {
-    const shown = url === undefined ? '' : escapeHtml(url);
-    const script =
-        url !== undefined
-            ? ''
-            : `
+  const shown = url === undefined ? "" : escapeHtml(url);
+  const script =
+    url !== undefined
+      ? ""
+      : `
 <script type="text/javascript">
 (function () {
   var m = /[?&]url=([^&]+)/.exec(location.search);
@@ -47,7 +47,7 @@ export function renderNotFoundPage(url?: string): string {
 })();
 </script>`;
 
-    return `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+  return `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
 <html lang="en">
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">

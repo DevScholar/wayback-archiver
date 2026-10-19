@@ -39,7 +39,7 @@ links, no toolbar, no injected scripts.
 
 The bytes are stored under the inner `<url>`, the headers are rebuilt from the
 historical `X-Archive-Orig-*` values (so `server: nginx` and CSP never leak in),
-and the record is stamped with the *historical* capture time, not the current
+and the record is stamped with the _historical_ capture time, not the current
 clock. The result is a WACZ that looks like a direct capture from the past.
 
 Every modifier becomes `id_`. `im_` images already equal `id_`, since images are
@@ -68,7 +68,7 @@ analytics. Every URL is rewritten to a `/web/<ts>[mod_]/<url>` route. That copy 
 lossy: `wombat.js` reserializes the DOM, so tag case and quoting normalize, CRLF
 becomes LF, and relative URLs become absolute. None of that can be undone later.
 
-This tool does not un-rewrite those bytes. It reads the *list* of replay URLs in
+This tool does not un-rewrite those bytes. It reads the _list_ of replay URLs in
 the input WACZ and refetches each `id_` route, which serves the bytes exactly as
 captured, with no rewriting and no chrome. For each snapshot it:
 
@@ -80,7 +80,7 @@ captured, with no rewriting and no chrome. For each snapshot it:
   `WARC-Identified-Payload-Type`, with ArchiveWeb.page's own identified type as
   the fallback. A page whose server declared no charset still replays with the
   encoding of its bytes;
-- stamps the record with its *historical* capture time;
+- stamps the record with its _historical_ capture time;
 - follows a redirect the era's server sent, hop by hop, archiving each hop under
   its own URL with its historical status and `Location`, and fetches each hop
   through Wayback at the same capture time, so the live web is never contacted;
@@ -90,7 +90,7 @@ captured, with no rewriting and no chrome. For each snapshot it:
   is left for a later run, like a failed fetch.
 
 One URL captured at several dates gives several snapshots, each restored on its
-own. Records are de-duplicated by inner URL *and* capture timestamp, so the routes
+own. Records are de-duplicated by inner URL _and_ capture timestamp, so the routes
 of one capture (bare, `im_`, ...) collapse into one, and distinct captures never
 overwrite each other.
 
@@ -165,7 +165,7 @@ then a `<meta>` charset, then the bytes. Valid UTF-8 stays UTF-8, and legacy
 single-byte text is declared `windows-1252`. Stored bytes are never transcoded.
 
 Replay routes accept the Wayback `id_` modifier.
-`/web/<timestamp>id_/<url>` serves the capture's *identity*: the original bytes as
+`/web/<timestamp>id_/<url>` serves the capture's _identity_: the original bytes as
 archived, with no link rewriting and no url-fixer shim injected.
 
 ## Verify archive integrity
