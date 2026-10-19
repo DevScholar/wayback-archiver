@@ -1,9 +1,7 @@
 # Wayback Archiver
 
 Read [WACZ](https://webrecorder.net/wacz) web archives: capture URLs into a new
-WACZ, export them to a standalone flat HTML folder, or serve them for replay in
-a browser.
-
+WACZ, export them to a flat HTML folder, or serve them for replay in a browser.
 
 ## Requirements
 
@@ -16,55 +14,47 @@ a browser.
 npx tsx src/cli/downloader.ts --url-list=my-urls.txt --output-file=my-archive.wacz [--title="My WACZ Title"] [--user-agent="..."] [--accept="..."] [--accept-language="..."] [--wayback]
 ```
 
-`my-urls.txt` holds one URL per line (blank lines and `#` comments are
-ignored). Each URL is fetched once and archived as a WARC 1.1 `response` record
-inside `archive/data.warc.gz`, preceded by a `request` record that records the
-client identity it was fetched under (a Windows NT 10.0 / Edge 150
-`User-Agent`, plus `Accept` and `Accept-Language: en-US,en;q=0.9`). The title
-defaults to the output file's basename.
+`my-urls.txt` holds one URL per line. Blank lines and `#` comments are ignored.
+Each URL is fetched once and stored as a WARC 1.1 `response` record in
+`archive/data.warc.gz`. A `request` record comes first and holds the client
+identity used for the fetch: a Windows NT 10.0 / Edge 150 `User-Agent`, plus
+`Accept` and `Accept-Language: en-US,en;q=0.9`. The title defaults to the output
+file's basename.
 
-**Redirects are archived hop by hop.** A 3xx is not followed silently: each hop
-is kept as its own (empty-body) `response` record under its own URL, with its
-`location` header, and only the final response carries the body. Replaying the
-original URL therefore walks the same redirect chain the live fetch did, and the
-redirect itself — the era's server deciding where to send the browser — survives
-as historical material.
-
-Every URL is fetched once and archived as a WARC 1.1 `request`/`response` pair.
-A success writes one `response` record per redirect hop. A failed fetch is not
-archived: the WARC record vocabulary has no standard field for a capture error,
-so (rather than inventing a non-standard extension) nothing is written for the
-URL, matching ArchiveWeb.page. A fresh archive begins with a single `warcinfo`
-record describing the crawl (`software`, `format`, `isPartOf`).
+A fresh archive starts with one `warcinfo` record (`software`, `format`,
+`isPartOf`). A success writes one `response` record per redirect hop. A 3xx is not
+followed silently: each hop is kept as its own empty-body `response` under its own
+URL, with its `location` header, and only the final response carries the body.
+Replay walks the same chain, and the redirect stays as historical material. A
+failed fetch writes nothing, because WARC has no standard field for a capture
+error.
 
 ### Capturing Wayback Machine replays as pure originals (`--wayback`)
 
 By default the downloader fetches each URL directly. With `--wayback`, each
-url-list line is instead treated as a **Wayback Machine replay URL**
-(`https://web.archive.org/web/<ts>[mod_]/<url>`), and the downloader fetches the
-`id_` form of it — the identity route that serves the archived bytes **exactly
-as captured**, with no link rewriting, no toolbar, and no injected scripts. The
-result is a WACZ that looks as if the pages were captured directly, in the past:
-the response is stored under the inner `<url>`, its headers are rebuilt from the
-historical `X-Archive-Orig-*` values (so `server: nginx` / CSP never leak in),
-and it is stamped with the *historical* capture timestamp rather than the
-current wall clock.
+url-list line is a **Wayback Machine replay URL**
+(`https://web.archive.org/web/<ts>[mod_]/<url>`). The downloader fetches the
+`id_` form, which serves the archived bytes **exactly as captured**: no rewritten
+links, no toolbar, no injected scripts.
 
-Every modifier is rewritten to `id_`, not just the bare page route: `im_` images
-already equal `id_` (images are not rewritten), but `cs_`/`js_` carry a Wayback
-footer and URL rewriting that only `id_` removes. This is the byte-for-byte
-faithful capture path — the replayed routes (`im_`/`cs_`/`js_`/bare) lose
-information (relative paths made absolute, tag case and quoting normalized) that
-cannot be recovered afterward, so a faithful archive must fetch `id_` from the
-start. Any line that is not a Wayback replay URL is skipped with a warning.
+The bytes are stored under the inner `<url>`, the headers are rebuilt from the
+historical `X-Archive-Orig-*` values (so `server: nginx` and CSP never leak in),
+and the record is stamped with the *historical* capture time, not the current
+clock. The result is a WACZ that looks like a direct capture from the past.
 
-The download is **incremental**: if `--output-file` already exists, it is
-appended to rather than replaced. URLs already in the archive are skipped (not
-re-fetched), existing records are kept byte-for-byte, and only new URLs are
-added. Omitting `--title` keeps the existing title; providing it renames the
-archive. Options: `--concurrency` (default 8), `--user-agent`, `--accept`, and
-`--accept-language` (each defaults to its Chrome-100-style value and is recorded
-in the request record).
+Every modifier becomes `id_`. `im_` images already equal `id_`, since images are
+not rewritten. `cs_` and `js_` add a Wayback footer and rewrite URLs. Only `id_`
+leaves the bytes alone. The other routes lose information that cannot be
+recovered later: relative paths become absolute, and tag case and quoting
+normalize. A faithful archive must fetch `id_` from the start. Any line that is
+not a replay URL is skipped with a warning.
+
+A run resumes an existing `--output-file` instead of replacing it. URLs already
+in the archive are skipped, existing records stay byte for byte, and only new
+URLs are added. Omitting `--title` keeps the existing title, and providing it
+renames the archive. Options: `--concurrency` (default 8), `--user-agent`,
+`--accept`, and `--accept-language`. Each defaults to its Chrome-100-style value
+and is recorded in the request record.
 
 ## Restore a Wayback Machine capture
 
@@ -72,71 +62,64 @@ in the request record).
 npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]
 ```
 
-When ArchiveWeb.page crawls `https://web.archive.org/web/<ts>/http://host/...`,
-it archives the replayed page *wrapped in Wayback's own chrome* (top toolbar,
-donation banner, `wombat.js`, `bundle-playback.js`, analytics), every URL
-rewritten to a `/web/<ts>[mod_]/<url>` route. That replayed copy is *lossy*:
-wombat.js reserializes the DOM (tag case and quoting normalize, CRLF becomes LF,
-relative URLs become absolute), so the era's original bytes can never be
-recovered from it afterward.
+ArchiveWeb.page archives a Wayback replay page together with Wayback's own
+chrome: top toolbar, donation banner, `wombat.js`, `bundle-playback.js`,
+analytics. Every URL is rewritten to a `/web/<ts>[mod_]/<url>` route. That copy is
+lossy: `wombat.js` reserializes the DOM, so tag case and quoting normalize, CRLF
+becomes LF, and relative URLs become absolute. None of that can be undone later.
 
-This tool therefore does not try to un-rewrite the replayed bytes. It reads the
-*list* of Wayback replay URLs the input WACZ captured, and for each one fetches a
-fresh copy of its `id_` identity route — the route that serves the archived
-bytes exactly as captured, with no rewriting and no chrome. The result is a WACZ
-that looks as if the pages were captured directly, in the past:
+This tool does not un-rewrite those bytes. It reads the *list* of replay URLs in
+the input WACZ and refetches each `id_` route, which serves the bytes exactly as
+captured, with no rewriting and no chrome. For each snapshot it:
 
 - unwraps each `/web/<ts>[mod_]/<url>` to its `id_` form, fetches it, and stores
   the original bytes under the inner `<url>`;
-- restores the historical HTTP headers from `X-Archive-Orig-*`, so a modern
-  replay artifact (`server: nginx`, CSP, `cache-control`) never leaks into the
-  restored record;
-- keeps a charset hint for replay: Wayback's `X-Archive-Guessed-Charset` wins
-  (written as `WARC-Identified-Payload-Type`), with ArchiveWeb.page's own
-  identified type as the fallback, so a page whose server declared no charset
-  still replays with the encoding of its bytes;
-- stamps each record with its *historical* capture time, not the wall clock;
-- follows a redirect the era's server sent hop by hop, archiving each hop under
+- rebuilds the historical headers from `X-Archive-Orig-*`, so a modern replay
+  artifact (`server: nginx`, CSP, `cache-control`) never leaks into the record;
+- keeps a charset hint: Wayback's `X-Archive-Guessed-Charset` wins, written as
+  `WARC-Identified-Payload-Type`, with ArchiveWeb.page's own identified type as
+  the fallback. A page whose server declared no charset still replays with the
+  encoding of its bytes;
+- stamps the record with its *historical* capture time;
+- follows a redirect the era's server sent, hop by hop, archiving each hop under
   its own URL with its historical status and `Location`, and fetches each hop
-  through Wayback at the same capture time so the live web is never contacted;
-- follows but never archives a Wayback playback redirect (the timestamp shift
-  Wayback writes when it has no capture at the requested time). The capture it
+  through Wayback at the same capture time, so the live web is never contacted;
+- follows but never archives a Wayback playback redirect, the timestamp shift
+  Wayback writes when it has no capture at the requested time. The capture it
   reaches is stamped with that capture's real time, and the requested timestamp
-  is left as-is for a later run, like a failed fetch.
+  is left for a later run, like a failed fetch.
 
-A URL captured at several dates is several snapshots, and each is restored
-independently. Records are de-duplicated by inner URL *and* capture timestamp,
-so the routes of one capture (bare, `im_`, ...) collapse to one record while
-distinct historical captures never overwrite each other.
+One URL captured at several dates gives several snapshots, each restored on its
+own. Records are de-duplicated by inner URL *and* capture timestamp, so the routes
+of one capture (bare, `im_`, ...) collapse into one, and distinct captures never
+overwrite each other.
 
-Wayback's own error page (the 2026 page titled "Wayback Machine", served when a
-URL is not archived) is never stored as content. The snapshot is left as-is
-instead, so a later run can retry it.
+Wayback's own error page (the 2026 page titled "Wayback Machine") is never stored.
+The snapshot is left as is for a later retry.
 
-Binary media are the one exception that never hit the network: Wayback only
-rewrites HTML/CSS/JavaScript bodies, so an `im_` (image), `oe_` (embedded
-object — `.dcr`, `.exe`, `.wav`, plugin data), or `id_` capture already in the
-input WACZ is byte-for-byte the identity, and the restorer reuses it locally
-rather than re-fetching it. Only pages (`cs_`/`js_`/bare) need a fresh `id_`
-request. A reused record whose own content type turns out to be text (an HTML
-error page served for a missing image, say) is re-fetched instead, since that
-body *was* rewritten. A snapshot with no local body at all is re-fetched too,
-rather than skipped.
+Binary media never hit the network. Wayback only rewrites HTML, CSS, and
+JavaScript bodies, so an `im_` (image), `oe_` (embedded object: `.dcr`, `.exe`,
+`.wav`, plugin data), or `id_` capture already in the input WACZ is byte for byte
+the identity. The restorer reuses it locally. Only pages (`cs_`, `js_`, bare) need
+a fresh `id_` request. If a reused record's own content type turns out to be text
+(an HTML error page served for a missing image, say), it is re-fetched, because
+that body was rewritten. A snapshot with no local body is re-fetched too, not
+skipped.
 
-A resource that cannot be re-fetched is skipped: a network error writes nothing,
-and a rate limit (429) is moved onto a separate slow queue and retried at
-`--rate-limit-delay` with backoff before also being skipped. The **download is
-incremental**: if `--output-file` already exists, URLs it already holds are
-skipped, so re-running resumes where a previous run left off. Fetches use a
-normal browser `User-Agent` (the same Edge 150 string as the downloader) so
-Wayback does not serve a bot response. If `--output-file` is omitted, output
-defaults to `<archive>-restored.wacz` next to the input.
+A resource that cannot be re-fetched is skipped. A network error writes nothing,
+and a rate limit (429) moves to a slow queue and is retried at
+`--rate-limit-delay` with backoff before it is skipped as well.
 
-By default a snapshot that could not be restored is left as-is in the output,
-so a later run can retry it. Pass `--drop-unrestored` to omit those Wayback
-replay records instead: the result then contains only historical records, plus
-non-replay content (screenshots, archive.org pages) carried unchanged. The
-input WACZ remains the lossless source either way.
+The download is **incremental**: an existing `--output-file` keeps the URLs it
+already holds, so a re-run resumes where the last one stopped. A normal browser
+`User-Agent` (the same Edge 150 string) keeps Wayback from serving a bot
+response. Without `--output-file`, output defaults to `<archive>-restored.wacz`
+next to the input.
+
+By default a snapshot that could not be restored stays in the output for a later
+retry. `--drop-unrestored` drops those replay records instead, so the result holds
+only historical records plus non-replay content (screenshots, archive.org pages)
+carried unchanged. The input WACZ remains the lossless source either way.
 
 ## Export to standalone HTML
 
@@ -145,21 +128,21 @@ npx tsx src/cli/export-to-html.ts <archive.wacz> [--out <dir>] [--with=thumbnail
 ```
 
 Extracts every archived resource into a flat folder. Files are named
-`<prefix>~<n><ext>` where `<prefix>` is the first five characters of the
+`<prefix>~<n><ext>`, where `<prefix>` is the first five characters of the
 original file name and `<n>` disambiguates files that share a prefix
-(`about~1.html`, `infor~2.asp`, `cdx~1`). Two metadata files are written to the
-output root:
+(`about~1.html`, `infor~2.asp`, `cdx~1`). Two metadata files go in the output
+root:
 
-- `urls.csv` — `File Name,Timestamp,Original URLs` mapping, timestamps in
+- `urls.csv`: `File Name,Timestamp,Original URLs`, with timestamps in
   WACZ-compatible RFC3339 form.
-- `wayback-index.html` — a pre-generated index page.
+- `wayback-index.html`: a pre-generated index page.
 
-The per-page screenshots (`urn:thumbnail:` and `urn:view:` records) are large
-and are only used for the index-page preview, so they are **not exported by
-default**. Pass `--with=thumbnail` and/or `--with=view` to include them
-(`--with=thumbnail` also restores the preview column on `wayback-index.html`).
+Per-page screenshots (`urn:thumbnail:` and `urn:view:` records) are large and only
+feed the index-page preview, so they are **not exported by default**. Pass
+`--with=thumbnail` and/or `--with=view` to include them. `--with=thumbnail` also
+restores the preview column on `wayback-index.html`.
 
-If `--out` is omitted, output defaults to `<archive>-html/` next to the archive.
+Without `--out`, output defaults to `<archive>-html/` next to the archive.
 
 ## Serve for replay
 
@@ -168,23 +151,22 @@ npx tsx src/cli/server.ts <archive.wacz> [--port 8080] [--expose]
 ```
 
 Serves the archive at `http://localhost:8080/`. The index page is generated on
-demand from the archive's index, and archived content is served through
-`/web/<timestamp>/<url>` routes with links rewritten to stay local. Pass
-`--expose` to bind `0.0.0.0` and allow LAN access.
+demand from the archive's index. Archived content is served through
+`/web/<timestamp>/<url>` routes, with links rewritten to stay local. `--expose`
+binds `0.0.0.0` to allow LAN access.
 
 A replay URL with no record returns the same plain "URL not saved" page the flat
 export writes (`unarchived-message.html`), with the missing address shown. It has
-no CSS or styling.
+no CSS.
 
-A page whose archived `Content-Type` declares no charset (the normal case for
-1990s servers) is served with the archive's `WARC-Identified-Payload-Type` when
-present, then a `<meta>` charset, then the bytes: valid UTF-8 stays UTF-8, and
-legacy single-byte text is declared `windows-1252`. The stored bytes are never
-transcoded.
+A page whose archived `Content-Type` declares no charset (normal for 1990s
+servers) is served with the archive's `WARC-Identified-Payload-Type` when present,
+then a `<meta>` charset, then the bytes. Valid UTF-8 stays UTF-8, and legacy
+single-byte text is declared `windows-1252`. Stored bytes are never transcoded.
 
-Replay routes accept the Wayback `id_` modifier: `/web/<timestamp>id_/<url>`
-serves the capture's *identity* — the original bytes exactly as archived, with
-no link rewriting and no url-fixer shim injected.
+Replay routes accept the Wayback `id_` modifier.
+`/web/<timestamp>id_/<url>` serves the capture's *identity*: the original bytes as
+archived, with no link rewriting and no url-fixer shim injected.
 
 ## Verify archive integrity
 
@@ -192,27 +174,26 @@ no link rewriting and no url-fixer shim injected.
 npx tsx src/cli/verify.ts <archive.wacz>
 ```
 
-Confirms, byte for byte, that nothing in the archive has changed since it was
-written. The downloader records every digest an integrity check needs — each
-resource's `sha256` hash in `datapackage.json`, the `datapackage-digest.json`
-that hashes `datapackage.json` itself, and each WARC record's
-`WARC-Payload-Digest` / `WARC-Block-Digest` — and this command reads them back,
-layer by layer:
+Confirms, byte for byte, that the archive has not changed since it was written.
+The downloader records every digest a check needs: each resource's `sha256` hash
+in `datapackage.json`, the `datapackage-digest.json` that hashes
+`datapackage.json` itself, and each WARC record's `WARC-Payload-Digest` and
+`WARC-Block-Digest`. This command reads them back, layer by layer:
 
-- `datapackage-digest.json` → `sha256(datapackage.json)`;
-- each resource's `hash` + `bytes` → its stored bytes (covering the whole
-  `data.warc.gz`, including the un-indexed `request` and `metadata` records);
-- each indexed response record's `WARC-Block-Digest` and `WARC-Payload-Digest`
-  → re-derived over the exact byte spans they cover. A `revisit` record has no
-  payload of its own: its digest is checked against the record named by
-  `WARC-Refers-To`, and reported as unverifiable (not failed) when that record
-  is not in the archive. A non-HTTP record (`resource`, `metadata`) is checked
-  over its whole block, which is its payload.
+- `datapackage-digest.json` is checked against `sha256(datapackage.json)`;
+- each resource's `hash` and `bytes` are checked against its stored bytes, which
+  covers the whole `data.warc.gz`, including the un-indexed `request` and
+  `metadata` records;
+- each indexed response record's `WARC-Block-Digest` and `WARC-Payload-Digest` are
+  re-derived over the exact byte spans they cover. A `revisit` record has no
+  payload of its own, so its digest is checked against the record named by
+  `WARC-Refers-To`, and reported as unverifiable (not failed) when that record is
+  not in the archive. A non-HTTP record (`resource`, `metadata`) is checked over
+  its whole block, which is its payload.
 
-Exit code is 0 only when every layer passes. This is an **offline audit**, run
-deliberately (after copying an archive to new media, or on a schedule to catch
-bit-rot) — the replay server still reads by trusting the index, and never pays
-the hashing cost on its hot path.
+The exit code is 0 only when every layer passes. This is an **offline audit**, run
+on purpose: after copying an archive to new media, or on a schedule to catch bit
+rot.
 
 ## License
 
