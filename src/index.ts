@@ -14,6 +14,7 @@ export * from "./archive/warc-writer.js";
 export * from "./archive/zip.js";
 export * from "./archive/zip-writer.js";
 
+export * from "./lib/digest.js";
 export * from "./lib/time.js";
 export * from "./lib/url.js";
 

@@ -32,6 +32,8 @@ import { detectContentKind } from "../replay/rewrite.js";
 import { URL_FIXER_SCRIPT_ROUTE } from "../replay/url-fixer.js";
 import { URL_FIXER_SHIM } from "../replay/url-fixer-shim.js";
 import { renderNotFoundPage } from "../replay/not-found.js";
+import { handleCdxQuery } from "../replay/cdx-api.js";
+import { sha1Base32, waybackDigestOf } from "../lib/digest.js";
 import { LruCache } from "../lib/lru.js";
 
 /** Decode the inner URL of a `/web/<ts>[mod_]/<url>` path for the "not saved"
@@ -469,6 +471,12 @@ function main(): void {
   const wacz = new Wacz(args.wacz);
   const pipeline = createDefaultPipeline();
 
+  // The CDX route filters this list on every request. `wacz.entries` copies the
+  // array, and a copy of a few hundred thousand entries per query is pure
+  // garbage, so take it once: the archive is immutable for the life of the
+  // server, and the entries never change under it.
+  const archiveEntries: CdxjEntry[] = wacz.entries;
+
   const host = args.expose ? "0.0.0.0" : "127.0.0.1";
 
   // The index page lists the archive's *pages* (from pages.jsonl), not every
@@ -519,6 +527,35 @@ function main(): void {
     maxEntryBytes: 8 * 1024 * 1024,
     sizeOf: (r) => r.body.length,
   });
+
+  /**
+   * The SHA-1 digest the CDX API prints.
+   *
+   * An index that already stores the SHA-1 digest costs one string parse and
+   * no reads. Otherwise the record is read once and its payload hashed; the
+   * result is kept so a repeated query (or a page of rows that share a record)
+   * does not decompress it again. A record that cannot be read yields null,
+   * which the API prints as an empty digest rather than as a SHA-256 value in a
+   * SHA-1 column.
+   */
+  const cdxSha1Cache = new Map<string, string | null>();
+  const resolveEntrySha1 = async (entry: CdxjEntry): Promise<string | null> => {
+    const direct = waybackDigestOf(entry.digest);
+    if (direct) return direct;
+
+    const cacheKey = `${entry.filename}@${entry.offset}`;
+    if (cdxSha1Cache.has(cacheKey)) return cdxSha1Cache.get(cacheKey) ?? null;
+
+    let digest: string | null = null;
+    try {
+      const record = await wacz.recordForEntryAsync(entry);
+      digest = sha1Base32(record.body);
+    } catch {
+      digest = null;
+    }
+    cdxSha1Cache.set(cacheKey, digest);
+    return digest;
+  };
 
   /** Compute the response for a `/web/<ts>/<url>` request, or null for a 404.
    * Moved out of the request handler so it can be cached whole. */
@@ -684,6 +721,32 @@ function main(): void {
     if (reqUrl === "/" || reqUrl === "/index.html") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(buildIndexPage());
+      return;
+    }
+
+    // CDX query API, in the Wayback shape: /cdx/search/cdx, and /cdx as an
+    // alias. Answers from the WACZ's own CDXJ index; the `digest` column is a
+    // bare Base32 SHA-1, recomputed from the record when the index only holds
+    // SHA-256.
+    if (
+      reqUrl === "/cdx" ||
+      reqUrl.startsWith("/cdx?") ||
+      reqUrl === "/cdx/search/cdx" ||
+      reqUrl.startsWith("/cdx/search/cdx?")
+    ) {
+      const parsedQuery = new URL(reqUrl, "http://localhost");
+      const result = await handleCdxQuery(
+        archiveEntries,
+        parsedQuery.searchParams,
+        {
+          resolveSha1: resolveEntrySha1,
+        },
+      );
+      res.writeHead(result.status, {
+        "Content-Type": result.contentType,
+        "Cache-Control": "no-store",
+      });
+      res.end(result.body);
       return;
     }
 

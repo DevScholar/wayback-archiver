@@ -416,6 +416,33 @@ export class Wacz {
     return { entry, matchedUrl, record };
   }
 
+  /**
+   * Read the record an index entry points at, following `revisit` references.
+   *
+   * Callers that already hold an entry (the CDX endpoint, for instance) need
+   * the payload bytes rather than the empty body of a deduplicated record.
+   * Unlike `resolveRecordAsync` this does not look the URL up again, so the
+   * entry that answers is exactly the one asked for -- two captures of the same
+   * URL at the same timestamp must not borrow each other's bytes.
+   */
+  async recordForEntryAsync(entry: CdxjEntry): Promise<WarcRecord> {
+    let record = await this.readRecordAsync(entry);
+    for (let i = 0; i < 8; i++) {
+      const refersTo = record.headers.get("warc-refers-to-target-uri");
+      if (
+        refersTo &&
+        (record.warcType === "revisit" || record.body.length === 0)
+      ) {
+        const original = this.resolveAt(refersTo, entry.timestamp);
+        if (!original) break;
+        record = await this.readRecordAsync(original);
+      } else {
+        break;
+      }
+    }
+    return record;
+  }
+
   /** Decompress and parse a single index entry's WARC record. */
   private readRecord(entry: CdxjEntry): WarcRecord {
     const zipName = this._warcEntries.get(entry.filename) || entry.filename;

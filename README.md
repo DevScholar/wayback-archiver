@@ -189,6 +189,33 @@ Replay routes accept the Wayback `id_` modifier.
 archived, with no link rewriting and no url-fixer shim injected. Headers follow the
 same rule as a normal replay, so the archived ones stay under `X-Archive-Orig-*`.
 
+## Query the CDX index
+
+The replay server also answers CDX queries at `/cdx/search/cdx`, and at `/cdx`
+as an alias, in the shape the Wayback Machine uses:
+
+```
+curl 'http://localhost:8080/cdx/search/cdx?url=example.com&matchType=domain&output=json'
+```
+
+Seven fields print in Wayback's order:
+`urlkey timestamp original mimetype statuscode digest length`. One capture per
+line, space-separated, unless `output=json` asks for an array of arrays whose
+first row names the fields.
+
+Parameters: `url`, `matchType` (`exact`, `prefix`, `host`, `domain`), `from`,
+`to`, `fl` (which columns, in which order), `filter` (`[!]field:value`, with an
+optional `=` for exact or `~` for a regular expression), `collapse` (`urlkey`,
+`digest`), `sort=reverse`, `limit`, and `output` (`text`, `cdx`, `cdxj`,
+`json`). A trailing `*` on `url` means a prefix match.
+
+The `digest` column is a bare 32-character Base32 SHA-1, the value Wayback
+prints there. An index that already carries a SHA-1 digest answers with no
+record reads. Any other archive has the SHA-1 recomputed from the record's
+payload once and cached, which costs about 0.2 ms per row the first time. A
+record that cannot be read prints an empty digest rather than a SHA-256 value
+in a SHA-1 column.
+
 ## Verify archive integrity
 
 ```
