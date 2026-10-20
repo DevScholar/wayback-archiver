@@ -34,6 +34,7 @@ import * as zlib from "zlib";
 import { ZipReader } from "../archive/zip.js";
 import { parseCdxj } from "../archive/cdxj.js";
 import { findHeaderEnd } from "../archive/warc.js";
+import { base32Encode, parseDigest, type ParsedDigest } from "../lib/digest.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -49,6 +50,43 @@ function hexOf(value: string | undefined | null): string | null {
   if (value == null) return null;
   const m = /(?:sha256:|sha-256:)?\s*([0-9a-fA-F]{64})/.exec(value.trim());
   return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Compare a freshly computed digest against the one a record carries.
+ *
+ * The algorithm comes from the digest's own length rather than its label:
+ * 20 bytes is SHA-1, 32 is SHA-256. That way a WARC written by the Wayback
+ * Machine (`sha1:BASE32`) and one written by a Webrecorder tool
+ * (`sha256:hex`) are both checked the same way, instead of one of them being
+ * reported as having no digest at all.
+ */
+function digestMatches(bytes: Buffer, stored: ParsedDigest): boolean {
+  if (!stored.bytes) return false;
+  const algorithm = stored.bytes.length === 20 ? "sha1" : "sha256";
+  const computed = crypto.createHash(algorithm).update(bytes).digest();
+  return computed.equals(stored.bytes);
+}
+
+/** Recompute `bytes` in the algorithm and spelling `stored` uses, for a
+ * mismatch message. */
+function computedDigestText(bytes: Buffer, stored: ParsedDigest): string {
+  const algorithm = stored.bytes?.length === 20 ? "sha1" : "sha256";
+  const raw = crypto.createHash(algorithm).update(bytes).digest();
+  const value =
+    stored.source === "base32" ? base32Encode(raw) : raw.toString("hex");
+  return `${algorithm}:${value}`;
+}
+
+function digestText(stored: ParsedDigest | null): string {
+  if (!stored) return "(absent)";
+  const value = stored.source === "base32" ? stored.base32 : stored.hex;
+  return `${stored.algorithm}:${value ?? ""}`;
+}
+
+/** Two digests name the same bytes, whether or not they share a spelling. */
+function sameDigest(a: ParsedDigest | null, b: ParsedDigest | null): boolean {
+  return !!a?.bytes && !!b?.bytes && a.bytes.equals(b.bytes);
 }
 
 interface Stats {
@@ -215,8 +253,8 @@ function main(): void {
       warc: Map<string, string>;
       block: Buffer;
       payload: Buffer;
-      blockDigest: string | null;
-      payloadDigest: string | null;
+      blockDigest: ParsedDigest | null;
+      payloadDigest: ParsedDigest | null;
       targetUri: string;
       date: string;
       warcType: string;
@@ -238,8 +276,8 @@ function main(): void {
       }
 
       const warc = warcHeaders(raw);
-      const blockDigest = hexOf(warc.get("warc-block-digest"));
-      const payloadDigest = hexOf(warc.get("warc-payload-digest"));
+      const blockDigest = parseDigest(warc.get("warc-block-digest"));
+      const payloadDigest = parseDigest(warc.get("warc-payload-digest"));
       const contentLen = Number(warc.get("content-length"));
 
       // The WARC `Content-Length` is the exact record-block length. For a
@@ -281,13 +319,12 @@ function main(): void {
       loaded.push(record);
 
       if (blockDigest) {
-        const computed = sha256(block);
-        if (computed === blockDigest) {
+        if (digestMatches(block, blockDigest)) {
           recStats.ok++;
         } else {
           recStats.failed++;
           fail(
-            `${e.url}: WARC-Block-Digest mismatch (stored ${blockDigest}, computed ${computed})`,
+            `${e.url}: WARC-Block-Digest mismatch (stored ${digestText(blockDigest)}, computed ${computedDigestText(block, blockDigest)})`,
           );
         }
       } else {
@@ -298,13 +335,12 @@ function main(): void {
         if (record.warcType === "revisit") {
           revisitChecks.push(record);
         } else {
-          const computed = sha256(payload);
-          if (computed === payloadDigest) {
+          if (digestMatches(payload, payloadDigest)) {
             recStats.ok++;
           } else {
             recStats.failed++;
             fail(
-              `${e.url}: WARC-Payload-Digest mismatch (stored ${payloadDigest}, computed ${computed})`,
+              `${e.url}: WARC-Payload-Digest mismatch (stored ${digestText(payloadDigest)}, computed ${computedDigestText(payload, payloadDigest)})`,
             );
           }
         }
@@ -354,11 +390,11 @@ function main(): void {
       for (const candidate of candidates) {
         if (candidate === revisit) continue;
         if (candidate.warcType === "revisit") {
-          if (candidate.payloadDigest === expected) {
+          if (sameDigest(candidate.payloadDigest, expected)) {
             matched = true;
             break;
           }
-        } else if (sha256(candidate.payload) === expected) {
+        } else if (digestMatches(candidate.payload, expected)) {
           matched = true;
           break;
         }
@@ -370,7 +406,7 @@ function main(): void {
       } else if (exact) {
         recStats.failed++;
         fail(
-          `${revisit.entry.url}: WARC-Payload-Digest does not match the referenced record (stored ${expected})`,
+          `${revisit.entry.url}: WARC-Payload-Digest does not match the referenced record (stored ${digestText(expected)})`,
         );
       } else {
         unverifiableRevisits++;
