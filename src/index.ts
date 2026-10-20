@@ -9,6 +9,7 @@
 
 export * from "./archive/cdxj.js";
 export * from "./archive/wacz.js";
+export * from "./archive/wacz-bundle.js";
 export * from "./archive/warc.js";
 export * from "./archive/warc-writer.js";
 export * from "./archive/zip.js";

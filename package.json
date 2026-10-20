@@ -1,7 +1,7 @@
 {
   "name": "@devscholar/wayback-archiver",
   "version": "1.0.0",
-  "description": "Read WACZ web archives: capture, restore, export to standalone HTML, and serve for replay",
+  "description": "Read WACZ web archives: capture, restore, merge, de-duplicate, export to standalone HTML, and serve for replay",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -23,7 +23,9 @@
     "wayback-export": "./dist/cli/export-to-html.js",
     "wayback-server": "./dist/cli/server.js",
     "wayback-restore": "./dist/cli/wayback-machine-restorer.js",
-    "wayback-verify": "./dist/cli/verify.js"
+    "wayback-verify": "./dist/cli/verify.js",
+    "wayback-merge": "./dist/cli/merge.js",
+    "wayback-dedupe": "./dist/cli/dedupe.js"
   },
   "engines": {
     "node": ">=20"
@@ -35,6 +37,8 @@
     "server": "tsx src/cli/server.ts",
     "restore": "tsx src/cli/wayback-machine-restorer.ts",
     "verify": "tsx src/cli/verify.ts",
+    "merge": "tsx src/cli/merge.ts",
+    "dedupe": "tsx src/cli/dedupe.ts",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

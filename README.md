@@ -1,7 +1,8 @@
 # Wayback Archiver
 
 Read [WACZ](https://webrecorder.net/wacz) web archives: capture URLs into a new
-WACZ, export them to a flat HTML folder, or serve them for replay in a browser.
+WACZ, merge archives, drop duplicate captures, export them to a flat HTML
+folder, or serve them for replay in a browser.
 
 ## Requirements
 
@@ -120,6 +121,66 @@ By default a snapshot that could not be restored stays in the output for a later
 retry. `--drop-unrestored` drops those replay records instead, so the result holds
 only historical records plus non-replay content (screenshots, archive.org pages)
 carried unchanged. The input WACZ remains the lossless source either way.
+
+## Merge WACZ files
+
+```
+npx tsx src/cli/merge.ts --input-files=one.wacz,two.wacz --output-file=merged.wacz [--title="Merged"]
+```
+
+`--input-files` takes one or more paths, comma-separated; repeat the flag to add
+more. `--output-file` is required and can never be one of the inputs, so a
+command cannot overwrite the only copy of an archive. `--title` defaults to the
+output file's basename.
+
+Records are copied byte for byte. Only their byte offsets and the WARC file name
+change: the result holds one `archive/data.warc.gz` and one `indexes/index.cdx`,
+no matter how many WARC files each input had. Every digest a record carries
+therefore stays valid, and `verify` still passes. The bytes between indexed
+records, the `warcinfo` block and the `request` records, are copied too, so a
+merge loses nothing.
+
+The one thing a merge drops is a capture the output already holds: two records
+with the same URL, timestamp and payload digest are the same capture. Merging an
+archive another input already covers therefore stores nothing twice, and merging
+a file with itself changes nothing. One URL captured at several times keeps every
+capture, exactly as each input has them. `dedupe` collapses those.
+
+The output is a WACZ of the shape this project writes: its WARC streams, its
+index and `pages.jsonl`. Any other file an input carries is not copied over.
+
+## Remove duplicate captures
+
+```
+npx tsx src/cli/dedupe.ts --input-files=in.wacz [--output-file=out.wacz] [--exemption-minutes=60] [--dry-run]
+```
+
+A duplicate is a second record for the **same exact URL**. URLs that differ in a
+query parameter, a trailing slash or letter case are different captures and are
+never compared. Payload bytes are not compared either: the URL and the capture
+time decide.
+
+Records of one URL are grouped by capture time. `--exemption-minutes=60` says
+that captures more than an hour apart are not duplicates, so a page captured in
+1998 and again in 1999 keeps both. Without the flag there is no exemption: every
+record of one exact URL collapses to one, and the survivor is the earliest record
+that carries a payload. Pass the flag on an archive restored from the Wayback
+Machine, where one page is often several historical snapshots.
+
+`--dry-run` prints what would be removed and writes nothing. Without
+`--output-file` the result goes to `<archive>-deduped.wacz` next to the input.
+
+A `revisit` record carries no body of its own. It points at an earlier record
+through `WARC-Refers-To-Target-URI` and `WARC-Refers-To-Date`, and replay serves
+that record's bytes. Such a record is never chosen over the response it names, so
+a page keeps its content. A revisit that survives keeps the record it points at,
+so no surviving revisit is left pointing at nothing. Dropping a revisit loses
+only the note that the same URL answered the same bytes at that moment, not the
+bytes themselves.
+
+Every kept record is copied byte for byte and re-indexed at its new offset, so
+the digests a record carries stay valid. The un-indexed `warcinfo` and `request`
+members are carried over in place.
 
 ## Export to standalone HTML
 
