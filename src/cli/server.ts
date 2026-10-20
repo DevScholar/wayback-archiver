@@ -24,8 +24,9 @@ import * as os from "os";
 import cluster from "cluster";
 import { Wacz } from "../archive/wacz.js";
 import { WarcRecord } from "../archive/warc.js";
+import type { CdxjEntry } from "../archive/cdxj.js";
 import { renderIndexPage, buildPageRows } from "../replay/index-page.js";
-import { rfc3339ToTs14 } from "../lib/time.js";
+import { rfc3339ToTs14, cdxjTsToRfc1123 } from "../lib/time.js";
 import { createDefaultPipeline, ReplayContext } from "../replay/plugins.js";
 import { detectContentKind } from "../replay/rewrite.js";
 import { URL_FIXER_SCRIPT_ROUTE } from "../replay/url-fixer.js";
@@ -162,46 +163,61 @@ function identifiedCharset(record: WarcRecord): string | undefined {
 }
 
 /**
- * Framing + hop-by-hop headers (RFC 7230 section 6.1) that Node's HTTP layer owns and
- * that can't be replayed verbatim -- the body has been decompressed and
- * rewritten, so the original `content-length`/`content-encoding` no longer
- * match. Keyed lowercase -> canonical name. When we strip one we emit its
- * original value under `X-Archive-Orig-<Name>` (below), so the archived value
- * stays inspectable.
+ * Archived headers replayed as they stand.
+ *
+ * Only the headers that describe the payload itself pass through, because the
+ * browser needs them to render the bytes. Every other archived header describes
+ * an origin that is no longer being contacted, so replaying it would either
+ * mislead the visitor's browser or steer it according to rules that belong to a
+ * server on another machine: `cache-control`/`expires`/`etag` would cache a
+ * replay the way that server wanted, `strict-transport-security` and
+ * `permissions-policy` would impose its security policy here, `set-cookie`
+ * would write its session cookie into the visitor's browser, `server` would
+ * claim the wrong machine, and a `content-security-policy` would block every
+ * local asset, including the injected url-fixer shim.
+ *
+ * The Wayback Machine draws the same line: a replay of a 1996 page answers with
+ * its own `server`, `date` and `memento-datetime`, sends `content-type` from the
+ * capture, and reports every original header as `x-archive-orig-<name>`. We
+ * follow that rule, with `X-Archive-Orig-<Name>` kept for the whole set (pywb,
+ * the engine behind archiveweb.page, uses this spelling).
  */
-const STRIP_HEADERS: Record<string, string> = {
-  connection: "Connection",
-  "keep-alive": "Keep-Alive",
-  "proxy-authenticate": "Proxy-Authenticate",
-  "proxy-authorization": "Proxy-Authorization",
+const PASSTHROUGH_HEADERS = new Set(["content-type"]);
+
+/** Header names whose canonical spelling is not "capitalize every word". */
+const HEADER_ACRONYMS: Record<string, string> = {
+  "content-md5": "Content-MD5",
+  etag: "ETag",
+  p3p: "P3P",
   te: "TE",
-  trailer: "Trailer",
-  "transfer-encoding": "Transfer-Encoding",
-  upgrade: "Upgrade",
-  "content-length": "Content-Length",
-  "content-encoding": "Content-Encoding",
+  "www-authenticate": "WWW-Authenticate",
+  "x-ua-compatible": "X-UA-Compatible",
+  "x-xss-protection": "X-XSS-Protection",
 };
 
-/**
- * Archived headers that forbid replay, because their value names the *original*
- * origin as the only allowed source. A Content-Security-Policy lists the hosts a
- * page may load scripts, styles, frames and fonts from; a replayed page is
- * served by the local replay server instead, so every local asset -- and the
- * injected url-fixer shim -- matches none of those hosts and the browser blocks
- * it. The browser reports the block, so a strict CSP turns a replayed JavaScript
- * app into an empty page. The archived value is preserved under
- * `X-Archive-Orig-<Name>` (below) so it stays inspectable.
- */
-const DROP_HEADERS: Record<string, string> = {
-  "content-security-policy": "Content-Security-Policy",
-  "content-security-policy-report-only": "Content-Security-Policy-Report-Only",
-  "x-content-security-policy": "X-Content-Security-Policy",
-  "x-webkit-csp": "X-WebKit-CSP",
-};
+/** Canonical spelling of an archived header name. The WARC parser stores header
+ * names lowercased, and `Content-Security-Policy` reads better than
+ * `content-security-policy` in a header the user inspects. */
+export function canonicalHeaderName(lower: string): string {
+  const acronym = HEADER_ACRONYMS[lower];
+  if (acronym) return acronym;
+  return lower
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join("-");
+}
 
-/** Prefix for the original value of any header we had to change during replay.
- * This is the shared pywb / archiveweb.page convention (`X-Archive-Orig-*`). */
+/** Prefix for the original value of a header that is not replayed as it stands.
+ * This is the pywb / archiveweb.page convention. */
 const ARCHIVE_PREFIX = "X-Archive-Orig-";
+
+/** A control character in a header value makes Node's HTTP layer throw, and a
+ * crawl can store whatever the origin sent, so normalize what we copy across.
+ * Tab is the one control character a header value may keep (RFC 9110 section
+ * 5.5). */
+function safeHeaderValue(value: string): string {
+  return value.replace(/[\u0000-\u0008\u000a-\u001f\u007f]/g, " ");
+}
 
 /**
  * Whether a replay body needs the plugin pipeline run over it. Text content
@@ -303,26 +319,27 @@ function parseByteRange(
 }
 
 /**
- * Rebuild a replay's response headers, keeping every archived HTTP header
- * except the ones that *must* change:
+ * Rebuild a replay's response headers.
  *
- *   - framing/hop-by-hop headers (above) are dropped -- the body has been
- *     decompressed and rewritten, so the originals would be wrong. Their
- *     original values are preserved under `X-Archive-Orig-<Name>`.
- *   - Content-Security-Policy headers (above) are dropped -- they name the
- *     original origin as the only source of scripts and styles, which blocks
- *     every replay asset. Their original values are preserved the same way.
- *   - `location` is rewritten to a captive `/web/<ts>/<url>` route so a
- *     redirect resolves locally instead of leaking to the live web;
- *   - `set-cookie` is dropped so historical cookies are never injected into
- *     the visitor's browser.
+ * Every archived header is reported under `X-Archive-Orig-<Name>`, except
+ * `content-type`, which describes the payload and is replayed (see
+ * `PASSTHROUGH_HEADERS`). The live response carries only what this server can
+ * honestly say:
  *
- * `content-type` keeps its archived value (falling back to the CDXJ mime); a
- * charset is appended only when the type is HTML and the archived header lacks
- * one. `content-length` is always recomputed from the rewritten body.
+ *   - `content-type` from the capture, with a charset declared when the capture
+ *     never declared one;
+ *   - `content-length` and `accept-ranges` for the body we actually send;
+ *   - `location`, rewritten to a captive `/web/<ts>/<url>` route so a redirect
+ *     resolves locally instead of leaking to the live web;
+ *   - `memento-datetime`, `link` and `x-archive-src`, the metadata the Wayback
+ *     Machine reports about the capture being served.
+ *
+ * Bodyless responses (204/304/1xx) carry no `content-length` (RFC 7230 section
+ * 3.3.2), matching how the caller ends them.
  */
 export function buildReplayHeaders(
   record: WarcRecord,
+  entry: CdxjEntry,
   url: string,
   ts: string,
   mime: string,
@@ -332,15 +349,16 @@ export function buildReplayHeaders(
   const headers: Record<string, string> = {};
   for (const [name, value] of record.httpHeaders) {
     const lower = name.toLowerCase();
-    const canonical = STRIP_HEADERS[lower] ?? DROP_HEADERS[lower];
-    if (canonical) {
-      headers[ARCHIVE_PREFIX + canonical] = value;
+    const safeValue = safeHeaderValue(value);
+    if (PASSTHROUGH_HEADERS.has(lower)) {
+      headers[lower] = safeValue;
       continue;
     }
-    if (lower === "set-cookie" || lower === "location") continue;
-    headers[name] = value;
+    headers[ARCHIVE_PREFIX + canonicalHeaderName(lower)] = safeValue;
   }
 
+  // The archived `location` is reported like any other original header; the live
+  // one points at the replay route so the redirect stays local.
   const loc = record.httpHeaders.get("location");
   if (loc) {
     let target = loc;
@@ -380,6 +398,12 @@ export function buildReplayHeaders(
     // (most usefully an archived video) with byte-range requests.
     headers["accept-ranges"] = "bytes";
   }
+
+  // What the Wayback Machine tells a client about the capture it is serving:
+  // when it was taken, which capture it is, and where the bytes came from.
+  headers["memento-datetime"] = cdxjTsToRfc1123(entry.timestamp);
+  headers["link"] = `<${url}>; rel="original"`;
+  if (entry.filename) headers["x-archive-src"] = entry.filename;
   return headers;
 }
 
@@ -575,6 +599,7 @@ function main(): void {
 
     const headers = buildReplayHeaders(
       record,
+      rec.entry,
       rec.matchedUrl,
       ctx.ts,
       mime,

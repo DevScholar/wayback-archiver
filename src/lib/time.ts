@@ -22,6 +22,25 @@ export function rfc3339ToTs14(ts: string): string {
   return digits.slice(0, 14);
 }
 
+/** Convert a 17-digit CDXJ timestamp to an RFC 1123 HTTP date
+ * (`Tue, 22 Oct 1996 17:53:31 GMT`), the spelling `Memento-Datetime` and the
+ * Wayback Machine use for a capture time. */
+export function cdxjTsToRfc1123(ts: string): string {
+  const m = ts.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+  if (!m) return ts;
+  const date = new Date(
+    Date.UTC(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      Number(m[4]),
+      Number(m[5]),
+      Number(m[6]),
+    ),
+  );
+  return date.toUTCString();
+}
+
 /** Current UTC time as a 17-digit CDXJ timestamp (`YYYYMMDDHHMMSSmmm`). */
 export function nowTs17(): string {
   const d = new Date();

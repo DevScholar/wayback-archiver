@@ -164,11 +164,16 @@ servers) is served with the archive's `WARC-Identified-Payload-Type` when presen
 then a `<meta>` charset, then the bytes. Valid UTF-8 stays UTF-8, and legacy
 single-byte text is declared `windows-1252`. Stored bytes are never transcoded.
 
-An archived `Content-Security-Policy` header is not replayed. Its value names the
-original origin as the only allowed source for scripts and styles, and a replayed
-page is served by this server, so the browser would block every local file and the
-page would stay blank. The archived value stays visible as
-`X-Archive-Orig-Content-Security-Policy`.
+A replay answers with this server's headers, the same way the Wayback Machine
+does. `Content-Type` comes from the capture (with a charset added when the capture
+declared none). Every other archived header is reported as `X-Archive-Orig-<Name>`
+rather than replayed, so the origin's `Server`, `Date`, `Cache-Control`,
+`Set-Cookie` and `Strict-Transport-Security` cannot steer the visitor's browser.
+An archived `Content-Security-Policy` is the extreme case: it names the original
+origin as the only allowed source for scripts and styles, so replaying it would
+block every local file and leave the page blank. Each response also reports
+`Memento-Datetime`, `Link: <original>; rel="original"` and `X-Archive-Src`, which
+describe the capture being served.
 
 A `/web/<ts>/<url>` request that resolves to a capture at another timestamp is
 redirected (302) only when it is a page navigation, so the address bar names the
@@ -178,7 +183,8 @@ twice.
 
 Replay routes accept the Wayback `id_` modifier.
 `/web/<timestamp>id_/<url>` serves the capture's _identity_: the original bytes as
-archived, with no link rewriting and no url-fixer shim injected.
+archived, with no link rewriting and no url-fixer shim injected. Headers follow the
+same rule as a normal replay, so the archived ones stay under `X-Archive-Orig-*`.
 
 ## Verify archive integrity
 
