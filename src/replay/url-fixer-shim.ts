@@ -227,5 +227,22 @@ export const URL_FIXER_SHIM = `(function () {
       return origInsertAdjacent.call(this, pos, rewriteHtmlString(html));
     };
   }
+
+  // ---- document.write / writeln -----------------------------------------
+  // Older pages build markup with document.write. The server leaves <script>
+  // bodies alone (rewriting attribute-looking text inside JavaScript corrupts
+  // it), so a document.write call is the one place where such markup reaches
+  // the parser unrewritten.
+  ['write', 'writeln'].forEach(function (name) {
+    var orig = document[name];
+    if (typeof orig !== 'function') return;
+    document[name] = function () {
+      var args = Array.prototype.slice.call(arguments);
+      for (var i = 0; i < args.length; i++) {
+        if (typeof args[i] === 'string') args[i] = rewriteHtmlString(args[i]);
+      }
+      return orig.apply(document, args);
+    };
+  });
 })();
 `;

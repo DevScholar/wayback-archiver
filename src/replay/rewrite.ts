@@ -91,7 +91,7 @@ function rewriteSrcset(
   return out.join(",");
 }
 
-function rewriteHtml(
+function rewriteHtmlText(
   content: string,
   baseUrl: string,
   rewrite: UrlRewriter,
@@ -178,6 +178,60 @@ function rewriteHtml(
   });
 
   return content;
+}
+
+/**
+ * Rewrite an HTML document, leaving the *body* of every `<script>` block alone.
+ *
+ * The passes in `rewriteHtmlText` are textual, so without this split they also
+ * match text that only looks like an attribute. A 2001 microsoft.com page shows
+ * the damage: its inline script contains
+ *
+ *   document.write('<a href="' + sItemURL + '" target=...>E-Mail This Page</a>')
+ *
+ * and treating the `href="' + sItemURL + '"` inside that string as an attribute
+ * resolves the fragment `' + sItemURL + ` as a URL, so its spaces become `%20`
+ * and the page is left with `...href="/web/2001/...'%20+%20...` -- a syntax
+ * error that stops the script dead.
+ *
+ * Leaving script bodies untouched is the safe side of the trade: a URL a script
+ * builds at runtime is the runtime shim's job (it patches the DOM APIs that
+ * consume that URL), while a corrupted script breaks the whole page. The
+ * opening tag is still rewritten, so `<script src="...">` keeps working, and
+ * `<style>` bodies still get CSS rewriting.
+ */
+function rewriteHtml(
+  content: string,
+  baseUrl: string,
+  rewrite: UrlRewriter,
+): string {
+  let out = "";
+  let lastIndex = 0;
+  const blockRe = /<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = blockRe.exec(content)) !== null) {
+    out += rewriteHtmlText(
+      content.slice(lastIndex, match.index),
+      baseUrl,
+      rewrite,
+    );
+
+    const block = match[0];
+    const element = match[1].toLowerCase();
+    const openEnd = block.indexOf(">") + 1;
+    const closeStart = block.toLowerCase().lastIndexOf("</" + element);
+    const openTag = block.slice(0, openEnd);
+    const body = block.slice(openEnd, closeStart);
+    const closeTag = block.slice(closeStart);
+
+    out += rewriteHtmlText(openTag, baseUrl, rewrite);
+    out += element === "style" ? rewriteCss(body, baseUrl, rewrite) : body;
+    out += closeTag;
+
+    lastIndex = match.index + block.length;
+  }
+  out += rewriteHtmlText(content.slice(lastIndex), baseUrl, rewrite);
+  return out;
 }
 
 // ---------------------------------------------------------------------------

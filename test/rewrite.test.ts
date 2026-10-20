@@ -62,3 +62,34 @@ test("detectContentKind classifies by mime not extension", () => {
   assert.equal(detectContentKind("image/png"), null);
   assert.equal(detectContentKind(""), null);
 });
+
+test("an attribute-looking string inside a <script> body is left alone", () => {
+  // The 2001 microsoft.com case: rewriting this string as if it were an
+  // attribute turns its spaces into %20 and breaks the script.
+  const html =
+    "<script>document.write('<a href=\"' + itemUrl + '\" target=_top>x</a>')</script>";
+  const out = rewriteContent(html, "http://example.com/", rewrite, "html");
+  assert.equal(out, html);
+});
+
+test("a <script src> attribute is still rewritten", () => {
+  const html = '<script src="/js/app.js"></script>';
+  const out = rewriteContent(html, "http://example.com/", rewrite, "html");
+  assert.equal(
+    out,
+    '<script src="/web/2026/http://example.com/js/app.js"></script>',
+  );
+});
+
+test("a <style> body still gets CSS rewriting", () => {
+  const html = "<style>body { background: url(/bg.png); }</style>";
+  const out = rewriteContent(html, "http://example.com/", rewrite, "html");
+  assert.ok(out.includes("url(/web/2026/http://example.com/bg.png)"));
+});
+
+test("markup after a <script> block is still rewritten", () => {
+  const html = '<script src="/a.js"></script><a href="/b.html">B</a>';
+  const out = rewriteContent(html, "http://example.com/", rewrite, "html");
+  assert.ok(out.includes('src="/web/2026/http://example.com/a.js"'));
+  assert.ok(out.includes('href="/web/2026/http://example.com/b.html"'));
+});
