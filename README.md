@@ -169,11 +169,14 @@ does. `Content-Type` comes from the capture (with a charset added when the captu
 declared none). Every other archived header is reported as `X-Archive-Orig-<Name>`
 rather than replayed, so the origin's `Server`, `Date`, `Cache-Control`,
 `Set-Cookie` and `Strict-Transport-Security` cannot steer the visitor's browser.
-An archived `Content-Security-Policy` is the extreme case: it names the original
-origin as the only allowed source for scripts and styles, so replaying it would
-block every local file and leave the page blank. Each response also reports
-`Memento-Datetime`, `Link: <original>; rel="original"` and `X-Archive-Src`, which
-describe the capture being served.
+The archived encoding is the one exception, reported as `X-Orig-Content-Encoding`,
+the spelling Wayback uses. An archived `Content-Security-Policy` is the extreme
+case: it names the original origin as the only allowed source for scripts and
+styles, so replaying it would block every local file and leave the page blank.
+Each response also reports `Memento-Datetime`, `Link: <original>; rel="original"`
+and `X-Archive-Src`, which describe the capture being served. An archive that was
+itself captured through a replay already carries some of these reported headers,
+and they keep their names instead of gaining a second prefix.
 
 A `/web/<ts>/<url>` request that resolves to a capture at another timestamp is
 redirected (302) only when it is a page navigation, so the address bar names the

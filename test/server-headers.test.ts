@@ -144,10 +144,26 @@ test("the origin's own headers are reported, not replayed", () => {
     headers["X-Archive-Orig-Set-Cookie"],
     "DENALISESSIONID=JQORAGFMMUWELGRI; path=/",
   );
-  assert.equal(headers["X-Archive-Orig-Content-Encoding"], "gzip");
+  // The encoding uses the short prefix, the spelling the Wayback Machine uses.
+  assert.equal(headers["X-Orig-Content-Encoding"], "gzip");
+  assert.equal(headers["X-Archive-Orig-Content-Encoding"], undefined);
   // Our own numbers, not the archived ones.
   assert.equal(headers["content-length"], String("<html></html>".length));
   assert.equal(headers["accept-ranges"], "bytes");
+});
+
+test("a header captured from an earlier replay keeps its own name", () => {
+  // An archive captured through a replay stores that replay's own reporting
+  // headers, so replaying it must not add a second prefix.
+  const headers = replayHeaders({
+    "Content-Type": "text/html",
+    "X-Archive-Orig-Server": "Microsoft-IIS/2.0",
+    "x-orig-content-encoding": "gzip",
+  });
+  assert.equal(headers["X-Archive-Orig-Server"], "Microsoft-IIS/2.0");
+  assert.equal(headers["X-Orig-Content-Encoding"], "gzip");
+  assert.equal(headers["X-Archive-Orig-X-Archive-Orig-Server"], undefined);
+  assert.equal(headers["X-Archive-Orig-X-Orig-Content-Encoding"], undefined);
 });
 
 test("an archived redirect target is reported, and the live one is rewritten", () => {

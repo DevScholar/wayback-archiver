@@ -211,6 +211,25 @@ export function canonicalHeaderName(lower: string): string {
  * This is the pywb / archiveweb.page convention. */
 const ARCHIVE_PREFIX = "X-Archive-Orig-";
 
+/**
+ * Archived headers whose original value the Wayback Machine reports under the
+ * short prefix. Its replay answers with `X-Orig-Content-Encoding`, not
+ * `X-Archive-Orig-Content-Encoding`, so a client written against Wayback finds
+ * the encoding where it expects it. We follow the spelling, because this server
+ * is meant to be dropped in where a Wayback replay URL was used.
+ */
+const SHORT_PREFIX_HEADERS: Record<string, string> = {
+  "content-encoding": "X-Orig-Content-Encoding",
+};
+
+/**
+ * Reporting prefixes that mean "an original header, kept aside". An archive
+ * captured *through* a replay carries these names already, so replaying one adds
+ * no second prefix: `x-archive-orig-server` stays `X-Archive-Orig-Server`
+ * instead of turning into `X-Archive-Orig-X-Archive-Orig-Server`.
+ */
+const REPORT_PREFIXES = ["x-archive-orig-", "x-orig-"];
+
 /** A control character in a header value makes Node's HTTP layer throw, and a
  * crawl can store whatever the origin sent, so normalize what we copy across.
  * Tab is the one control character a header value may keep (RFC 9110 section
@@ -321,10 +340,12 @@ function parseByteRange(
 /**
  * Rebuild a replay's response headers.
  *
- * Every archived header is reported under `X-Archive-Orig-<Name>`, except
- * `content-type`, which describes the payload and is replayed (see
- * `PASSTHROUGH_HEADERS`). The live response carries only what this server can
- * honestly say:
+ * An archived header is not replayed as it stands: `content-type` describes the
+ * payload and passes through (see `PASSTHROUGH_HEADERS`), `content-encoding`
+ * becomes `X-Orig-Content-Encoding`, and the rest becomes
+ * `X-Archive-Orig-<Name>`. A header that already carries one of those reporting
+ * names, which happens when the archive was captured through a replay, keeps its
+ * name. The live response carries only what this server can honestly say:
  *
  *   - `content-type` from the capture, with a charset declared when the capture
  *     never declared one;
@@ -352,6 +373,15 @@ export function buildReplayHeaders(
     const safeValue = safeHeaderValue(value);
     if (PASSTHROUGH_HEADERS.has(lower)) {
       headers[lower] = safeValue;
+      continue;
+    }
+    const shortName = SHORT_PREFIX_HEADERS[lower];
+    if (shortName) {
+      headers[shortName] = safeValue;
+      continue;
+    }
+    if (REPORT_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
+      headers[canonicalHeaderName(lower)] = safeValue;
       continue;
     }
     headers[ARCHIVE_PREFIX + canonicalHeaderName(lower)] = safeValue;
