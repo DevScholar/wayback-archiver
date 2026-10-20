@@ -164,6 +164,18 @@ servers) is served with the archive's `WARC-Identified-Payload-Type` when presen
 then a `<meta>` charset, then the bytes. Valid UTF-8 stays UTF-8, and legacy
 single-byte text is declared `windows-1252`. Stored bytes are never transcoded.
 
+An archived `Content-Security-Policy` header is not replayed. Its value names the
+original origin as the only allowed source for scripts and styles, and a replayed
+page is served by this server, so the browser would block every local file and the
+page would stay blank. The archived value stays visible as
+`X-Archive-Orig-Content-Security-Policy`.
+
+A `/web/<ts>/<url>` request that resolves to a capture at another timestamp is
+redirected (302) only when it is a page navigation, so the address bar names the
+capture actually served. Scripts, styles, images and fetches are served at the
+timestamp in the URL with no redirect: one URL per file, so a script cannot load
+twice.
+
 Replay routes accept the Wayback `id_` modifier.
 `/web/<timestamp>id_/<url>` serves the capture's _identity_: the original bytes as
 archived, with no link rewriting and no url-fixer shim injected.

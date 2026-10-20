@@ -182,6 +182,23 @@ const STRIP_HEADERS: Record<string, string> = {
   "content-encoding": "Content-Encoding",
 };
 
+/**
+ * Archived headers that forbid replay, because their value names the *original*
+ * origin as the only allowed source. A Content-Security-Policy lists the hosts a
+ * page may load scripts, styles, frames and fonts from; a replayed page is
+ * served by the local replay server instead, so every local asset -- and the
+ * injected url-fixer shim -- matches none of those hosts and the browser blocks
+ * it. The browser reports the block, so a strict CSP turns a replayed JavaScript
+ * app into an empty page. The archived value is preserved under
+ * `X-Archive-Orig-<Name>` (below) so it stays inspectable.
+ */
+const DROP_HEADERS: Record<string, string> = {
+  "content-security-policy": "Content-Security-Policy",
+  "content-security-policy-report-only": "Content-Security-Policy-Report-Only",
+  "x-content-security-policy": "X-Content-Security-Policy",
+  "x-webkit-csp": "X-WebKit-CSP",
+};
+
 /** Prefix for the original value of any header we had to change during replay.
  * This is the shared pywb / archiveweb.page convention (`X-Archive-Orig-*`). */
 const ARCHIVE_PREFIX = "X-Archive-Orig-";
@@ -202,6 +219,37 @@ function shouldRewrite(
   if (identity) return false;
   if (status >= 300 && status < 400) return false;
   return detectContentKind(mime) !== null;
+}
+
+/**
+ * Whether a request asks for a page to be navigated to, rather than for a
+ * resource that page uses.
+ *
+ * Only a navigation may be redirected to a different timestamp: the address bar
+ * shows that URL to the visitor, so it should name the capture being served. A
+ * subresource URL is an identity instead. Giving one file two URLs makes a
+ * script load twice, and for an ES module that means two module instances, so
+ * its top-level code runs twice and a repeated `customElements.define(...)`
+ * throws. Keeping every subresource at the timestamp the page already uses
+ * keeps one URL per file.
+ *
+ * The Fetch Metadata headers answer this exactly: a navigation is the only
+ * request whose destination is a document ("document", or "iframe" for a frame)
+ * and whose mode is "navigate". Browsers that send neither (or a command-line
+ * client that sends no such header) get the body directly, which is harmless
+ * because they have no address bar to keep faithful.
+ */
+export function isNavigationRequest(req: http.IncomingMessage): boolean {
+  const destination = req.headers["sec-fetch-dest"];
+  const mode = req.headers["sec-fetch-mode"];
+  if (typeof destination === "string" || typeof mode === "string") {
+    return (
+      destination === "document" ||
+      destination === "iframe" ||
+      mode === "navigate"
+    );
+  }
+  return false;
 }
 
 /** An inclusive byte range `[start, end]`, resolved and clamped against a
@@ -261,6 +309,9 @@ function parseByteRange(
  *   - framing/hop-by-hop headers (above) are dropped -- the body has been
  *     decompressed and rewritten, so the originals would be wrong. Their
  *     original values are preserved under `X-Archive-Orig-<Name>`.
+ *   - Content-Security-Policy headers (above) are dropped -- they name the
+ *     original origin as the only source of scripts and styles, which blocks
+ *     every replay asset. Their original values are preserved the same way.
  *   - `location` is rewritten to a captive `/web/<ts>/<url>` route so a
  *     redirect resolves locally instead of leaking to the live web;
  *   - `set-cookie` is dropped so historical cookies are never injected into
@@ -270,7 +321,7 @@ function parseByteRange(
  * charset is appended only when the type is HTML and the archived header lacks
  * one. `content-length` is always recomputed from the rewritten body.
  */
-function buildReplayHeaders(
+export function buildReplayHeaders(
   record: WarcRecord,
   url: string,
   ts: string,
@@ -281,7 +332,7 @@ function buildReplayHeaders(
   const headers: Record<string, string> = {};
   for (const [name, value] of record.httpHeaders) {
     const lower = name.toLowerCase();
-    const canonical = STRIP_HEADERS[lower];
+    const canonical = STRIP_HEADERS[lower] ?? DROP_HEADERS[lower];
     if (canonical) {
       headers[ARCHIVE_PREFIX + canonical] = value;
       continue;
@@ -395,7 +446,9 @@ function main(): void {
   }
 
   /**
-   * The rendered-response cache, keyed by the request path (`/web/<ts>/<url>`).
+   * The rendered-response cache, keyed by the request path (`/web/<ts>/<url>`),
+   * prefixed with `nav:` or `sub:` so a navigation's time-shift 302 and a
+   * subresource's body never collide.
    * The archive is immutable while it is being served, and the pipeline is
    * stateless, so a given path always renders to the same bytes -- caching the
    * final response (not just the decompressed record) skips the read + gunzip +
@@ -417,6 +470,7 @@ function main(): void {
    * Moved out of the request handler so it can be cached whole. */
   const renderReplay = async (
     reqUrl: string,
+    navigation: boolean,
   ): Promise<RenderedResponse | null> => {
     const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
     if (!m) return null;
@@ -458,12 +512,20 @@ function main(): void {
 
     // The requested timestamp may not be a real capture: the archive
     // resolves to the *nearest* capture at or around the requested time.
-    // When that capture's own timestamp differs from what the URL asked
-    // for, redirect to the faithful timestamp -- the same way the Wayback
-    // Machine 302s a time-shifted request to the capture's actual time --
-    // so the address bar never claims one time while serving another.
+    // For a page navigation -- where the address bar shows the timestamp --
+    // redirect to the capture's faithful timestamp, the same way the Wayback
+    // Machine 302s a time-shifted request to the capture's actual time, so
+    // the address bar never claims one time while serving another.
+    //
+    // Subresources (scripts, styles, images, fetches) are NOT redirected.
+    // Their URL is an identity, not something the visitor reads: a second URL
+    // for the same file is a second copy. For an ES module that copy is a
+    // second module instance, so its top-level code runs twice -- and a
+    // second `customElements.define(...)` throws, which kills a JavaScript
+    // app before it renders anything. Keeping one URL per resource also lets
+    // the rewrite prefix below stay fixed for the whole page load.
     const actualTs = rec.entry.timestamp.slice(0, 14);
-    if (actualTs !== reqTs) {
+    if (navigation && actualTs !== reqTs) {
       // Preserve the modifier across the time-shift redirect so an
       // `id_` request stays in identity mode after it lands on the
       // capture's faithful timestamp.
@@ -490,9 +552,17 @@ function main(): void {
     // skipped too: a 3xx has no page to rewrite or shim, and injecting
     // the url-fixer script into its empty body would turn a bare 302
     // into one that carries a script and a misleading content-length.
+    //
+    // `ts` is the timestamp of the *request*, not of the capture that the
+    // request resolved to. Naming each rewritten link after the capture's own
+    // timestamp would let one link point at /web/2001.../ and the next at
+    // /web/2003.../, so a single resource collected at several times would be
+    // fetched (and, for scripts, executed) once per timestamp. Using the
+    // request's timestamp keeps every link inside one page load on the same
+    // prefix, which is what makes a module-heavy page load each module once.
     const ctx: ReplayContext = {
       url: rec.matchedUrl,
-      ts: rec.entry.timestamp.slice(0, 14),
+      ts: reqTs,
       mime,
       body: record.body,
       mode: "server",
@@ -562,15 +632,22 @@ function main(): void {
       return;
     }
 
-    // Replay route: /web/<timestamp>[mod_]/<url>. The response is a pure
-    // function of the request path (the archive is immutable and the
-    // pipeline is stateless), so it is computed once and cached whole --
-    // repeat requests for a hot resource skip the read + gunzip + rewrite.
+    // Replay route: /web/<timestamp>[mod_]/<url>. The rendered body is a pure
+    // function of the request path (the archive is immutable and the pipeline
+    // is stateless), so it is computed once and cached whole -- repeat requests
+    // for a hot resource skip the read + gunzip + rewrite.
+    //
+    // Whether the request is a page navigation is part of the cache key,
+    // because that is the only thing that changes the response for one path:
+    // a navigation may answer with a time-shift 302 while a subresource with
+    // the same path gets the body.
     const m = reqUrl.match(/^\/web\/(\d{4,14})([a-z]{2}_)?\/(.+)$/i);
     if (m) {
-      let rendered: RenderedResponse | null = replayCache.get(reqUrl) ?? null;
+      const navigation = isNavigationRequest(req);
+      const cacheKey = navigation ? `nav:${reqUrl}` : `sub:${reqUrl}`;
+      let rendered: RenderedResponse | null = replayCache.get(cacheKey) ?? null;
       if (!rendered) {
-        rendered = await renderReplay(reqUrl);
+        rendered = await renderReplay(reqUrl, navigation);
         if (!rendered) {
           // No record for this replay route: show the same plain
           // "not saved" page the flat export writes, with the
@@ -579,7 +656,7 @@ function main(): void {
           res.end(renderNotFoundPage(replayInnerUrl(m[3])));
           return;
         }
-        replayCache.set(reqUrl, rendered);
+        replayCache.set(cacheKey, rendered);
       }
 
       // Byte-range support (RFC 7233). A replay body is fully materialized
