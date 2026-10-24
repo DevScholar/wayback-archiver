@@ -232,12 +232,40 @@ const SHORT_PREFIX_HEADERS: Record<string, string> = {
  */
 const REPORT_PREFIXES = ["x-archive-orig-", "x-orig-"];
 
+/** Encode one character as the UTF-8 percent escapes a URL would use. */
+function percentEncode(character: string): string {
+  let out = "";
+  for (const byte of Buffer.from(character, "utf8")) {
+    out += "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
 /** A control character in a header value makes Node's HTTP layer throw, and a
  * crawl can store whatever the origin sent, so normalize what we copy across.
  * Tab is the one control character a header value may keep (RFC 9110 section
- * 5.5). */
+ * 5.5). A character above U+00FF throws too, because a header value is bytes
+ * and Node refuses a code point that is not one. */
 function safeHeaderValue(value: string): string {
-  return value.replace(/[\u0000-\u0008\u000a-\u001f\u007f]/g, " ");
+  return value
+    .replace(/[\u0000-\u0008\u000a-\u001f\u007f]/g, " ")
+    .replace(/[^\u0000-\u00ff]/g, percentEncode);
+}
+
+/**
+ * A URL as it may appear inside an HTTP header value.
+ *
+ * `Link: <url>; rel="original"` and `Location: /web/<ts>/<url>` both name the
+ * original address, and a crawl keeps that address the way the site wrote it. A
+ * Chinese page's URL holds the characters themselves --
+ * `.../decisionpoint.asp?lcid=2052&MSCOMTB=MS_Microsoft 指南` is what this
+ * archive stores -- so passing it through made Node reject the response and
+ * killed the whole replay server. Percent-encoding restores printable ASCII and
+ * also encodes the space that would otherwise end a `Link` reference. A `%` is
+ * left alone, so an address that is already encoded is not encoded twice.
+ */
+function headerUrl(url: string): string {
+  return url.replace(/[^\x21-\x7e]|[<>"]/g, percentEncode);
 }
 
 /**
@@ -399,7 +427,7 @@ export function buildReplayHeaders(
     } catch {
       /* keep the raw value */
     }
-    headers["location"] = `/web/${ts}/${target}`;
+    headers["location"] = `/web/${ts}/${headerUrl(target)}`;
   }
 
   let contentType = headers["content-type"] || mime;
@@ -434,7 +462,7 @@ export function buildReplayHeaders(
   // What the Wayback Machine tells a client about the capture it is serving:
   // when it was taken, which capture it is, and where the bytes came from.
   headers["memento-datetime"] = cdxjTsToRfc1123(entry.timestamp);
-  headers["link"] = `<${url}>; rel="original"`;
+  headers["link"] = `<${headerUrl(url)}>; rel="original"`;
   if (entry.filename) headers["x-archive-src"] = entry.filename;
   return headers;
 }

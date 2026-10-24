@@ -227,6 +227,48 @@ test("a control character in an archived value cannot break the response", () =>
   assert.equal(headers["X-Archive-Orig-X-Odd"], "a b c\td");
 });
 
+test("a code point above U+00FF in an archived value cannot break the response", () => {
+  // Node's HTTP layer rejects a header value that is not bytes, so a Chinese
+  // filename in an archived Content-Disposition would crash the response.
+  const headers = replayHeaders({
+    "Content-Type": "text/html",
+    "Content-Disposition": 'inline; filename="指南.html"',
+  });
+  assert.equal(
+    headers["X-Archive-Orig-Content-Disposition"],
+    'inline; filename="%E6%8C%87%E5%8D%97.html"',
+  );
+});
+
+test("a URL with characters above U+00FF is percent-encoded in the reporting headers", () => {
+  // This archive keeps the Chinese characters of a page's URL in the URL
+  // itself. One request for that page killed the replay server, because the
+  // `link` header carried the characters straight into Node's HTTP layer.
+  const url =
+    "http://register.microsoft.com/regsys/decisionpoint.asp?lcid=2052&MSCOMTB=MS_Microsoft 指南";
+  const headers = replayHeaders({ "Content-Type": "text/html" }, url);
+  assert.equal(
+    headers["link"],
+    '<http://register.microsoft.com/regsys/decisionpoint.asp?lcid=2052&MSCOMTB=MS_Microsoft%20%E6%8C%87%E5%8D%97>; rel="original"',
+  );
+});
+
+test("an archived redirect target above U+00FF is percent-encoded", () => {
+  const headers = replayHeaders(
+    { Location: "/指 南.html" },
+    "https://example.com/a/page.html",
+    "19960101000000",
+    Buffer.alloc(0),
+    302,
+  );
+  assert.equal(
+    headers["location"],
+    "/web/19960101000000/https://example.com/%E6%8C%87%20%E5%8D%97.html",
+  );
+  // The archived value is still reported, with its characters encoded.
+  assert.ok(!/[^\u0000-\u00ff]/.test(headers["X-Archive-Orig-Location"]!));
+});
+
 function fakeRequest(headers: Record<string, string>): http.IncomingMessage {
   return { headers } as unknown as http.IncomingMessage;
 }
