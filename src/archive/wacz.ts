@@ -4,59 +4,23 @@
  * Facade over a WACZ file. Opens the ZIP once, parses datapackage.json,
  * the CDXJ index, and pages.jsonl, and exposes a way to read any resource's
  * HTTP payload on demand.
+ *
+ * The lookup tables live in `wacz-index` and the record reads in
+ * `wacz-records`; this class holds them together for the tools that replay,
+ * merge, de-duplicate or export an archive.
  */
 
-import * as zlib from "zlib";
 import { ZipReader } from "./zip.js";
-import { parseWarcRecord, WarcRecord } from "./warc.js";
-import { parseCdxj, CdxjEntry } from "./cdxj.js";
+import { type WarcRecord } from "./warc.js";
+import { parseCdxj, type CdxjEntry } from "./cdxj.js";
 import {
-  candidateUrls,
-  lookupKey,
-  lookupPathKey,
-  lookupKeyCi,
-} from "../lib/url.js";
-import { rfc3339ToTs14 } from "../lib/time.js";
-import { LruCache } from "../lib/lru.js";
-
-/** Gunzip a buffer off the event loop: `zlib.gunzip` runs the deflate work on
- * libuv's threadpool, so a large record's decompression does not block the
- * server's event loop the way `gunzipSync` does. */
-function gunzipAsync(buf: Buffer): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    zlib.gunzip(buf, (err, out) => (err ? reject(err) : resolve(out)));
-  });
-}
-
-/** If `url` is a Wayback replay URL (`https://web.archive.org/web/<ts>/<url>`),
- * return its capture time (14 digits) and inner URL; else null. */
-function waybackInner(url: string): { ts14: string; url: string } | null {
-  const m =
-    /^https?:\/\/web\.archive\.org\/web\/(\d{4,14})(?:[a-z]{2}_)?\/(.+)$/i.exec(
-      url,
-    );
-  if (!m) return null;
-  let inner = m[2];
-  try {
-    inner = decodeURIComponent(inner);
-  } catch {
-    /* keep raw */
-  }
-  return { ts14: m[1].slice(0, 14), url: inner };
-}
-
-/** If `url` is a page thumbnail (`urn:thumbnail:<page-url>`), return the page
- * it captures and that capture's time: the Wayback time + inner URL when the
- * thumbnail wraps a replay URL, else the thumbnail record's own timestamp and
- * the bare URL (a direct or already-restored capture). */
-function thumbnailTarget(
-  url: string,
-  ts17: string,
-): { ts14: string; url: string } | null {
-  const m = /^urn:thumbnail:(.+)$/i.exec(url);
-  if (!m) return null;
-  return waybackInner(m[1]) ?? { ts14: ts17.slice(0, 14), url: m[1] };
-}
+  buildWaczIndex,
+  findCapture,
+  findNearestCapture,
+  findThumbnail,
+  type WaczIndex,
+} from "./wacz-index.js";
+import { WarcRecordReader } from "./wacz-records.js";
 
 export interface WaczPage {
   url: string;
@@ -77,44 +41,13 @@ export class Wacz {
   private zip: ZipReader;
   private _entries: CdxjEntry[] = [];
   private _pages: WaczPage[] = [];
-  /** lookupKey(url) -> all captures of that URL, in index (ascending ts) order. */
-  private _indexByKey = new Map<string, CdxjEntry[]>();
-  /** lookupPathKey(url) -> all captures sharing that scheme/host/port/path, any query. */
-  private _indexByPath = new Map<string, CdxjEntry[]>();
-  /** lookupKeyCi(url) -> all captures whose scheme/host/path differ only by case. */
-  private _indexByKeyCi = new Map<string, CdxjEntry[]>();
-  /** Page identity (`ts14 +   + lookupKey(innerUrl)`) -> thumbnail record. */
-  private _thumbnails = new Map<string, CdxjEntry>();
-  /** Maps a WARC file basename (from CDXJ `filename`) to its ZIP entry path. */
-  private _warcEntries = new Map<string, string>();
+  private _index: WaczIndex = buildWaczIndex([]);
+  private _reader: WarcRecordReader;
   private _title = "";
-
-  /**
-   * Decompressed WARC records, keyed by `<filename>@<offset>`. Reading and
-   * gunzipping a record on every request is the dominant cost of replaying a
-   * hot URL; caching the parsed result turns repeated requests for the same
-   * capture into a map lookup. The byte budget bounds the cache regardless of
-   * archive size, and the value is keyed on the CDXJ location rather than the
-   * URL so two distinct captures of the same URL (or a revisit and its
-   * referred-to original) never collide.
-   */
-  private _recordCache = new LruCache<WarcRecord>({
-    maxEntries: 512,
-    maxBytes: 128 * 1024 * 1024,
-    // Records larger than 8 MiB are not cached: they are still read and
-    // decompressed on demand, but caching one huge binary would evict the
-    // whole working set of small records that dominate a page's replay.
-    maxEntryBytes: 8 * 1024 * 1024,
-    sizeOf: (r) => r.body.length,
-  });
-
-  /** In-flight async reads, keyed like `_recordCache`. Concurrent requests for
-   * a cold record share one decompression instead of each starting its own;
-   * the promise is removed once it settles. */
-  private _pendingRecords = new Map<string, Promise<WarcRecord>>();
 
   constructor(private filePath: string) {
     this.zip = ZipReader.open(filePath);
+    this._reader = new WarcRecordReader(this.zip);
     this.load();
   }
 
@@ -140,10 +73,7 @@ export class Wacz {
    * times.
    */
   thumbnailFor(url: string, ts: string): CdxjEntry | null {
-    const t = waybackInner(url);
-    const ts14 = t ? t.ts14 : rfc3339ToTs14(ts);
-    const key = ts14 + " " + lookupKey(t ? t.url : url);
-    return this._thumbnails.get(key) ?? null;
+    return findThumbnail(this._index, url, ts);
   }
 
   /** Release the archive's underlying file descriptor. Safe to call more than
@@ -158,15 +88,6 @@ export class Wacz {
   }
 
   private load(): void {
-    // Index WARC entries by basename so CDXJ `filename` ("data.warc.gz")
-    // can be resolved to its full ZIP path ("archive/data.warc.gz").
-    for (const name of this.zip.names()) {
-      const base = name.split("/").pop();
-      if (base && (base.endsWith(".warc") || base.endsWith(".warc.gz"))) {
-        this._warcEntries.set(base, name);
-      }
-    }
-
     // datapackage.json
     try {
       const dp = JSON.parse(
@@ -183,48 +104,7 @@ export class Wacz {
       .find((n) => n.endsWith(".cdx") && !n.endsWith(".cdx.gz"));
     if (indexName) {
       this._entries = parseCdxj(this.zip.readEntry(indexName).toString("utf8"));
-      for (const e of this._entries) {
-        const key = lookupKey(e.url);
-        const list = this._indexByKey.get(key);
-        if (list) list.push(e);
-        else this._indexByKey.set(key, [e]);
-
-        const pkey = lookupPathKey(e.url);
-        const plist = this._indexByPath.get(pkey);
-        if (plist) plist.push(e);
-        else this._indexByPath.set(pkey, [e]);
-
-        const cikey = lookupKeyCi(e.url);
-        const cilist = this._indexByKeyCi.get(cikey);
-        if (cilist) cilist.push(e);
-        else this._indexByKeyCi.set(cikey, [e]);
-      }
-      // Sort each list by ascending timestamp so timestamp-aware lookups
-      // can pick "the latest capture at or before T" and "the nearest".
-      for (const list of this._indexByKey.values()) {
-        list.sort((a, b) =>
-          a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
-        );
-      }
-      for (const list of this._indexByPath.values()) {
-        list.sort((a, b) =>
-          a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
-        );
-      }
-      for (const list of this._indexByKeyCi.values()) {
-        list.sort((a, b) =>
-          a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
-        );
-      }
-
-      // Page thumbnails (ArchiveWeb.page screenshots) are stored under
-      // `urn:thumbnail:<page-url>`; index them by the page they capture so
-      // the index page can show one preview per capture.
-      for (const e of this._entries) {
-        const t = thumbnailTarget(e.url, e.timestamp);
-        if (!t) continue;
-        this._thumbnails.set(t.ts14 + " " + lookupKey(t.url), e);
-      }
+      this._index = buildWaczIndex(this._entries);
     }
 
     // pages.jsonl
@@ -255,24 +135,7 @@ export class Wacz {
 
   /** Find the best index entry for a requested URL, or null. */
   resolve(url: string): CdxjEntry | null {
-    for (const cand of candidateUrls(url)) {
-      const list = this._indexByKey.get(lookupKey(cand));
-      if (list && list.length) return list[0];
-    }
-    // Query-variant fallback: same scheme/host/port/path, any query. This
-    // covers the case where the crawler stored the resource under a
-    // different query form than the page references (e.g. an image served
-    // at `?w=400` archived only at `?w=1200&dpr=on,2`).
-    const plist = this._indexByPath.get(lookupPathKey(url));
-    if (plist && plist.length) return plist[0];
-
-    // Case-insensitive fallback (last resort): the page references a path
-    // in a different case than the crawler stored (legacy case-insensitive
-    // servers, e.g. old IIS). Exact match already won above, so this only
-    // fires on a genuine miss.
-    const cilist = this._indexByKeyCi.get(lookupKeyCi(url));
-    if (cilist && cilist.length) return cilist[0];
-    return null;
+    return findCapture(this._index, url);
   }
 
   /**
@@ -285,65 +148,7 @@ export class Wacz {
    * not indexed at all.
    */
   resolveAt(url: string, ts: string): CdxjEntry | null {
-    // A truncated timestamp names the end of the smallest specified unit,
-    // so pad with 9s (not 0s) to make the target point the inclusive upper
-    // bound of that unit (e.g. "20260831074847" -> "...74847999").
-    const target = ts.padEnd(17, "9");
-
-    // Tracks the nearest capture on either side of `target`. A fresh one is
-    // built per lookup rather than reset in place, so the `null` reset never
-    // narrows the shared object's properties and defeats the guards below.
-    type Best = { before: CdxjEntry | null; after: CdxjEntry | null };
-
-    const consider = (best: Best, e: CdxjEntry): void => {
-      if (e.timestamp <= target) {
-        if (!best.before || e.timestamp > best.before.timestamp)
-          best.before = e;
-      } else {
-        if (!best.after || e.timestamp < best.after.timestamp) best.after = e;
-      }
-    };
-
-    const nearestOf = (list: CdxjEntry[]): CdxjEntry | null => {
-      const best: Best = { before: null, after: null };
-      for (const e of list) consider(best, e);
-      const before = best.before;
-      const after = best.after;
-      if (!before) return after ?? null;
-      if (!after) return before;
-      const gapBefore = BigInt(target) - BigInt(before.timestamp);
-      const gapAfter = BigInt(after.timestamp) - BigInt(target);
-      return gapBefore <= gapAfter ? before : after;
-    };
-
-    // Exact URL first: pick the nearest capture of this exact URL. An
-    // exact hit must never be shadowed by a host/scheme variant (`www.` vs
-    // bare, http vs https) whose capture sits closer to the requested
-    // timestamp. That shadowing is exactly how a `www.` -> bare redirect
-    // loops: the bare target request re-matches the `www.` redirect record
-    // through the variant fallback and redirects straight back to bare.
-    const exact = this._indexByKey.get(lookupKey(url));
-    if (exact && exact.length) return nearestOf(exact);
-
-    // Query-variant fallback: same scheme/host/port/path, any query.
-    const plist = this._indexByPath.get(lookupPathKey(url));
-    if (plist && plist.length) return nearestOf(plist);
-
-    // Host/scheme variants (www. vs bare, http vs https), tried only when
-    // the exact URL is not indexed at all.
-    for (const cand of candidateUrls(url)) {
-      if (cand === url) continue;
-      const list = this._indexByKey.get(lookupKey(cand));
-      if (list && list.length) return nearestOf(list);
-    }
-
-    // Case-insensitive fallback (last resort): exact + query-variant +
-    // host/scheme all missed; try the same resource under a differently
-    // cased path.
-    const cilist = this._indexByKeyCi.get(lookupKeyCi(url));
-    if (cilist && cilist.length) return nearestOf(cilist);
-
-    return this.resolve(url);
+    return findNearestCapture(this._index, url, ts);
   }
 
   /**
@@ -360,7 +165,7 @@ export class Wacz {
     const entry = ts ? this.resolveAt(url, ts) : this.resolve(url);
     if (!entry) return null;
 
-    let record = this.readRecord(entry);
+    let record = this._reader.read(entry);
     let matchedUrl = entry.url;
 
     // Follow revisit chains (bounded to avoid pathological cycles). The
@@ -375,7 +180,7 @@ export class Wacz {
       ) {
         const original = this.resolveAt(refersTo, entry.timestamp);
         if (!original || original.url === matchedUrl) break;
-        record = this.readRecord(original);
+        record = this._reader.read(original);
       } else {
         break;
       }
@@ -396,7 +201,7 @@ export class Wacz {
     const entry = ts ? this.resolveAt(url, ts) : this.resolve(url);
     if (!entry) return null;
 
-    let record = await this.readRecordAsync(entry);
+    let record = await this._reader.readAsync(entry);
     let matchedUrl = entry.url;
 
     for (let i = 0; i < 8; i++) {
@@ -407,7 +212,7 @@ export class Wacz {
       ) {
         const original = this.resolveAt(refersTo, entry.timestamp);
         if (!original || original.url === matchedUrl) break;
-        record = await this.readRecordAsync(original);
+        record = await this._reader.readAsync(original);
       } else {
         break;
       }
@@ -426,7 +231,7 @@ export class Wacz {
    * URL at the same timestamp must not borrow each other's bytes.
    */
   async recordForEntryAsync(entry: CdxjEntry): Promise<WarcRecord> {
-    let record = await this.readRecordAsync(entry);
+    let record = await this._reader.readAsync(entry);
     for (let i = 0; i < 8; i++) {
       const refersTo = record.headers.get("warc-refers-to-target-uri");
       if (
@@ -435,67 +240,11 @@ export class Wacz {
       ) {
         const original = this.resolveAt(refersTo, entry.timestamp);
         if (!original) break;
-        record = await this.readRecordAsync(original);
+        record = await this._reader.readAsync(original);
       } else {
         break;
       }
     }
     return record;
-  }
-
-  /** Decompress and parse a single index entry's WARC record. */
-  private readRecord(entry: CdxjEntry): WarcRecord {
-    const zipName = this._warcEntries.get(entry.filename) || entry.filename;
-    const cacheKey = `${zipName}@${entry.offset}`;
-    const cached = this._recordCache.get(cacheKey);
-    if (cached) return cached;
-
-    const raw = this.zip.storedRange(zipName, entry.offset, entry.length);
-    const inflated = zlib.gunzipSync(raw);
-    const record = parseWarcRecord(inflated);
-    this._recordCache.set(cacheKey, record);
-    return record;
-  }
-
-  /**
-   * Async counterpart of `readRecord` for the replay server: reads and gunzips
-   * a record without blocking the event loop. Cold records from concurrent
-   * requests are de-duplicated through `_pendingRecords`, so a burst of clients
-   * hitting the same uncached capture triggers one decompression, not N.
-   */
-  private readRecordAsync(entry: CdxjEntry): Promise<WarcRecord> {
-    const zipName = this._warcEntries.get(entry.filename) || entry.filename;
-    const cacheKey = `${zipName}@${entry.offset}`;
-
-    const cached = this._recordCache.get(cacheKey);
-    if (cached) return Promise.resolve(cached);
-
-    const pending = this._pendingRecords.get(cacheKey);
-    if (pending) return pending;
-
-    const loading = this.loadRecordAsync(zipName, entry, cacheKey);
-    this._pendingRecords.set(cacheKey, loading);
-    return loading;
-  }
-
-  /** Perform the actual async read + gunzip + parse + cache for a cold record. */
-  private async loadRecordAsync(
-    zipName: string,
-    entry: CdxjEntry,
-    cacheKey: string,
-  ): Promise<WarcRecord> {
-    try {
-      const raw = await this.zip.storedRangeAsync(
-        zipName,
-        entry.offset,
-        entry.length,
-      );
-      const inflated = await gunzipAsync(raw);
-      const record = parseWarcRecord(inflated);
-      this._recordCache.set(cacheKey, record);
-      return record;
-    } finally {
-      this._pendingRecords.delete(cacheKey);
-    }
   }
 }

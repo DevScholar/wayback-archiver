@@ -5,7 +5,7 @@ import { surtKey } from "../src/lib/url.js";
 import {
   dropStaleCarried,
   dropUnrestoredReplay,
-} from "../src/cli/wayback-machine-restorer.js";
+} from "../src/restore/carry.js";
 
 // dropStaleCarried removes carried Wayback replay records whose snapshot was
 // just restored, splicing their bytes out of the stored WARC and remapping the

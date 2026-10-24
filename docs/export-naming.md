@@ -1,7 +1,8 @@
 # Export naming scheme
 
 `src/cli/export-to-html.ts` flattens every archived resource into a single directory and
-renames files as `<prefix>~<n><ext>`.
+renames files as `<prefix>~<n><ext>`. The naming rules themselves live in
+`src/export/naming.ts`.
 
 ## Rules
 

@@ -30,11 +30,8 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import type { CdxjEntry } from "../archive/cdxj.js";
-import {
-  loadWacz,
-  writeBundle,
-  type BundleSegment,
-} from "../archive/wacz-bundle.js";
+import { loadWacz, type BundleSegment } from "../archive/wacz-bundle.js";
+import { writeBundle } from "../archive/wacz-write.js";
 import { parseArgv, splitList } from "../lib/args.js";
 import { rfc3339ToTs14 } from "../lib/time.js";
 

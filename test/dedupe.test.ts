@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { dedupeArchive } from "../src/cli/dedupe.js";
+import { dedupeArchive } from "../src/dedupe/run.js";
 import { buildFixture, readFixture } from "./wacz-fixture.js";
 
 // dedupe groups records by exact URL, clusters them by capture time, and keeps

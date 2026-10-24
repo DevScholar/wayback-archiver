@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sniffCharset } from "../src/cli/server.js";
+import { sniffCharset } from "../src/replay/headers.js";
 
 // The replay server declares a charset for archived HTML that does not carry
 // one. The bytes are always served verbatim; only the declaration changes.

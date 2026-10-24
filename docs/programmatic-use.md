@@ -29,6 +29,18 @@ import { Wacz } from "./src/index.ts";
 Every example assumes `archive.wacz` is a WACZ produced by the downloader or
 restorer.
 
+## Source layout
+
+Each command under `src/cli` parses its arguments and starts a run. The work
+itself lives in the modules beside it, grouped by function:
+
+- `src/capture` -- the downloader: the URL list, one URL's redirect chain, page titles, and WACZ packaging.
+- `src/restore` -- the Wayback restorer: classifying replay URLs, reusing local bytes, fetching, planning, and writing the output.
+- `src/archive` -- WACZ, WARC and ZIP reading and writing.
+- `src/replay` -- the replay server's response rules: headers, rendering, byte ranges, rewriting, and the CDX API.
+- `src/export` -- the flat HTML export: file naming, link lookup, and the index files.
+- `src/dedupe` and `src/verify` -- the de-duplication plan and the fixity audit.
+
 ## Reading an archive
 
 [`src/archive/wacz.ts`](../src/archive/wacz.ts) exports the `Wacz` facade, which

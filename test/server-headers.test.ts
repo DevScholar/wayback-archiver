@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import * as http from "http";
 import {
   buildReplayHeaders,
-  isNavigationRequest,
   canonicalHeaderName,
-} from "../src/cli/server.js";
+} from "../src/replay/headers.js";
+import { isNavigationRequest } from "../src/replay/navigation.js";
 import type { WarcRecord } from "../src/archive/warc.js";
 import type { CdxjEntry } from "../src/archive/cdxj.js";
 

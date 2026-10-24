@@ -1,26 +1,24 @@
 /**
  * wacz-bundle.ts
  *
- * Reads a WACZ as an ordered list of WARC byte segments, and writes a new WACZ
- * from a filtered list of them. The `merge` and `dedupe` commands both rewrite
- * an archive's index and page list while copying record bytes verbatim: only
- * offsets and the WARC file name change, so every digest a record carries stays
- * valid and an audit with `verify` still passes.
+ * Reads a WACZ as an ordered list of WARC byte segments. The `merge` and
+ * `dedupe` commands both rewrite an archive's index and page list while copying
+ * record bytes verbatim: only offsets and the WARC file name change, so every
+ * digest a record carries stays valid and an audit with `verify` still passes.
  *
  * A segment is a contiguous run of bytes in the stored WARC. An indexed record
  * is one segment, and the bytes between indexed records (a `warcinfo` block, a
  * `request` record) are segments with no index entry of their own. Carrying
  * those gaps is what makes a rewrite lossless: a record the CDX index does not
  * list is still copied over, in place.
+ *
+ * Writing the rewritten archive is in `wacz-write`, and reading a member's WARC
+ * header without inflating its payload in `warc-peek`.
  */
 
-import * as crypto from "crypto";
-import * as zlib from "zlib";
 import { ZipReader } from "./zip.js";
-import { writeZipFile } from "./zip-writer.js";
 import { parseCdxj, type CdxjEntry } from "./cdxj.js";
 import { surtKey } from "../lib/url.js";
-import { SOFTWARE, resource } from "./wacz-append.js";
 
 /** Where a rewritten archive keeps its one WARC stream. */
 export const WARC_ZIP_PATH = "archive/data.warc.gz";
@@ -267,179 +265,4 @@ export function compareEntries(a: CdxjEntry, b: CdxjEntry): number {
   if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
   if (a.url !== b.url) return a.url < b.url ? -1 : 1;
   return 0;
-}
-
-/** One CDXJ line, pointing at a record's new byte range. Every other field of
- * the original line is preserved, so a non-standard field a source tool wrote
- * survives the rewrite. */
-function indexLineFor(
-  entry: CdxjEntry,
-  offset: number,
-  length: number,
-): string {
-  const json: Record<string, unknown> = {
-    ...entry.json,
-    offset,
-    length,
-    filename: WARC_BASENAME,
-  };
-  return `${entry.key || surtKey(entry.url)} ${entry.timestamp} ${JSON.stringify(json)}`;
-}
-
-export interface WriteBundleOptions {
-  outputFile: string;
-  title: string;
-  /** Segments to write, in stream order. Segments with no entry are the
-   * un-indexed bytes and are always written. */
-  segments: BundleSegment[];
-  pageHeaders?: Record<string, unknown>[];
-  pages?: Record<string, unknown>[];
-  /** Metadata carried from a source archive. `title`, `modified` and
-   * `resources` are always rewritten; `created` and any other field a source
-   * set are kept. */
-  datapackage?: Record<string, unknown>;
-  /** Written to `datapackage.json`'s `software` field. */
-  software?: string;
-}
-
-export interface WriteBundleResult {
-  records: number;
-  pages: number;
-  warcBytes: number;
-}
-
-/** Write one WACZ holding `segments`: `archive/data.warc.gz`,
- * `indexes/index.cdx`, `pages/pages.jsonl`, `datapackage.json`, and
- * `datapackage-digest.json`. */
-export function writeBundle(opts: WriteBundleOptions): WriteBundleResult {
-  const nowIso = new Date().toISOString();
-
-  const parts: Buffer[] = [];
-  const placed: { entry: CdxjEntry; offset: number; length: number }[] = [];
-  let offset = 0;
-  for (const segment of opts.segments) {
-    if (segment.raw.length === 0) continue;
-    for (const entry of segment.entries) {
-      placed.push({ entry, offset, length: segment.raw.length });
-    }
-    parts.push(segment.raw);
-    offset += segment.raw.length;
-  }
-  const warcGz = Buffer.concat(parts);
-  placed.sort((a, b) => compareEntries(a.entry, b.entry));
-  const indexLines = placed.map((p) =>
-    indexLineFor(p.entry, p.offset, p.length),
-  );
-  const cdx = Buffer.from(
-    indexLines.length > 0 ? indexLines.join("\n") + "\n" : "",
-    "utf-8",
-  );
-
-  const pageLines: string[] = [];
-  for (const header of opts.pageHeaders ?? []) {
-    pageLines.push(JSON.stringify(header));
-  }
-  const pageList = opts.pages ?? [];
-  for (const page of pageList) pageLines.push(JSON.stringify(page));
-  const pages = Buffer.from(
-    pageLines.length > 0 ? pageLines.join("\n") + "\n" : "",
-    "utf-8",
-  );
-
-  const dp: Record<string, unknown> = { ...(opts.datapackage ?? {}) };
-  dp.profile = typeof dp.profile === "string" ? dp.profile : "data-package";
-  dp.wacz_version =
-    typeof dp.wacz_version === "string" ? dp.wacz_version : "1.1.1";
-  dp.software = opts.software ?? SOFTWARE;
-  dp.created = typeof dp.created === "string" ? dp.created : nowIso;
-  dp.title = opts.title;
-  dp.modified = nowIso;
-  dp.resources = [
-    resource("pages.jsonl", PAGES_ZIP_PATH, pages),
-    resource(WARC_BASENAME, WARC_ZIP_PATH, warcGz),
-    resource("index.cdx", INDEX_ZIP_PATH, cdx),
-  ];
-  const datapackageBuf = Buffer.from(
-    JSON.stringify(dp, null, 2) + "\n",
-    "utf-8",
-  );
-  const digestJson = {
-    path: "datapackage.json",
-    hash:
-      "sha256:" +
-      crypto.createHash("sha256").update(datapackageBuf).digest("hex"),
-  };
-
-  writeZipFile(opts.outputFile, [
-    { name: "datapackage.json", data: datapackageBuf, method: "deflate" },
-    {
-      name: "datapackage-digest.json",
-      data: Buffer.from(JSON.stringify(digestJson, null, 2) + "\n", "utf-8"),
-      method: "deflate",
-    },
-    { name: PAGES_ZIP_PATH, data: pages, method: "deflate" },
-    { name: WARC_ZIP_PATH, data: warcGz, method: "store" },
-    { name: INDEX_ZIP_PATH, data: cdx, method: "store" },
-  ]);
-
-  return {
-    records: placed.length,
-    pages: pageList.length,
-    warcBytes: warcGz.length,
-  };
-}
-
-/** Compressed bytes to inflate when peeking at a record's WARC header. A WARC
- * header block is small, and deflate cannot expand more than about 1 KiB of
- * plaintext per compressed byte, so this bounds the peek to a few MiB even for
- * a pathological record. */
-const PEEK_COMPRESSED_BYTES = 2048;
-
-/** Bytes of the inflated prefix to read as the header block. */
-const PEEK_PLAIN_BYTES = 8192;
-
-/**
- * Read a record's WARC header block without inflating its whole payload.
- *
- * The header sits at the start of the decompressed member, so inflating a
- * prefix of the compressed member with `Z_SYNC_FLUSH` yields it without
- * decoding the body. A member stored uncompressed (a `.warc` stream, which a
- * WACZ allows when the archive is streamed) is read as plain text. Returns null
- * for a member that is neither.
- */
-export function peekWarcHeaders(member: Buffer): Map<string, string> | null {
-  if (member.length === 0) return null;
-  const slice =
-    member.length > PEEK_COMPRESSED_BYTES
-      ? member.subarray(0, PEEK_COMPRESSED_BYTES)
-      : member;
-  let text: string;
-  try {
-    text = zlib
-      .gunzipSync(slice, { finishFlush: zlib.constants.Z_SYNC_FLUSH })
-      .subarray(0, PEEK_PLAIN_BYTES)
-      .toString("latin1");
-  } catch {
-    text = member.subarray(0, PEEK_PLAIN_BYTES).toString("latin1");
-  }
-  if (!text.startsWith("WARC/")) return null;
-
-  const end = text.search(/\r?\n\r?\n/);
-  const block = end >= 0 ? text.slice(0, end) : text;
-  const headers = new Map<string, string>();
-  for (const line of block.split(/\r?\n/).slice(1)) {
-    const index = line.indexOf(":");
-    if (index <= 0) continue;
-    headers.set(
-      line.slice(0, index).trim().toLowerCase(),
-      line.slice(index + 1).trim(),
-    );
-  }
-  return headers;
-}
-
-/** The `WARC-Type` a member declares, lowercased, or "" when it has none. */
-export function peekWarcType(member: Buffer): string {
-  const headers = peekWarcHeaders(member);
-  return (headers?.get("warc-type") ?? "").toLowerCase();
 }

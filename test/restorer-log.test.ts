@@ -3,11 +3,8 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import {
-  restoreArchive,
-  logPathFor,
-  type Args,
-} from "../src/cli/wayback-machine-restorer.js";
+import { restoreArchive } from "../src/restore/run.js";
+import { logPathFor, type Args } from "../src/restore/args.js";
 import { RunLog } from "../src/lib/run-log.js";
 import { buildFixture } from "./wacz-fixture.js";
 
