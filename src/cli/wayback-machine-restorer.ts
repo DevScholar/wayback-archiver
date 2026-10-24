@@ -61,7 +61,15 @@
  * drained one at a time at `--rate-limit-delay` with backoff.
  *
  * Usage:
- *   npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]
+ *   npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--log-file <path>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]
+ *
+ * Every run is logged to `<input stem>-restored.log` (or `--log-file`), next to
+ * the input archive: the console's own lines, plus a per-resource detail line
+ * per snapshot, per fetch attempt and per redirect hop. A restore is long enough
+ * that the terminal that ran it is often gone before its result is examined, and
+ * "why was this image not reused" or "why did this page shift to another time"
+ * is answered only by that detail. The file is appended to, so repeated runs of
+ * one archive keep their history.
  */
 
 import * as path from "path";
@@ -105,14 +113,18 @@ import {
   indexLine,
   type ExistingArchive,
 } from "../archive/wacz-append.js";
+import { RunLog } from "../lib/run-log.js";
 
 // ---------------------------------------------------------------------------
 // Arguments
 // ---------------------------------------------------------------------------
 
-interface Args {
+export interface Args {
   input: string;
   outputFile: string;
+  /** Where the run log goes; defaults to `<input stem>-restored.log` next to
+   * the input archive. */
+  logFile: string;
   title?: string;
   concurrency: number;
   userAgent?: string;
@@ -133,6 +145,7 @@ function parseArgs(argv: string[]): Args {
   const args: Args = {
     input: "",
     outputFile: "",
+    logFile: "",
     concurrency: 8,
     rateLimitDelay: 3000,
     max429Retries: 3,
@@ -146,6 +159,7 @@ function parseArgs(argv: string[]): Args {
   // its value unless it looks like another flag.
   const VALUE_FLAGS = new Set([
     "--output-file",
+    "--log-file",
     "--title",
     "--concurrency",
     "--user-agent",
@@ -175,6 +189,7 @@ function parseArgs(argv: string[]): Args {
     }
 
     if (key === "--output-file") args.outputFile = val;
+    else if (key === "--log-file") args.logFile = val;
     else if (key === "--title") args.title = val;
     else if (key === "--concurrency") args.concurrency = parseInt(val, 10) || 8;
     else if (key === "--user-agent") args.userAgent = val;
@@ -191,7 +206,7 @@ function parseArgs(argv: string[]): Args {
   if (positional.length > 0) args.input = path.resolve(positional[0]);
   if (!args.input) {
     console.error(
-      'Usage: npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]',
+      'Usage: npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--log-file <path>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]',
     );
     process.exit(1);
   }
@@ -202,7 +217,20 @@ function parseArgs(argv: string[]): Args {
       base + "-restored.wacz",
     );
   }
+  args.logFile = logPathFor(args.input, args.logFile);
   return args;
+}
+
+/**
+ * Where a run's log goes: `<input stem>-restored.log` next to the input archive,
+ * the same name the default output would take. `--log-file` overrides it. The
+ * log is appended to, so repeated runs of one archive leave a history in one
+ * file.
+ */
+export function logPathFor(inputFile: string, logFile?: string): string {
+  if (logFile) return path.resolve(logFile);
+  const stem = path.basename(inputFile).replace(/\.wacz$/i, "");
+  return path.join(path.dirname(inputFile), stem + "-restored.log");
 }
 
 // ---------------------------------------------------------------------------
@@ -403,24 +431,118 @@ function fetchOnce(
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
+/** True for a record that redirects to another URL. */
+function isRedirectRecord(record: WarcRecord): boolean {
+  return record.httpStatus !== null && REDIRECT_STATUS.has(record.httpStatus);
+}
+
+/**
+ * True when a locally captured redirect is Wayback's own playback redirect.
+ *
+ * Wayback answers a timestamp it has no capture for with a redirect to the
+ * nearest capture, and marks that redirect with `X-Archive-Redirect-Reason`. A
+ * redirect the site really sent is replayed with historical `X-Archive-Orig-*`
+ * headers instead, and its `location` was rewritten into a replay route, so its
+ * bytes are not identity bytes: only the `id_` route restores it. That one must
+ * not be followed locally.
+ */
+function isLocalPlaybackRedirect(record: WarcRecord, baseUrl: string): boolean {
+  if (!isRedirectRecord(record)) return false;
+  const names = [...record.httpHeaders.keys()];
+  if (names.some((name) => name.startsWith("x-archive-orig-"))) return false;
+  if (names.includes("x-archive-redirect-reason")) return true;
+  const location = record.httpHeaders.get("location");
+  return location !== undefined && isPlaybackRedirect(location, baseUrl);
+}
+
+/**
+ * The record among several captures of one replay URL that carries the payload.
+ *
+ * ArchiveWeb.page writes one `response` for a resource and then a `revisit` for
+ * every later capture of it, so the same replay URL can appear many times in the
+ * index. The response holds the bytes and the historical headers; a revisit
+ * holds neither. Reading only the last record of a URL therefore lost the body.
+ * Preference: a non-redirect with a body, then a redirect (whose `location` is
+ * followed), then whatever is there.
+ */
+function primaryRecord(candidates: WarcRecord[]): WarcRecord {
+  const payload = candidates.find(
+    (record) => record.body.length > 0 && !isRedirectRecord(record),
+  );
+  if (payload) return payload;
+  return candidates.find(isRedirectRecord) ?? candidates[0];
+}
+
+/**
+ * Pick the record of `candidates` a revisit names, or the payload record when
+ * no date is known.
+ *
+ * A revisit carries no bytes and points at the record that does, through
+ * `WARC-Refers-To-Target-URI` and `WARC-Refers-To-Date`. ArchiveWeb.page writes
+ * the URL of the revisit itself as the target URI, so the date is the only
+ * thing that distinguishes the response from the revisits that followed it.
+ * Dates are compared exactly first, then by the instant they name, because the
+ * two spellings can differ (`.051Z` against `.051Z` is the common case, but a
+ * missing fraction is legal too).
+ */
+function pickLocalRecord(
+  candidates: WarcRecord[],
+  preferredDate?: string,
+): WarcRecord | undefined {
+  if (candidates.length === 0) return undefined;
+  if (preferredDate) {
+    const exact = candidates.find((record) => record.date === preferredDate);
+    if (exact) return exact;
+    const wanted = Date.parse(preferredDate);
+    if (!Number.isNaN(wanted)) {
+      const sameInstant = candidates.find(
+        (record) => record.date !== null && Date.parse(record.date) === wanted,
+      );
+      if (sameInstant) return sameInstant;
+    }
+  }
+  return primaryRecord(candidates);
+}
+
 /**
  * Follow a Wayback replay URL's redirect chain and WARC `revisit` references
  * within the locally-captured records, returning the final content-bearing
  * record. Mirrors the downloader's hop-following, but reads from the input
  * WACZ instead of the network.
+ *
+ * `recordsByUrl` holds every capture of a replay URL, not one. A revisit whose
+ * target URI is its own URL is resolved through `WARC-Refers-To-Date` to the
+ * response it names, which is how a snapshot recorded as a revisit still
+ * yields its bytes.
+ *
+ * Exported for the reuse tests, which hand it records directly.
  */
-function resolveLocalChain(
+export function resolveLocalChain(
   startUrl: string,
-  byReplayUrl: Map<string, WarcRecord>,
-): { record: WarcRecord | null; finalUrl: string } {
+  recordsByUrl: Map<string, WarcRecord[]>,
+): { record: WarcRecord | null; finalUrl: string; stopReason?: string } {
   let cur = startUrl;
+  let preferredDate: string | undefined;
   for (let hop = 0; hop < 12; hop++) {
-    const rec = byReplayUrl.get(cur);
-    if (!rec) return { record: null, finalUrl: cur };
+    const candidates = recordsByUrl.get(cur);
+    if (!candidates || candidates.length === 0)
+      return {
+        record: null,
+        finalUrl: cur,
+        stopReason: "no local record for " + cur,
+      };
 
-    const status = rec.httpStatus;
+    const rec = pickLocalRecord(candidates, preferredDate)!;
 
-    if (status !== null && REDIRECT_STATUS.has(status)) {
+    if (isRedirectRecord(rec)) {
+      if (!isLocalPlaybackRedirect(rec, cur)) {
+        return {
+          record: rec,
+          finalUrl: cur,
+          stopReason:
+            "a redirect the site sent; its location was rewritten, so only the identity route restores it",
+        };
+      }
       const loc = rec.httpHeaders.get("location");
       if (loc) {
         let next: string;
@@ -431,6 +553,7 @@ function resolveLocalChain(
         }
         if (next !== cur) {
           cur = next;
+          preferredDate = undefined;
           continue;
         }
       }
@@ -438,15 +561,27 @@ function resolveLocalChain(
 
     if (rec.warcType === "revisit" || rec.body.length === 0) {
       const refersTo = rec.headers.get("warc-refers-to-target-uri");
-      if (refersTo && refersTo !== cur) {
-        cur = refersTo;
-        continue;
+      if (refersTo) {
+        const refersDate = rec.headers.get("warc-refers-to-date") ?? undefined;
+        const referred =
+          refersTo === cur
+            ? pickLocalRecord(candidates, refersDate)
+            : pickLocalRecord(recordsByUrl.get(refersTo) ?? [], refersDate);
+        if (referred !== rec) {
+          cur = refersTo;
+          preferredDate = refersDate;
+          continue;
+        }
       }
     }
 
     return { record: rec, finalUrl: cur };
   }
-  return { record: null, finalUrl: cur };
+  return {
+    record: null,
+    finalUrl: cur,
+    stopReason: "chain did not settle within 12 hops",
+  };
 }
 
 /** Modifiers whose replayed bytes are already the identity bytes. Wayback only
@@ -456,9 +591,13 @@ function resolveLocalChain(
 const REUSABLE_MODIFIERS = new Set(["im_", "oe_", "id_"]);
 
 /** Turn a locally-resolved WARC record into a restored record, mirroring the
- * network path's header restoration and timestamping. */
+ * network path's header restoration and timestamping. The URL and capture time
+ * come from the replay route the chain ended on, not necessarily the requested
+ * snapshot: a recorded playback redirect means the bytes belong to another
+ * capture, and they are stored under that capture's own time. */
 function recordFromLocal(
-  target: WaybackTarget,
+  innerUrl: string,
+  ts14: string,
   record: WarcRecord,
 ): KeptRecord {
   const headersArr: [string, string][] = [...record.httpHeaders.entries()];
@@ -479,8 +618,8 @@ function recordFromLocal(
       .split(";")[0]
       .trim() || "application/octet-stream";
   return {
-    innerUrl: target.innerUrl,
-    ts17: (target.ts14 + "000").slice(0, 17),
+    innerUrl,
+    ts17: (ts14 + "000").slice(0, 17),
     mime,
     status: record.httpStatus ?? 200,
     statusText: record.httpStatusText || "",
@@ -1129,8 +1268,9 @@ export function writeOutput(opts: {
 // Main
 // ---------------------------------------------------------------------------
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+/** Restore one archive. Exported for the offline log test, which runs a whole
+ * restore against a fixture and reads the log it leaves behind. */
+export async function restoreArchive(args: Args, log: RunLog): Promise<void> {
   const zip = ZipReader.open(args.input);
   const names = zip.names();
 
@@ -1138,8 +1278,9 @@ async function main(): Promise<void> {
     names.find((n) => n.endsWith(".cdx") && !n.endsWith(".cdx.gz")) ||
     names.find((n) => n.endsWith(".cdx"));
   if (!indexName) {
-    console.error("Not a WACZ (missing CDX index).");
-    process.exit(1);
+    log.error("Not a WACZ (missing CDX index).");
+    process.exitCode = 1;
+    return;
   }
 
   const entries = parseCdxj(zip.readEntry(indexName).toString("utf8"));
@@ -1179,6 +1320,15 @@ async function main(): Promise<void> {
   // Read the input WARC's records so `im_` images can be reused locally. The
   // CDXJ `filename` is a basename ("data.warc.gz"); resolve it to the full
   // ZIP path.
+  //
+  // Every record of a replay URL is kept, not one: ArchiveWeb.page writes a
+  // `response` for a resource and a `revisit` for each later capture of it, so
+  // keeping the last record of a URL would trade the body for an empty revisit.
+  //
+  // Only replay routes are indexed, because only they can be followed: a
+  // revisit can name an unrelated URL (the crawler's own injected script, say),
+  // and resolving that to some other record would store the wrong bytes under
+  // this snapshot's name.
   const warcEntries = new Map<string, string>();
   for (const n of names) {
     const base = n.split("/").pop();
@@ -1186,16 +1336,26 @@ async function main(): Promise<void> {
       warcEntries.set(base, n);
     }
   }
-  const byReplayUrl = new Map<string, WarcRecord>();
+  const byReplayUrl = new Map<string, WarcRecord[]>();
   for (const e of entries) {
+    if (!parseWaybackUrl(e.url)) continue;
     try {
       const zipName = warcEntries.get(e.filename) || e.filename;
       const raw = zip.storedRange(zipName, e.offset, e.length);
       const inflated = zlib.gunzipSync(raw);
-      byReplayUrl.set(e.url, parseWarcRecord(inflated));
+      const record = parseWarcRecord(inflated);
+      const list = byReplayUrl.get(e.url);
+      if (list) list.push(record);
+      else byReplayUrl.set(e.url, [record]);
     } catch {
       /* leave unread; a missed `im_` falls back to the network path */
     }
+  }
+  // The payload record of each replay URL, for the metadata pass below: a
+  // revisit carries no headers worth reading.
+  const primaryRecordByUrl = new Map<string, WarcRecord>();
+  for (const [url, records] of byReplayUrl) {
+    primaryRecordByUrl.set(url, primaryRecord(records));
   }
 
   // Wayback's charset guess for each snapshot, or ArchiveWeb.page's identified
@@ -1203,7 +1363,10 @@ async function main(): Promise<void> {
   // WARC-Identified-Payload-Type is what lets a page whose 1990s server
   // declared no charset (the common case) replay with the encoding its stored
   // bytes actually use.
-  const identifiedTypeBySnapshot = buildIdentifiedTypeMap(entries, byReplayUrl);
+  const identifiedTypeBySnapshot = buildIdentifiedTypeMap(
+    entries,
+    primaryRecordByUrl,
+  );
 
   // Restore targets are keyed by *snapshot* -- the inner URL together with its
   // historical capture time. A single URL captured at several points in the
@@ -1350,16 +1513,36 @@ async function main(): Promise<void> {
   const accept = args.accept || DEFAULT_ACCEPT;
   const acceptLanguage = args.acceptLanguage || DEFAULT_ACCEPT_LANGUAGE;
 
-  console.log("=== Wayback Restorer ===");
-  console.log("Input:     " + args.input);
-  console.log(
+  log.line("=== Wayback Restorer ===");
+  log.line("Started:   " + new Date().toISOString());
+  log.line("Input:     " + args.input);
+  log.line(
     "Output:    " + args.outputFile + (existing ? " (appending)" : " (new)"),
   );
-  console.log("Title:     " + title);
-  console.log("User-Agent: " + userAgent);
-  console.log(
+  log.line("Log:       " + log.filePath);
+  log.line("Title:     " + title);
+  log.line("User-Agent: " + userAgent);
+  log.line(
     `${existingSnapshotKeys.size} already restored, reusing ${reuseLocally.length} locally (im_), fetching ${targets.length} URL(s), carrying over ${carried.length} (concurrency ${args.concurrency})...\n`,
   );
+
+  // What the input holds for each pending snapshot, file only: its capture time,
+  // the replay modifiers the crawler recorded, and the route this run starts
+  // from. These lines are what explain a later "NO LOCAL BODY", "REUSE SKIP" or
+  // "SHIFT" line for the same URL.
+  log.note(
+    `-- input: ${entries.length} record(s), ${targetBySnap.size} snapshot(s), ${pending.length} pending --`,
+  );
+  for (const t of pending) {
+    const mods = [
+      ...(modifiersBySnap.get(snapshotKey(t.innerUrl, t.ts14)) ?? []),
+    ]
+      .map((m) => m || "(bare)")
+      .join(",");
+    log.note(
+      `SNAPSHOT ${t.innerUrl} ts=${t.ts14} mods=${mods || "(none)"} route=${replayUrlBySnap.get(snapshotKey(t.innerUrl, t.ts14)) ?? t.idUrl}`,
+    );
+  }
 
   const kept: KeptRecord[] = [];
   const keptPages: Record<string, unknown>[] = [];
@@ -1379,18 +1562,57 @@ async function main(): Promise<void> {
   // snapshot with no local body. Both fall back to re-fetching the `id_`
   // route, which can still serve the capture or shift to the nearest one.
   const promoted: WaybackTarget[] = [];
+  let reusedLocally = 0;
+
+  /** Write the record a local chain resolved to, under the URL and capture time
+   * that chain ended on. */
+  const storeLocalRecord = (
+    innerUrl: string,
+    ts14: string,
+    record: WarcRecord,
+  ): void => {
+    const keptRecord = recordFromLocal(innerUrl, ts14, record);
+    // Wayback's guess (from any route of this snapshot) wins over the
+    // ArchiveWeb.page type the local record itself carries.
+    keptRecord.identifiedPayloadType =
+      identifiedTypeBySnapshot.get(snapshotKey(innerUrl, ts14)) ??
+      keptRecord.identifiedPayloadType;
+    kept.push(keptRecord);
+    if (isHtmlMime(keptRecord.mime)) {
+      keptPages.push({
+        url: innerUrl,
+        ts: cdxjTsToRfc3339((ts14 + "000").slice(0, 17)),
+        title: titleByInnerUrl.get(innerUrl) || innerUrl,
+      });
+    }
+  };
+
   for (const t of reuseLocally) {
-    const replayUrl = replayUrlBySnap.get(snapshotKey(t.innerUrl, t.ts14));
+    const requestedKey = snapshotKey(t.innerUrl, t.ts14);
+    const replayUrl = replayUrlBySnap.get(requestedKey);
     const start = replayUrl ?? t.idUrl;
     const resolved = resolveLocalChain(start, byReplayUrl);
-    const rec = resolved.record ?? byReplayUrl.get(start);
+    const rec = resolved.record;
+    const finalTarget = parseWaybackUrl(resolved.finalUrl);
+    const finalInnerUrl = finalTarget?.innerUrl ?? t.innerUrl;
+    const finalTs14 = finalTarget?.ts14 ?? t.ts14;
+    const localKey = snapshotKey(finalInnerUrl, finalTs14);
+    log.note(
+      `REUSE PROBE ${t.innerUrl} ts=${t.ts14} start=${start} -> ${resolved.finalUrl} record=${rec ? `${rec.warcType}/${rec.httpStatus ?? "no-status"}/${rec.body.length}B` : "none"}${resolved.stopReason ? ` stop=${resolved.stopReason}` : ""}`,
+    );
     if (!rec || rec.body.length === 0) {
       // Nothing local to reuse. Try the identity route over the network
       // instead of giving up: Wayback can still serve the capture (or
       // shift to the nearest one), while `--offline` fails and leaves the
       // snapshot as-is exactly as before.
       promoted.push(t);
-      console.log(`NO LOCAL BODY ${t.innerUrl} (fetching id_)`);
+      log.line(`NO LOCAL BODY ${t.innerUrl} (fetching id_)`);
+      log.note(
+        `  no local body: ${resolved.stopReason ?? `${rec ? rec.warcType : "record"} at ${resolved.finalUrl} has no body`}` +
+          (rec && rec.warcType === "revisit"
+            ? `; it refers to ${rec.headers.get("warc-refers-to-target-uri") ?? "(no URI)"} at ${rec.headers.get("warc-refers-to-date") ?? "(no date)"}`
+            : ""),
+      );
       continue;
     }
     const rawCtype = (rec.httpHeaders.get("content-type") || "")
@@ -1398,44 +1620,59 @@ async function main(): Promise<void> {
       .trim();
     if (isRewritableMime(rawCtype)) {
       promoted.push(t);
+      log.line(
+        `REUSE SKIP ${t.innerUrl} (local body is ${rawCtype || "untyped"}, Wayback rewrote it)`,
+      );
       continue;
     }
-    const reuseKey = snapshotKey(t.innerUrl, t.ts14);
-    if (storedKeys.has(reuseKey)) {
+
+    if (localKey !== requestedKey) {
+      // The recorded chain ends on another capture time (or URL): a playback
+      // redirect the crawler met, not a capture of the requested snapshot.
+      // The bytes are kept at their own time and the requested snapshot is
+      // left as-is, exactly as the network path treats a SHIFT.
+      shifted++;
+      carryOnFailure(t);
+      if (!storedKeys.has(localKey)) {
+        storedKeys.add(localKey);
+        storeLocalRecord(finalInnerUrl, finalTs14, rec);
+      }
+      log.line(
+        `SHIFT ${rec.httpStatus ?? 200} ${t.innerUrl} (no capture at ${t.ts14}; recorded playback redirect leads to ${finalTs14} at ${finalInnerUrl}) (left as-is)`,
+      );
+      log.note(
+        `  local shift: requested ${requestedKey} -> stored ${localKey}`,
+      );
+      continue;
+    }
+
+    if (storedKeys.has(requestedKey)) {
       // A redirect chain this run already stored this snapshot; the bytes
       // are the same resource, so reuse it without a second record.
       ok++;
-      console.log(
+      reusedLocally++;
+      log.line(
         `REUSE OK ${rec.httpStatus ?? 200} ${t.innerUrl} (already stored)`,
       );
       continue;
     }
-    storedKeys.add(reuseKey);
-    const keptRec = recordFromLocal(t, rec);
-    // Wayback's guess (from any route of this snapshot) wins over the
-    // ArchiveWeb.page type the local record itself carries.
-    keptRec.identifiedPayloadType =
-      identifiedTypeBySnapshot.get(reuseKey) ?? keptRec.identifiedPayloadType;
-    kept.push(keptRec);
-    if (isHtmlMime(keptRec.mime)) {
-      const title = titleByInnerUrl.get(t.innerUrl) || t.innerUrl;
-      keptPages.push({
-        url: t.innerUrl,
-        ts: cdxjTsToRfc3339((t.ts14 + "000").slice(0, 17)),
-        title,
-      });
-    }
+    storedKeys.add(requestedKey);
+    storeLocalRecord(finalInnerUrl, finalTs14, rec);
     ok++;
-    console.log(`REUSE OK ${rec.httpStatus ?? 200} ${t.innerUrl}`);
+    reusedLocally++;
+    log.line(`REUSE OK ${rec.httpStatus ?? 200} ${t.innerUrl}`);
+    if (resolved.finalUrl !== start) {
+      log.note(
+        `  reuse followed a local redirect: ${start} -> ${resolved.finalUrl}`,
+      );
+    }
   }
   if (promoted.length > 0) {
     targets.push(...promoted);
     targets.sort((a, b) =>
       a.innerUrl < b.innerUrl ? -1 : a.innerUrl > b.innerUrl ? 1 : 0,
     );
-    console.log(
-      `promoted ${promoted.length} local snapshot(s) to network fetch`,
-    );
+    log.line(`promoted ${promoted.length} local snapshot(s) to network fetch`);
   }
 
   // Turn one successful fetch into output records. A chain that only shifts
@@ -1462,6 +1699,20 @@ async function main(): Promise<void> {
     return batch;
   };
 
+  /** The redirect chain of one fetch, file only: every hop, with the status and
+   * type it answered. A timestamp shift is visible here as the hop that landed
+   * on another `/web/<ts>/` URL, and a failure as the hop that never arrived. */
+  const noteFetch = (target: WaybackTarget, hops: FetchedHop[]): void => {
+    log.note(`FETCH ${target.idUrl} requested ts=${target.ts14}`);
+    for (const hop of hops) {
+      const type =
+        hop.headers.find(
+          ([name]) => name.toLowerCase() === "content-type",
+        )?.[1] ?? "(no content-type)";
+      log.note(`  HOP ${hop.status} ${type} ${hop.body.length}B ${hop.url}`);
+    }
+  };
+
   // Normal pool: one attempt per URL, at full concurrency. A 429 is set
   // aside on the rate-limit list rather than retried in-place.
   const slowQueue: { target: WaybackTarget; retries: number }[] = [];
@@ -1481,29 +1732,36 @@ async function main(): Promise<void> {
       );
       if (outcome.kind === "rate-limited") {
         slowQueue.push({ target: t, retries: 0 });
-        console.log(`[${id}] RATE-LIMITED ${t.innerUrl}`);
+        log.line(`[${id}] RATE-LIMITED ${t.innerUrl}`);
         continue;
       }
       if (outcome.kind === "error") {
         failed++;
         carryOnFailure(t);
-        console.log(
+        log.line(
           `[${id}] FAIL ${outcome.message} | ${t.innerUrl} (left as-is)`,
+        );
+        log.note(
+          `  fetch ${t.idUrl} (ts=${t.ts14}) failed: ${outcome.message}`,
         );
         continue;
       }
+      noteFetch(t, outcome.hops);
       const batch = storeOutcome(t, outcome.hops);
       if (batch.wroteTarget) {
         ok++;
-        console.log(`[${id}] OK ${batch.lastStatus} ${t.innerUrl}`);
+        log.line(`[${id}] OK ${batch.lastStatus} ${t.innerUrl}`);
       } else if (batch.records.length > 0) {
         // Wayback answered with a timestamp shift: the bytes are real,
         // but they belong to another capture, so they are stored under
         // that capture's own time and this snapshot is left as-is.
         shifted++;
         carryOnFailure(t);
-        console.log(
+        log.line(
           `[${id}] SHIFT ${batch.lastStatus} ${t.innerUrl} (no capture at ${t.ts14}; nearest capture stored at ${batch.lastTs14}) (left as-is)`,
+        );
+        log.note(
+          `  shift stored at ${batch.lastTs14}; playbackRedirects=${batch.skippedPlaybackRedirects} errorPages=${batch.skippedErrorPages}`,
         );
       } else if (batch.skippedAlreadyStored > 0) {
         // The redirect led to a capture another chain had already
@@ -1511,14 +1769,17 @@ async function main(): Promise<void> {
         // the archive at their own time.
         shifted++;
         carryOnFailure(t);
-        console.log(
+        log.line(
           `[${id}] SHIFT ${t.innerUrl} (no capture at ${t.ts14}; nearest capture already in the archive at ${batch.alreadyStoredTs14}) (left as-is)`,
         );
       } else {
         failed++;
         carryOnFailure(t);
-        console.log(
+        log.line(
           `[${id}] SKIP ${t.innerUrl} (no historical capture) (left as-is)`,
+        );
+        log.note(
+          `  no record kept; playbackRedirects=${batch.skippedPlaybackRedirects} errorPages=${batch.skippedErrorPages}`,
         );
       }
     }
@@ -1531,7 +1792,7 @@ async function main(): Promise<void> {
   // Slow queue: drain one at a time, with backoff on repeated 429s, so the
   // rate-limited URLs retry at a gentler pace than the normal pool.
   if (slowQueue.length > 0) {
-    console.log(
+    log.line(
       `\nDraining ${slowQueue.length} rate-limited URL(s) at ${args.rateLimitDelay}ms...\n`,
     );
   }
@@ -1548,14 +1809,14 @@ async function main(): Promise<void> {
       if (item.retries < args.max429Retries) {
         item.retries++;
         slowQueue.push(item);
-        console.log(
+        log.line(
           `SLOW retry ${item.retries}/${args.max429Retries} (backing off ${args.rateLimitDelay * item.retries}ms) ${item.target.innerUrl}`,
         );
         await sleep(args.rateLimitDelay * item.retries);
       } else {
         failed++;
         carryOnFailure(item.target);
-        console.log(
+        log.line(
           `FAIL gave up after ${args.max429Retries} rate-limit retries | ${item.target.innerUrl} (left as-is)`,
         );
       }
@@ -1564,32 +1825,42 @@ async function main(): Promise<void> {
     if (outcome.kind === "error") {
       failed++;
       carryOnFailure(item.target);
-      console.log(
+      log.line(
         `SLOW FAIL ${outcome.message} | ${item.target.innerUrl} (left as-is)`,
+      );
+      log.note(
+        `  fetch ${item.target.idUrl} (ts=${item.target.ts14}) failed: ${outcome.message}`,
       );
       continue;
     }
+    noteFetch(item.target, outcome.hops);
     const batch = storeOutcome(item.target, outcome.hops);
     if (batch.wroteTarget) {
       ok++;
-      console.log(`SLOW OK ${batch.lastStatus} ${item.target.innerUrl}`);
+      log.line(`SLOW OK ${batch.lastStatus} ${item.target.innerUrl}`);
     } else if (batch.records.length > 0) {
       shifted++;
       carryOnFailure(item.target);
-      console.log(
+      log.line(
         `SLOW SHIFT ${batch.lastStatus} ${item.target.innerUrl} (no capture at ${item.target.ts14}; nearest capture stored at ${batch.lastTs14}) (left as-is)`,
+      );
+      log.note(
+        `  shift stored at ${batch.lastTs14}; playbackRedirects=${batch.skippedPlaybackRedirects} errorPages=${batch.skippedErrorPages}`,
       );
     } else if (batch.skippedAlreadyStored > 0) {
       shifted++;
       carryOnFailure(item.target);
-      console.log(
+      log.line(
         `SLOW SHIFT ${item.target.innerUrl} (no capture at ${item.target.ts14}; nearest capture already in the archive at ${batch.alreadyStoredTs14}) (left as-is)`,
       );
     } else {
       failed++;
       carryOnFailure(item.target);
-      console.log(
+      log.line(
         `SLOW SKIP ${item.target.innerUrl} (no historical capture) (left as-is)`,
+      );
+      log.note(
+        `  no record kept; playbackRedirects=${batch.skippedPlaybackRedirects} errorPages=${batch.skippedErrorPages}`,
       );
     }
     await sleep(args.rateLimitDelay);
@@ -1626,8 +1897,11 @@ async function main(): Promise<void> {
       ? `, ${droppedReplay} unrestored replay record(s) dropped`
       : "";
 
-  console.log(
+  log.line(
     `\n${ok} restored, ${shifted} shifted to their real capture time, ${failed} skipped, ${finalCarried.length} carried over${droppedNote}`,
+  );
+  log.note(
+    `summary: snapshots=${targetBySnap.size} alreadyRestored=${existingSnapshotKeys.size} reusedLocally=${reusedLocally} fetched=${targets.length} promoted=${promoted.length} restored=${ok} shifted=${shifted} failed=${failed} carried=${finalCarried.length} droppedReplay=${droppedReplay}`,
   );
 
   if (
@@ -1636,13 +1910,14 @@ async function main(): Promise<void> {
     (!existing || (args.title === undefined && !args.dropUnrestored))
   ) {
     if (existing) {
-      console.log(
+      log.line(
         "Nothing new to add: the output already holds every record these snapshots produced.",
       );
       return;
     }
-    console.error("Nothing to restore.");
-    process.exit(1);
+    log.error("Nothing to restore.");
+    process.exitCode = 1;
+    return;
   }
 
   // Snapshots restored this run, so dropStaleCarried can prune their stale
@@ -1662,18 +1937,40 @@ async function main(): Promise<void> {
     dropUnrestored: args.dropUnrestored,
   });
 
-  console.log("\n=== Done ===");
-  console.log("Wrote " + args.outputFile);
+  log.line("\n=== Done ===");
+  log.line("Wrote " + args.outputFile);
+  log.line("Log:   " + log.filePath);
 }
 
-// Run only when executed directly (not when imported by a test).
+/**
+ * Start one restore run and mirror everything it reports into its log file.
+ * A fatal error is written to the log as well, so the reason a run stopped is
+ * still readable after the terminal is gone.
+ */
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  const log = new RunLog(args.logFile);
+  try {
+    await restoreArchive(args, log);
+  } catch (error) {
+    log.error(
+      "Fatal: " +
+        (error instanceof Error
+          ? (error.stack ?? error.message)
+          : String(error)),
+    );
+    process.exitCode = 1;
+  } finally {
+    log.close();
+  }
+}
+
+// Run only when executed directly (not when imported by a test). `main` handles
+// its own failure so the log file records why the run stopped.
 if (
   process.argv[1] &&
   import.meta.url ===
     new URL(`file://${process.argv[1].replace(/\\/g, "/")}`).href
 ) {
-  main().catch((e) => {
-    console.error("Fatal:", e);
-    process.exit(1);
-  });
+  await main();
 }

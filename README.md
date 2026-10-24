@@ -60,7 +60,7 @@ and is recorded in the request record.
 ## Restore a Wayback Machine capture
 
 ```
-npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]
+npx tsx src/cli/wayback-machine-restorer.ts <archive.wacz> [--output-file <out.wacz>] [--log-file <path>] [--title <t>] [--concurrency 8] [--user-agent "..."] [--rate-limit-delay 3000] [--max-429-retries 3] [--offline] [--drop-unrestored]
 ```
 
 ArchiveWeb.page archives a Wayback replay page together with Wayback's own
@@ -107,6 +107,24 @@ a fresh `id_` request. If a reused record's own content type turns out to be tex
 that body was rewritten. A snapshot with no local body is re-fetched too, not
 skipped.
 
+The input of one replay URL is read as a whole. ArchiveWeb.page writes a
+`response` for a resource and a `revisit` for every later capture of it, so a
+URL can hold many records, and a revisit points at the response that carries the
+bytes through `WARC-Refers-To-Date`. Reading only the newest record of a URL
+would trade the body for an empty revisit and force a needless network request.
+
+A local route can itself be a playback redirect: the crawler recorded that the
+image had no capture at the page's time and Wayback shifted to the nearest one.
+Those bytes are kept under the capture's own URL and time, and the requested
+snapshot is carried unchanged, which is the same rule the network path follows
+for a shift. The bytes never take the requested time's name.
+
+A redirect the site itself sent is not followed locally. Its location was
+rewritten for replay, so the captured redirect is not identity bytes and only
+the `id_` route restores it; such a record is re-fetched like a page. Only
+Wayback's own playback redirects are followed, because they lead to the bytes
+without carrying any of their own.
+
 A resource that cannot be re-fetched is skipped. A network error writes nothing,
 and a rate limit (429) moves to a slow queue and is retried at
 `--rate-limit-delay` with backoff before it is skipped as well.
@@ -116,6 +134,16 @@ already holds, so a re-run resumes where the last one stopped. A normal browser
 `User-Agent` (the same Edge 150 string) keeps Wayback from serving a bot
 response. Without `--output-file`, output defaults to `<archive>-restored.wacz`
 next to the input.
+
+Every run also writes a log, `<archive>-restored.log` next to the input
+(`--log-file` picks another path). The file mirrors what the console prints and
+adds the detail behind each decision: one line per snapshot naming its capture
+time, replay modifiers and starting route; one per local reuse probe naming the
+record the chain resolved to; one per fetch and per redirect hop; and a closing
+line of counts. A restore is long enough that the terminal is often gone before
+the result is read, and "why was this image not reused" or "why did this page
+shift to another capture time" is answered only by that detail. The log is
+appended to, so repeated runs of one archive keep their history in one file.
 
 By default a snapshot that could not be restored stays in the output for a later
 retry. `--drop-unrestored` drops those replay records instead, so the result holds
