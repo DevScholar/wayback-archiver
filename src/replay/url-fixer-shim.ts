@@ -198,10 +198,19 @@ export const URL_FIXER_SHIM = `(function () {
   // before it is parsed.
   function rewriteHtmlString(html) {
     return String(html)
-      .replace(/((?:href|src|action|poster|background|formaction)\\s*=\\s*)(["'])([^"']*)\\2/gi, function (m, pre, q, url) {
+      .replace(/((?:href|src|action|poster|background|formaction)\\s*=\\s*)(?:"([^"]*)"|'([^']*)'|([^\\s>]*))/gi, function (m, pre, doubleQuoted, singleQuoted, unquoted) {
+        var q = unquoted !== undefined ? '' : doubleQuoted !== undefined ? '"' : "'";
+        var url = unquoted !== undefined ? unquoted : doubleQuoted !== undefined ? doubleQuoted : singleQuoted;
         return pre + q + fixUrl(url) + q;
       })
-      .replace(/(srcset\\s*=\\s*)(["'])([^"']*)\\2/gi, function (m, pre, q, v) {
+      .replace(/(srcset\\s*=\\s*)(?:"([^"]*)"|'([^']*)'|([^\\s>]+))/gi, function (m, pre, doubleQuoted, singleQuoted, unquoted) {
+        if (unquoted !== undefined) {
+          return pre + unquoted.split(',').map(function (candidate) {
+            return fixUrl(candidate);
+          }).join(',');
+        }
+        var q = doubleQuoted !== undefined ? '"' : "'";
+        var v = doubleQuoted !== undefined ? doubleQuoted : singleQuoted;
         return pre + q + fixSrcset(v) + q;
       });
   }

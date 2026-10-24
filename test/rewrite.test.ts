@@ -55,6 +55,30 @@ test("rewriteContent handles comma in srcset query string", () => {
   assert.ok(out.includes("/web/2026/http://example.com/img2.png 2x"));
 });
 
+test("an unquoted attribute value is rewritten in place", () => {
+  // A 2001 microsoft.com page writes its headline images without quotes:
+  //   <img src=/china/windowsxp/mainleft.jpg border=0 ...>
+  // Leaving that value alone made the browser ask the replay server for
+  // /china/windowsxp/mainleft.jpg, which answered 404, so the archived image
+  // never showed. An unquoted value ends at whitespace or `>`.
+  const html =
+    '<img src=/china/windowsxp/mainleft.jpg border=0 alt="x"><a href=/china/press/2001/1109.asp>p</a>';
+  const out = rewriteContent(html, "http://example.com/", rewrite, "html");
+  assert.equal(
+    out,
+    '<img src=/web/2026/http://example.com/china/windowsxp/mainleft.jpg border=0 alt="x"><a href=/web/2026/http://example.com/china/press/2001/1109.asp>p</a>',
+  );
+});
+
+test("an unquoted srcset candidate is rewritten", () => {
+  const html = "<img srcset=/a.png,/b.png>";
+  const out = rewriteContent(html, "http://example.com/", rewrite, "html");
+  assert.equal(
+    out,
+    "<img srcset=/web/2026/http://example.com/a.png,/web/2026/http://example.com/b.png>",
+  );
+});
+
 test("detectContentKind classifies by mime not extension", () => {
   assert.equal(detectContentKind("text/html"), "html");
   assert.equal(detectContentKind("text/css; charset=utf-8"), "css");

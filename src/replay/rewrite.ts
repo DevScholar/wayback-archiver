@@ -96,11 +96,29 @@ function rewriteHtmlText(
   baseUrl: string,
   rewrite: UrlRewriter,
 ): string {
-  // Attributes whose value is a URL.
-  const ATTR_RE = /(href|src|action|background|poster)\s*=\s*(["'])(.*?)\2/gi;
+  // Attributes whose value is a URL, in all three value syntaxes HTML allows:
+  // double-quoted, single-quoted, and unquoted. An unquoted value ends at
+  // whitespace or `>` (HTML's unquoted attribute value state). A 2001
+  // microsoft.com page writes `<img src=/china/windowsxp/mainleft.jpg>`, and
+  // leaving that one unrewritten made the browser ask this server for a path it
+  // does not serve, so the archived image came back as a 404. The rewritten URL
+  // goes back in the syntax the page used: no quote character for an unquoted
+  // value.
+  const ATTR_RE =
+    /(href|src|action|background|poster)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/gi;
   content = content.replace(
     ATTR_RE,
-    (match, attr: string, quote: string, ref: string) => {
+    (
+      match: string,
+      attr: string,
+      doubleQuoted: string | undefined,
+      singleQuoted: string | undefined,
+      unquoted: string | undefined,
+    ) => {
+      const ref = doubleQuoted ?? singleQuoted ?? unquoted ?? "";
+      const quote =
+        unquoted !== undefined ? "" : doubleQuoted !== undefined ? '"' : "'";
+
       const abs = toAbsolute(ref, baseUrl);
       if (abs === null) return match;
 
@@ -118,10 +136,31 @@ function rewriteHtmlText(
   // `img.webp 1x, img.png 2x`). Each URL is rewritten in place, descriptors
   // are left untouched. This is what makes <picture> WebP sources -- which the
   // crawler archives under their `?basic=.webp` variant -- resolve locally.
-  const SRCSET_RE = /srcset\s*=\s*(["'])(.*?)\1/gi;
+  const SRCSET_RE = /srcset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
   content = content.replace(
     SRCSET_RE,
-    (match, quote: string, value: string) => {
+    (
+      match: string,
+      doubleQuoted: string | undefined,
+      singleQuoted: string | undefined,
+      unquoted: string | undefined,
+    ) => {
+      if (unquoted !== undefined) {
+        // An unquoted value cannot hold whitespace, so no candidate can carry a
+        // descriptor, and every comma ends a candidate (HTML's srcset parser
+        // ends a URL at a comma in that form).
+        const value = unquoted
+          .split(",")
+          .map((candidate) => {
+            const abs = toAbsolute(candidate, baseUrl);
+            if (abs === null) return candidate;
+            return rewrite(abs) ?? candidate;
+          })
+          .join(",");
+        return `srcset=${value}`;
+      }
+      const value = doubleQuoted ?? singleQuoted ?? "";
+      const quote = doubleQuoted !== undefined ? '"' : "'";
       return `srcset=${quote}${rewriteSrcset(value, baseUrl, rewrite)}${quote}`;
     },
   );
